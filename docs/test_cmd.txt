@@ -1,0 +1,87 @@
+================================================================================
+gNMI Mock Server — Test Command Reference
+================================================================================
+Each section is independent. The only prerequisite is a running server
+(see Prerequisites). Sections can be run in any order.
+
+================================================================================
+Prerequisites — Start the Server
+================================================================================
+Purpose : Must be running before any other command.
+
+  cd /home/daryl/work/test/c_cpp/ref/tmp/psc-mock-server
+  ./build/psc-mock-server --force-insecure --log-level 4
+
+Expected : Server listening on localhost:50051
+
+
+================================================================================
+Capabilities
+================================================================================
+Purpose : Verify the server advertises the correct YANG model.
+
+  gnmic -a localhost:50051 --insecure capabilities
+
+Verify  : Response contains "openconfig-platform-psu" and "openconfig-platform".
+
+
+================================================================================
+Get — Snapshot Query
+================================================================================
+Purpose : One-shot read of a single leaf. No subscription needed.
+
+  gnmic -a localhost:50051 --insecure \
+    get --path "/components/component[name=PSC-1]/state/temperature/instant"
+
+Verify  : Returns a single double_val (temperature in celsius). RPC closes immediately.
+
+
+================================================================================
+Subscribe: STREAM SAMPLE — Single Path
+================================================================================
+Purpose : Verify periodic push for a specific sensor.
+
+  gnmic -a localhost:50051 --insecure \
+    subscribe \
+    --path "/components/component[name=PSC-0]/power-supply/state/output-voltage" \
+    --mode stream \
+    --stream-mode sample \
+    --sample-interval 2s
+
+Verify  : double_val arrives every 2 seconds, fluctuating around 12V.
+          Server drives the cadence; client does not send additional messages.
+
+
+================================================================================
+Subscribe: STREAM SAMPLE — Full Component Tree
+================================================================================
+Purpose : Verify fan-out across both PSC units and all sensor paths.
+
+  gnmic -a localhost:50051 --insecure \
+    subscribe \
+    --path "/components/component" \
+    --mode stream \
+    --stream-mode sample \
+    --sample-interval 3s
+
+Verify  : Every 3 seconds, a batch containing all sensor values for both
+          PSC-0 and PSC-1 arrives (temperature, voltage, current, power, capacity).
+
+
+================================================================================
+Subscribe: POLL — Client-triggered Snapshot
+================================================================================
+Purpose : Verify POLL mode. Client controls when data is fetched.
+          Each poll trigger must be answered with data + sync_response.
+
+Note    : gnmic --mode poll (openconfig/gnmic ≥ 0.46) establishes the
+          subscription but never sends Poll trigger messages — no data is
+          returned. This is a known gnmic limitation. Use test_poll.py instead.
+
+  python3 docs/test_poll.py
+
+Verify  : Script sends 3 Poll triggers at 1.5s intervals.
+          Each trigger receives sensor data followed by sync_response=True.
+          Output ends with "PASS — sync_response=true received after every poll".
+
+================================================================================

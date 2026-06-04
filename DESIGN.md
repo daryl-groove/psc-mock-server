@@ -201,10 +201,24 @@ cd psc-mock-server && meson setup build && ninja -C build
 **Goal:** ✅ server starts, Subscribe STREAM SAMPLE returns drifting mock PSC values
 
 ### Phase 2 — Fix Type B Subscribe bugs
-- Fix POLL `sync_response` missing (`subscribe.cpp:304`)
+- ✅ Fix POLL `sync_response` missing (`subscribe.cpp:267`) — MUST per spec §3.5.2
 - Fix non-existent path closes RPC (`subscribe.cpp:63`)
 - Fix `updates_only` flag (`subscribe.cpp:139`, `subscribe.cpp:157`)
+- Add POLL initial snapshot (optional — see note below)
 - **Goal:** ONCE / POLL / STREAM all behave correctly per spec
+
+#### POLL initial snapshot — design note
+Spec §3.5.1.5.3 does not explicitly mandate an initial snapshot when a POLL
+subscription is established (data retrieval is described as triggered by a
+Poll message). However, the OpenConfig Go reference implementation
+(`spec/gnmi/subscribe/subscribe.go:435`) sends an initial snapshot +
+`sync_response` immediately after subscription setup, before the first Poll
+trigger. This gives the client a consistent starting state without requiring
+an explicit Poll.
+
+Decision: treat as **optional but recommended**. Align with the Go reference
+impl — send initial snapshot + `sync_response` at POLL subscription
+establishment. Implement after the remaining mandatory fixes.
 
 ### Phase 3 — ON_CHANGE (easier without sysrepo)
 - Add value cache in `PscPowerSensorProvider` (previous reading per path)
@@ -230,11 +244,21 @@ cd psc-mock-server && meson setup build && ninja -C build
 See `sysrepo-gnxi_GNMI_STATUS.md` Section 11 for full list.
 Critical ones for this project:
 
-| Priority | Gap | File |
-|----------|-----|------|
-| P1 | POLL `sync_response` missing | `subscribe.cpp:304` |
-| P1 | Non-existent path closes RPC | `subscribe.cpp:63` |
-| P2 | `ON_CHANGE` not implemented | `subscribe.cpp:216` |
-| P2 | `updates_only` ignored | `subscribe.cpp:139` |
-| P3 | `suppress_redundant` not implemented | `subscribe.cpp:36` |
-| P3 | `sample_interval=0` not handled | `subscribe.cpp:213` |
+| Priority | Gap | File | Status |
+|----------|-----|------|--------|
+| P1 | POLL `sync_response` missing | `subscribe.cpp:267` | ✅ fixed |
+| P1 | Non-existent path closes RPC | `subscribe.cpp:63` | pending |
+| P1 | POLL initial snapshot missing | `subscribe.cpp:246` | optional — align with Go ref impl |
+| P1 | Path key filter not applied — `[name=PSC-0]` ignored; all providers match any component path | `psc_power_sensor_provider.cpp` | ✅ fixed |
+| P2 | `ON_CHANGE` not implemented | `subscribe.cpp:216` | Phase 3 |
+| P2 | `updates_only` ignored | `subscribe.cpp:139` | pending |
+| P3 | `suppress_redundant` not implemented | `subscribe.cpp:36` | pending |
+| P3 | `sample_interval=0` not handled | `subscribe.cpp:213` | pending |
+
+### Tool note — gnmic poll mode
+`gnmic --mode poll` (openconfig/gnmic ≥ 0.46) establishes a POLL subscription
+but **never sends Poll trigger messages**; no data is returned. This is a known
+limitation of the gnmic CLI — it is distinct from the `gnmi_cli` tool
+(openconfig/gnmi) which does send automatic poll triggers via `PollingInterval`.
+
+Use `docs/test_poll.py` to verify POLL behaviour end-to-end.
