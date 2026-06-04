@@ -263,6 +263,10 @@ Status Subscribe::handlePoll(ServerContext* context, SubscribeRequest request,
           }
           stream->Write(response);
           response.Clear();
+
+          response.set_sync_response(true);
+          stream->Write(response);
+          response.Clear();
           break;
         }
       // kAliases removed in proto 0.10.0 (field reserved)
