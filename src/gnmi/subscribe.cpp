@@ -83,9 +83,7 @@ Subscribe::BuildSubscribeNotification(Notification *notification,
 
   // use_aliases was reserved/removed in proto 0.10.0; no action needed.
 
-  /* Check if only updates should be sent */
-  if (request.updates_only())
-    BOOST_LOG_TRIVIAL(warning) << "Unsupported updates_only, send all paths";
+  /* updates_only is handled by the caller (handleStream); no action here */
 
   /* Get time since epoch in milliseconds */
   notification->set_timestamp(get_time_nanosec());
@@ -136,18 +134,19 @@ Status Subscribe::handleStream(
     }
   }
 
-  // Sends a first Notification message that updates all Subcriptions
-  status = BuildSubscribeNotification(response.mutable_update(),
-                                      request.subscribe());
-  if (!status.ok()) {
-    context->TryCancel();
-    return status;
+  // Send initial snapshot unless client requested updates_only.
+  // sync_response is always sent to mark initial synchronisation complete.
+  if (!request.subscribe().updates_only()) {
+    status = BuildSubscribeNotification(response.mutable_update(),
+                                        request.subscribe());
+    if (!status.ok()) {
+      context->TryCancel();
+      return status;
+    }
+    stream->Write(response);
+    response.Clear();
   }
-  stream->Write(response);
-  response.Clear();
 
-  // Sends a SYNC message that indicates that initial synchronization
-  // has completed, i.e. each Subscription has been updated once
   response.set_sync_response(true);
   stream->Write(response);
   response.Clear();
