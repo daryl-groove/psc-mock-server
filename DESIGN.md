@@ -208,8 +208,8 @@ cd psc-mock-server && meson setup build && ninja -C build
 - ✅ Fix `updates_only` flag (`subscribe.cpp:139`) — skip initial snapshot when set
 - ✅ Fix path filter in `Fill()` — return only leaves matching subscribed path
 - Non-existent path closes RPC (`subscribe.cpp:63`) — not applicable; our implementation returns empty updates gracefully, no error propagated
-- Add POLL initial snapshot (optional — see note below)
-- **Goal:** ONCE / POLL / STREAM all behave correctly per spec
+- ✅ Add POLL initial snapshot — aligns with Go ref impl (see note below)
+- **Goal:** ✅ ONCE / POLL / STREAM all behave correctly per spec
 
 #### POLL initial snapshot — design note
 Spec §3.5.1.5.3 does not explicitly mandate an initial snapshot when a POLL
@@ -220,9 +220,8 @@ Poll message). However, the OpenConfig Go reference implementation
 trigger. This gives the client a consistent starting state without requiring
 an explicit Poll.
 
-Decision: treat as **optional but recommended**. Align with the Go reference
-impl — send initial snapshot + `sync_response` at POLL subscription
-establishment. Implement after the remaining mandatory fixes.
+Decision: **implemented** — aligned with the Go reference impl, sends initial
+snapshot + `sync_response` at POLL subscription establishment.
 
 ### Phase 3 — ON_CHANGE
 ON_CHANGE requires a fundamentally different data flow from STREAM SAMPLE.
@@ -288,7 +287,7 @@ Critical ones for this project:
 | P2 | `TARGET_DEFINED` silently ignored (proto3 default = 0) | `subscribe.cpp:159` | ✅ fixed — routes via `IDataProvider::PreferredMode()` per leaf; default SAMPLE |
 | P2 | `updates_only` ignored | `subscribe.cpp:139` | ✅ fixed |
 | P3 | `suppress_redundant` not implemented | `subscribe.cpp:36` | pending |
-| P3 | `sample_interval=0` not handled | `subscribe.cpp:213` | pending |
+| P3 | `sample_interval=0` not handled | `subscribe.cpp:213` | ✅ non-issue — loop capped at 200ms, interval=0 fires every iteration = lowest possible |
 
 ### Tool note — gnmic poll mode
 `gnmic --mode poll` (openconfig/gnmic ≥ 0.46) establishes a POLL subscription
