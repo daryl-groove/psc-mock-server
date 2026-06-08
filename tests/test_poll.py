@@ -3,8 +3,9 @@
 POLL subscription test for psc-mock-server.
 
 Verifies:
-  1. Server responds to Poll triggers with sensor data
-  2. Each Poll response is followed by sync_response=true (Phase 2 fix)
+  1. Server sends initial snapshot + sync_response immediately on subscription
+     establishment (before any Poll trigger is sent)
+  2. Server responds to each Poll trigger with sensor data + sync_response
   3. Client-supplied paths determine which updates are returned
 
 Usage:
@@ -78,10 +79,11 @@ def run():
     channel = grpc.insecure_channel(SERVER)
     stub = gnmi_pb2_grpc.gNMIStub(channel)
 
-    poll_num = 0
+    # poll_num 0 = initial snapshot, 1..POLL_COUNT = poll trigger responses
+    poll_num = -1
     updates_in_poll = 0
-    got_sync = False
     errors = []
+    t_start = time.time()
 
     print(f"\n=== POLL test against {SERVER} ===\n")
 
@@ -99,14 +101,24 @@ def run():
 
             elif which == "sync_response":
                 poll_num += 1
+                elapsed = time.time() - t_start
                 got_sync = resp.sync_response
+                label = "initial" if poll_num == 0 else f"poll #{poll_num}"
                 print(f"  [server] sync_response={got_sync}  "
-                      f"(poll #{poll_num}, {updates_in_poll} updates)")
+                      f"({label}, {updates_in_poll} updates, t+{elapsed:.2f}s)")
 
                 if not got_sync:
-                    errors.append(f"poll #{poll_num}: sync_response was False")
+                    errors.append(f"{label}: sync_response was False")
                 if updates_in_poll == 0:
-                    errors.append(f"poll #{poll_num}: no updates received before sync_response")
+                    errors.append(f"{label}: no updates received before sync_response")
+
+                # Initial snapshot must arrive well before the first poll trigger
+                if poll_num == 0 and elapsed >= POLL_INTERVAL_S:
+                    errors.append(
+                        f"initial snapshot arrived too late ({elapsed:.2f}s >= {POLL_INTERVAL_S}s)"
+                        " — server likely did not send on establishment"
+                    )
+
                 updates_in_poll = 0
                 print()
 
@@ -114,15 +126,22 @@ def run():
         print(f"\n[error] gRPC error: {e.code()}: {e.details()}")
         sys.exit(1)
 
+    expected_total = POLL_COUNT + 1  # 1 initial + POLL_COUNT poll triggers
     print("=== Results ===")
-    print(f"  Polls completed : {poll_num} / {POLL_COUNT}")
+    print(f"  Sync responses : {poll_num + 1} / {expected_total}"
+          f"  (1 initial + {POLL_COUNT} poll triggers)")
+    if poll_num + 1 != expected_total:
+        errors.append(
+            f"expected {expected_total} sync_responses, got {poll_num + 1}"
+        )
+
     if errors:
         print("  FAIL")
         for e in errors:
             print(f"    - {e}")
         sys.exit(1)
     else:
-        print("  PASS — sync_response=true received after every poll")
+        print("  PASS")
 
 
 if __name__ == "__main__":
