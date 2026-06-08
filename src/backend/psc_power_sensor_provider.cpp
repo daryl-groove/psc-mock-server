@@ -39,35 +39,46 @@ bool PscPowerSensorProvider::Handles(const std::string& xpath) const {
 
 void PscPowerSensorProvider::Fill(RepeatedPtrField<Update>* list,
                                    const std::string& xpath) {
+    using Reader = double (PscPowerSensorProvider::*)(const std::string&);
+    static const struct { const char* suffix; Reader read; } LEAVES[] = {
+        { "/state/temperature/instant",         &PscPowerSensorProvider::readTemperature   },
+        { "/power-supply/state/input-voltage",  &PscPowerSensorProvider::readInputVoltage  },
+        { "/power-supply/state/input-current",  &PscPowerSensorProvider::readInputCurrent  },
+        { "/power-supply/state/output-voltage", &PscPowerSensorProvider::readOutputVoltage },
+        { "/power-supply/state/output-current", &PscPowerSensorProvider::readOutputCurrent },
+        { "/power-supply/state/output-power",   &PscPowerSensorProvider::readOutputPower   },
+        { "/power-supply/state/capacity",       &PscPowerSensorProvider::readCapacity      },
+    };
+
     // gnmi_to_xpath quotes key values (e.g. [name="PSC-0"]); strip quotes so
     // canonical paths ([name=PSC-0]) compare correctly.
     std::string norm;
     norm.reserve(xpath.size());
     for (char c : xpath) if (c != '"') norm += c;
 
-    // Determine which PSC units to report
+    const bool norm_has_key = (norm.find('[') != std::string::npos);
+
     std::vector<std::string> units;
     for (const auto& unit : PSC_UNITS)
         if (norm.find(unit) != std::string::npos)
             units.push_back(unit);
-    if (units.empty()) units = PSC_UNITS;  // no key filter — wildcard, return all units
+    if (units.empty()) units = PSC_UNITS;
 
     for (const auto& unit : units) {
         const std::string base = "/components/component[name=" + unit + "]";
 
-        // Include a leaf when its full path starts with the requested norm xpath.
-        // This covers: exact leaf, subtree ancestor, and no-key wildcard
-        // (e.g. /components/component is a prefix of /components/component[name=PSC-0]/...).
-        auto want = [&](const std::string& suffix) {
+        // Return true when the leaf's full path starts with norm.
+        // Case 1: direct starts_with (handles exact leaf, subtree, keyed path).
+        // Case 2: norm has no key filter — strip brackets from full path and retry
+        //         (e.g. /components/component matches /components/component[name=PSC-0]/...).
+        auto want = [&](const char* suffix) -> bool {
             std::string full = base + suffix;
-            // Case 1: leaf path starts with norm (norm is ancestor or exact)
             if (full.rfind(norm, 0) == 0) return true;
-            // Case 2: norm has no key filter; strip key from full and retry
-            if (norm.find('[') == std::string::npos) {
+            if (!norm_has_key) {
                 std::string keyless;
                 bool skip = false;
                 for (char c : full) {
-                    if (c == '[') { skip = true; continue; }
+                    if (c == '[') { skip = true;  continue; }
                     if (c == ']') { skip = false; continue; }
                     if (!skip) keyless += c;
                 }
@@ -76,20 +87,9 @@ void PscPowerSensorProvider::Fill(RepeatedPtrField<Update>* list,
             return false;
         };
 
-        if (want("/state/temperature/instant"))
-            addLeaf(list, base + "/state/temperature/instant",       readTemperature(unit));
-        if (want("/power-supply/state/input-voltage"))
-            addLeaf(list, base + "/power-supply/state/input-voltage",  readInputVoltage(unit));
-        if (want("/power-supply/state/input-current"))
-            addLeaf(list, base + "/power-supply/state/input-current",  readInputCurrent(unit));
-        if (want("/power-supply/state/output-voltage"))
-            addLeaf(list, base + "/power-supply/state/output-voltage", readOutputVoltage(unit));
-        if (want("/power-supply/state/output-current"))
-            addLeaf(list, base + "/power-supply/state/output-current", readOutputCurrent(unit));
-        if (want("/power-supply/state/output-power"))
-            addLeaf(list, base + "/power-supply/state/output-power",   readOutputPower(unit));
-        if (want("/power-supply/state/capacity"))
-            addLeaf(list, base + "/power-supply/state/capacity",       readCapacity(unit));
+        for (const auto& leaf : LEAVES)
+            if (want(leaf.suffix))
+                addLeaf(list, base + leaf.suffix, (this->*leaf.read)(unit));
     }
 }
 
