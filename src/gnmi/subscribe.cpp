@@ -248,6 +248,24 @@ Status Subscribe::handlePoll(ServerContext* context, SubscribeRequest request,
   SubscribeRequest subscription = request;
   Status status;
 
+  // Send initial snapshot + sync_response on subscription establishment.
+  // Aligns with Go reference impl (spec/gnmi/subscribe/subscribe.go:435):
+  // client gets consistent state immediately without needing a first Poll trigger.
+  {
+    SubscribeResponse response;
+    status = BuildSubscribeNotification(response.mutable_update(),
+                                        subscription.subscribe());
+    if (!status.ok()) {
+      context->TryCancel();
+      return status;
+    }
+    stream->Write(response);
+    response.Clear();
+    response.set_sync_response(true);
+    stream->Write(response);
+    response.Clear();
+  }
+
   while (stream->Read(&request)) {
     switch (request.request_case()) {
       case request.kPoll:

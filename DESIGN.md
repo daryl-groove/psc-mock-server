@@ -202,8 +202,9 @@ cd psc-mock-server && meson setup build && ninja -C build
 
 ### Phase 2 — Fix Type B Subscribe bugs
 - ✅ Fix POLL `sync_response` missing (`subscribe.cpp:267`) — MUST per spec §3.5.2
-- Fix non-existent path closes RPC (`subscribe.cpp:63`)
-- Fix `updates_only` flag (`subscribe.cpp:139`, `subscribe.cpp:157`)
+- ✅ Fix `updates_only` flag (`subscribe.cpp:139`) — skip initial snapshot when set
+- ✅ Fix path filter in `Fill()` — return only leaves matching subscribed path
+- Non-existent path closes RPC (`subscribe.cpp:63`) — not applicable; our implementation returns empty updates gracefully, no error propagated
 - Add POLL initial snapshot (optional — see note below)
 - **Goal:** ONCE / POLL / STREAM all behave correctly per spec
 
@@ -247,11 +248,11 @@ Critical ones for this project:
 | Priority | Gap | File | Status |
 |----------|-----|------|--------|
 | P1 | POLL `sync_response` missing | `subscribe.cpp:267` | ✅ fixed |
-| P1 | Non-existent path closes RPC | `subscribe.cpp:63` | pending |
+| P1 | Non-existent path closes RPC | `subscribe.cpp:63` | ✅ non-issue — returns empty updates, no error |
 | P1 | POLL initial snapshot missing | `subscribe.cpp:246` | optional — align with Go ref impl |
-| P1 | Path key filter not applied — `[name=PSC-0]` ignored; all providers match any component path | `psc_power_sensor_provider.cpp` | ✅ fixed |
+| P1 | Path key filter not applied | `psc_power_sensor_provider.cpp` | ✅ fixed |
 | P2 | `ON_CHANGE` not implemented | `subscribe.cpp:216` | Phase 3 |
-| P2 | `updates_only` ignored | `subscribe.cpp:139` | pending |
+| P2 | `updates_only` ignored | `subscribe.cpp:139` | ✅ fixed |
 | P3 | `suppress_redundant` not implemented | `subscribe.cpp:36` | pending |
 | P3 | `sample_interval=0` not handled | `subscribe.cpp:213` | pending |
 
