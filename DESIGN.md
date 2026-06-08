@@ -221,10 +221,40 @@ Decision: treat as **optional but recommended**. Align with the Go reference
 impl — send initial snapshot + `sync_response` at POLL subscription
 establishment. Implement after the remaining mandatory fixes.
 
-### Phase 3 — ON_CHANGE (easier without sysrepo)
-- Add value cache in `PscPowerSensorProvider` (previous reading per path)
-- In `subscribe.cpp` STREAM loop: compare current vs cached, emit only on change
-- Add `heartbeat_interval` support
+### Phase 3 — ON_CHANGE
+ON_CHANGE requires a fundamentally different data flow from STREAM SAMPLE.
+STREAM SAMPLE calls `Fill()` on every sample interval (pull/periodic);
+ON_CHANGE must only emit a Notification when a value actually changes (event-driven).
+
+**Spec requirements (§3.5.1.3):**
+- Initial snapshot: **MUST** send updates for all matching paths immediately on subscription establishment, then `sync_response`. Same as ONCE — spec is explicit MUST, not optional.
+- Changed values: **SHOULD** only transmit when value changes after the initial snapshot.
+- `heartbeat_interval`: if set, **MUST** re-send all values once per interval regardless of change.
+
+**Architecture (aligned with Go reference `spec/gnmi/subscribe/subscribe.go`):**
+
+- Add a per-leaf value cache inside `PscPowerSensorProvider` (previous reading per path)
+- `Fill()` compares new reading vs cached; emits only changed leaves
+- `subscribe.cpp` STREAM handler: send initial snapshot + `sync_response` first (MUST), then enter loop that calls `Fill()` and emits only if updateList is non-empty
+- Add `heartbeat_interval` support: force-emit all leaves periodically even if unchanged
+
+**Notification semantics for ON_CHANGE vs STREAM SAMPLE:**
+
+| | STREAM SAMPLE | ON_CHANGE |
+|--|--------------|-----------|
+| Trigger | timer (sample_interval) | value change detected |
+| Content | full state every tick | only changed leaves |
+| `atomic` | `false` — leaves independent | `false` for sensors; `true` only for config objects with coupling (e.g. route entry) |
+| `prefix` | not set (full path per Update) | same — not set for sensors; could be set to common ancestor for large subtrees |
+
+**Notification.prefix design decision:**
+Spec allows setting `Notification.prefix` to a common path ancestor so each
+`Update.path` carries only the relative suffix. For PSC sensors all sharing
+`/components/component[name=PSC-x]`, this would reduce wire size. However:
+- Go reference does not apply prefix path compression for ordinary STREAM/ON_CHANGE sensor data; prefix is used mainly for `Target`/`Origin` identification and `atomic` batches
+- Implementing per-unit prefix requires splitting one `BuildSubscribeNotification()` call into multiple per-unit Notification writes — moderate refactor
+- **Decision:** keep full paths in each Update for now; revisit if wire size becomes a concern or if a client requires prefix-relative paths
+
 - **Goal:** ON_CHANGE subscriptions work end-to-end
 
 ### Phase 4 — Capabilities + JSON_IETF polish
@@ -249,9 +279,10 @@ Critical ones for this project:
 |----------|-----|------|--------|
 | P1 | POLL `sync_response` missing | `subscribe.cpp:267` | ✅ fixed |
 | P1 | Non-existent path closes RPC | `subscribe.cpp:63` | ✅ non-issue — returns empty updates, no error |
-| P1 | POLL initial snapshot missing | `subscribe.cpp:246` | optional — align with Go ref impl |
+| P1 | POLL initial snapshot missing | `subscribe.cpp:246` | ✅ fixed — aligns with Go ref impl |
 | P1 | Path key filter not applied | `psc_power_sensor_provider.cpp` | ✅ fixed |
 | P2 | `ON_CHANGE` not implemented | `subscribe.cpp:216` | Phase 3 |
+| P2 | `TARGET_DEFINED` silently ignored (proto3 default = 0) | `subscribe.cpp:159` | pending — map to SAMPLE for all PSC leaves |
 | P2 | `updates_only` ignored | `subscribe.cpp:139` | ✅ fixed |
 | P3 | `suppress_redundant` not implemented | `subscribe.cpp:36` | pending |
 | P3 | `sample_interval=0` not handled | `subscribe.cpp:213` | pending |
@@ -262,4 +293,4 @@ but **never sends Poll trigger messages**; no data is returned. This is a known
 limitation of the gnmic CLI — it is distinct from the `gnmi_cli` tool
 (openconfig/gnmi) which does send automatic poll triggers via `PollingInterval`.
 
-Use `docs/test_poll.py` to verify POLL behaviour end-to-end.
+Use `tests/test_poll.py` to verify POLL behaviour end-to-end.

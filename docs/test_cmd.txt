@@ -78,7 +78,7 @@ Note    : gnmic --mode poll (openconfig/gnmic ≥ 0.46) establishes the
           subscription but never sends Poll trigger messages — no data is
           returned. This is a known gnmic limitation. Use test_poll.py instead.
 
-  python3 docs/test_poll.py
+  python3 tests/test_poll.py
 
 Verify  : Script sends 3 Poll triggers at 1.5s intervals.
           Each trigger receives sensor data followed by sync_response=True.
