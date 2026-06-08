@@ -1,4 +1,5 @@
 build/
+proto/generated/
 __pycache__/
 *.pyc
 *.pyo

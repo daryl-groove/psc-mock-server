@@ -20,23 +20,51 @@ boost_dep  = dependency('boost',
 thread_dep = dependency('threads')
 
 # ---------------------------------------------------------------------------
-# Pre-generated proto sources
+# Proto code generation
 #
-# gnmi.proto and gnmi_ext.proto are stable OpenConfig spec files.
-# Generated files live in proto/generated/ and are committed to the repo.
-#
-# To regenerate (only needed when proto/ files change):
-#   python3 proto/gen_proto.py <protoc> <grpc_cpp_plugin> <outdir> <srcdir>
-# or directly:
-#   cd proto && protoc --proto_path=. --cpp_out=generated --grpc_out=generated \
-#     --plugin=protoc-gen-grpc=$(which grpc_cpp_plugin) gnmi_ext.proto gnmi.proto
+# gnmi.proto imports "github.com/.../gnmi_ext/gnmi_ext.proto".
+# protoc places gnmi_ext outputs in a matching subdirectory of @OUTDIR@.
+# gnmi.pb.h will #include "github.com/.../gnmi_ext.pb.h" — resolved because
+# meson adds the custom_target output dir to the executable's include path.
+# We also copy gnmi_ext files flat to @OUTDIR@ so they compile as sources.
 # ---------------------------------------------------------------------------
 
-proto_sources = files(
-  'proto/generated/gnmi.pb.cc',
-  'proto/generated/gnmi.grpc.pb.cc',
-  'proto/generated/gnmi_ext.pb.cc',
-  'proto/generated/gnmi_ext.grpc.pb.cc',
+protoc          = find_program('protoc')
+grpc_cpp_plugin = find_program('grpc_cpp_plugin')
+
+gnmi_ext_proto = custom_target('gnmi_ext_proto',
+  input  : 'proto/github.com/openconfig/gnmi/proto/gnmi_ext/gnmi_ext.proto',
+  output : ['gnmi_ext.pb.cc', 'gnmi_ext.pb.h',
+             'gnmi_ext.grpc.pb.cc', 'gnmi_ext.grpc.pb.h'],
+  command: [
+    'bash', '-c',
+    'set -e'
+    + '; "$1" --proto_path="$4/proto" --cpp_out="$2" --grpc_out="$2"'
+    + ' --plugin=protoc-gen-grpc="$3"'
+    + ' github.com/openconfig/gnmi/proto/gnmi_ext/gnmi_ext.proto'
+    + '; EXT="$2/github.com/openconfig/gnmi/proto/gnmi_ext"'
+    + '; for f in pb.cc pb.h grpc.pb.cc grpc.pb.h;'
+    + ' do cp "$EXT/gnmi_ext.$f" "$2/gnmi_ext.$f"; done',
+    '_',                            # $0 (dummy for bash -c positional args)
+    protoc.full_path(),             # $1
+    '@OUTDIR@',                     # $2
+    grpc_cpp_plugin.full_path(),    # $3
+    meson.project_source_root(),    # $4
+  ]
+)
+
+gnmi_proto = custom_target('gnmi_proto',
+  input  : 'proto/gnmi.proto',
+  output : ['gnmi.pb.cc', 'gnmi.pb.h', 'gnmi.grpc.pb.cc', 'gnmi.grpc.pb.h'],
+  depends: gnmi_ext_proto,
+  command: [
+    protoc,
+    '--proto_path=@CURRENT_SOURCE_DIR@/proto',
+    '--cpp_out=@OUTDIR@',
+    '--grpc_out=@OUTDIR@',
+    '--plugin=protoc-gen-grpc=' + grpc_cpp_plugin.full_path(),
+    '@CURRENT_SOURCE_DIR@/proto/gnmi.proto',
+  ]
 )
 
 # ---------------------------------------------------------------------------
@@ -53,7 +81,8 @@ sources = [
   'src/backend/psc_power_sensor_provider.cpp',
   'src/security/authentication.cpp',
   'src/utils/log.cpp',
-  proto_sources,
+  gnmi_ext_proto,
+  gnmi_proto,
 ]
 
 # ---------------------------------------------------------------------------
@@ -70,7 +99,8 @@ executable('psc-mock-server',
   ],
   include_directories : [
     include_directories('src'),
-    include_directories('proto/generated'),  # for #include <gnmi.grpc.pb.h>
+    # Generated proto headers live in the build dir; meson auto-adds that
+    # directory to the include path when custom_target appears in sources.
   ],
   install : false
 )
