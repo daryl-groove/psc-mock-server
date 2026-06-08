@@ -157,7 +157,16 @@ Status Subscribe::handleStream(
   for (int i=0; i<request.subscribe().subscription_size(); i++) {
     Subscription sub = request.subscribe().subscription(i);
     switch (sub.mode()) {
-      case TARGET_DEFINED:  // all PSC leaves are continuous sensors → SAMPLE
+      case TARGET_DEFINED:
+        {
+          auto resolved = registry_.PreferredMode(gnmi_to_xpath(sub.path()));
+          if (resolved == SAMPLE) {
+            chronomap.emplace_back(sub, high_resolution_clock::now());
+          } else {
+            BOOST_LOG_TRIVIAL(warning) << "TARGET_DEFINED resolved to ON_CHANGE: Phase 3";
+          }
+          break;
+        }
       case SAMPLE:
         chronomap.emplace_back(sub, high_resolution_clock::now());
         break;

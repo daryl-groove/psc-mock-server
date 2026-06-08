@@ -121,6 +121,9 @@ void addLeaf(list, xpath, std::string value); // string_val  (status, firmware, 
 void addLeaf(list, xpath, bool value);        // bool_val    (enabled, alarm)
 void addLeaf(list, xpath, int64_t value);     // int_val     (signed counter)
 void addLeaf(list, xpath, uint64_t value);    // uint_val    (unsigned counter)
+
+// TARGET_DEFINED mode resolution — override in event-driven providers
+gnmi::SubscriptionMode PreferredMode(xpath);  // default: SAMPLE
 ```
 
 ---
@@ -282,7 +285,7 @@ Critical ones for this project:
 | P1 | POLL initial snapshot missing | `subscribe.cpp:246` | ✅ fixed — aligns with Go ref impl |
 | P1 | Path key filter not applied | `psc_power_sensor_provider.cpp` | ✅ fixed |
 | P2 | `ON_CHANGE` not implemented | `subscribe.cpp:216` | Phase 3 |
-| P2 | `TARGET_DEFINED` silently ignored (proto3 default = 0) | `subscribe.cpp:159` | ✅ fixed — mapped to SAMPLE for all PSC leaves |
+| P2 | `TARGET_DEFINED` silently ignored (proto3 default = 0) | `subscribe.cpp:159` | ✅ fixed — routes via `IDataProvider::PreferredMode()` per leaf; default SAMPLE |
 | P2 | `updates_only` ignored | `subscribe.cpp:139` | ✅ fixed |
 | P3 | `suppress_redundant` not implemented | `subscribe.cpp:36` | pending |
 | P3 | `sample_interval=0` not handled | `subscribe.cpp:213` | pending |

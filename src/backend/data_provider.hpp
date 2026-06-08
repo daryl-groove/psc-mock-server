@@ -86,6 +86,13 @@ public:
     // Appends entries to list — does NOT clear it.
     virtual void Fill(RepeatedPtrField<Update>* list,
                       const std::string& xpath) = 0;
+
+    // Return the preferred subscription mode for this xpath under TARGET_DEFINED.
+    // Default SAMPLE suits continuous sensor data; override to ON_CHANGE for
+    // event-driven leaves (alarms, state transitions).
+    virtual gnmi::SubscriptionMode PreferredMode(const std::string&) const {
+        return gnmi::SAMPLE;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -114,6 +121,16 @@ public:
             if (p->Handles(xpath))
                 p->Fill(list, xpath);
         }
+    }
+
+    // Returns the first matching provider's preferred subscription mode.
+    // Used by subscribe.cpp to resolve TARGET_DEFINED on a per-leaf basis.
+    gnmi::SubscriptionMode PreferredMode(const std::string& xpath) const {
+        for (auto& p : providers_) {
+            if (p->Handles(xpath))
+                return p->PreferredMode(xpath);
+        }
+        return gnmi::SAMPLE;
     }
 
 private:
