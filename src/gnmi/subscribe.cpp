@@ -157,12 +157,13 @@ Status Subscribe::handleStream(
   for (int i=0; i<request.subscribe().subscription_size(); i++) {
     Subscription sub = request.subscribe().subscription(i);
     switch (sub.mode()) {
+      case TARGET_DEFINED:  // all PSC leaves are continuous sensors → SAMPLE
       case SAMPLE:
         chronomap.emplace_back(sub, high_resolution_clock::now());
         break;
       default:
         BOOST_LOG_TRIVIAL(warning) << "Unsupported mode";
-        // TODO: Handle ON_CHANGE and TARGET_DEFINED modes
+        // TODO: Handle ON_CHANGE mode (Phase 3)
         // Ref: 3.5.1.5.2
         break;
     }
