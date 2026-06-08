@@ -33,6 +33,11 @@ public:
     void Fill(RepeatedPtrField<Update>* list,
               const std::string& xpath) override;
 
+    // All PSC sensor leaves are continuous measured values — SAMPLE is correct.
+    gnmi::SubscriptionMode PreferredMode(const std::string&) const override {
+        return gnmi::SAMPLE;
+    }
+
 private:
     // Mock sensor reads — replace with hardware access for real hardware
     double readTemperature(const std::string& unit);    // celsius
