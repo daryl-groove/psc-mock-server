@@ -154,16 +154,9 @@ public:
     }
 
 private:
-    // True if xpath (after quote-stripping) starts with prefix at a segment
-    // boundary — preventing /foobar from matching prefix /foo.
+    // True if the registered prefix owns this xpath's namespace.
     static bool matches(const std::string& xpath, const std::string& prefix) {
-        std::string norm;
-        norm.reserve(xpath.size());
-        for (char c : xpath) if (c != '"') norm += c;
-        if (!norm.starts_with(prefix)) return false;
-        if (norm.size() == prefix.size()) return true;
-        const char next = norm[prefix.size()];
-        return next == '/' || next == '[';
+        return isPathPrefix(prefix, stripPathQuotes(xpath));
     }
 
     std::vector<std::pair<std::string, IDataProvider*>> routes_;

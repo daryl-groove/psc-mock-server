@@ -109,6 +109,26 @@ inline void xpath_to_gnmi_path(const std::string& xpath, gnmi::Path* path)
   }
 }
 
+// Remove the double quotes gnmi_to_xpath puts around key values, so that
+// [name="PSC-0"] and [name=PSC-0] compare equal.
+inline std::string stripPathQuotes(const std::string& xpath) {
+    std::string out;
+    out.reserve(xpath.size());
+    for (char c : xpath)
+        if (c != '"') out += c;
+    return out;
+}
+
+// True if `prefix` is a path-prefix of `path` ending at a segment boundary:
+// /foo matches /foo, /foo/bar, /foo[k=v] but NOT /foobar. Both arguments must
+// already be quote-normalised (see stripPathQuotes).
+inline bool isPathPrefix(const std::string& prefix, const std::string& path) {
+    if (!path.starts_with(prefix)) return false;
+    if (path.size() == prefix.size()) return true;
+    const char next = path[prefix.size()];
+    return next == '/' || next == '[';
+}
+
 // Returns INVALID_ARGUMENT if the Path has structural issues:
 // empty element name or empty key name.
 // An empty path (no elems) is valid — it represents a root query.

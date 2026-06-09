@@ -133,6 +133,42 @@ TEST(ValidateGnmiPath, EmptyKeyNameIsInvalid) {
 }
 
 // ---------------------------------------------------------------------------
+// stripPathQuotes / isPathPrefix — shared path-match primitives
+// ---------------------------------------------------------------------------
+
+TEST(StripPathQuotes, RemovesKeyQuotes) {
+    EXPECT_EQ(stripPathQuotes("/components/component[name=\"PSC-0\"]/state"),
+              "/components/component[name=PSC-0]/state");
+}
+
+TEST(StripPathQuotes, LeavesUnquotedUnchanged) {
+    EXPECT_EQ(stripPathQuotes("/components/component[name=PSC-0]"),
+              "/components/component[name=PSC-0]");
+}
+
+TEST(IsPathPrefix, ExactMatch) {
+    EXPECT_TRUE(isPathPrefix("/foo", "/foo"));
+}
+
+TEST(IsPathPrefix, MatchesAtSlashBoundary) {
+    EXPECT_TRUE(isPathPrefix("/foo", "/foo/bar"));
+}
+
+TEST(IsPathPrefix, MatchesAtKeyBoundary) {
+    EXPECT_TRUE(isPathPrefix("/components/component",
+                             "/components/component[name=PSC-0]"));
+}
+
+TEST(IsPathPrefix, RejectsPartialSegment) {
+    EXPECT_FALSE(isPathPrefix("/foo", "/foobar"));
+    EXPECT_FALSE(isPathPrefix("/a/power", "/a/power-supply/x"));
+}
+
+TEST(IsPathPrefix, RejectsWhenNotAPrefix) {
+    EXPECT_FALSE(isPathPrefix("/foo", "/bar/foo"));
+}
+
+// ---------------------------------------------------------------------------
 // gnmi_to_xpath
 // ---------------------------------------------------------------------------
 

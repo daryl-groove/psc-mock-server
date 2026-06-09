@@ -2,16 +2,6 @@
 
 namespace {
 
-// gnmi_to_xpath emits quoted keys (e.g. [name="PSC-0"]); store keys and queries
-// are normalised to the unquoted form so both spellings compare equal.
-std::string stripQuotes(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s)
-        if (c != '"') out += c;
-    return out;
-}
-
 // Drop every [key=value] predicate, leaving the bare element path. Lets a
 // keyless query (/components/component/.../input-voltage) select keyed leaves of
 // every instance.
@@ -26,21 +16,12 @@ std::string stripKeys(const std::string& s) {
     return out;
 }
 
-// True if prefix matches full at a path-segment boundary, so /power does not
-// match /power-supply.
-bool isPrefixAtBoundary(const std::string& prefix, const std::string& full) {
-    if (full.rfind(prefix, 0) != 0) return false;
-    if (full.size() == prefix.size()) return true;
-    const char next = full[prefix.size()];
-    return next == '/' || next == '[';
-}
-
 // True if a stored leaf path is selected by query (already quote-stripped).
 // A keyless query also matches keyed leaves of the same shape.
 bool selects(const std::string& query, const std::string& leaf) {
-    if (isPrefixAtBoundary(query, leaf)) return true;
+    if (isPathPrefix(query, leaf)) return true;
     if (query.find('[') == std::string::npos)
-        return isPrefixAtBoundary(query, stripKeys(leaf));
+        return isPathPrefix(query, stripKeys(leaf));
     return false;
 }
 
@@ -85,19 +66,19 @@ void LeafStore::set(const std::string& xpath, uint64_t value, int64_t collectedN
 
 void LeafStore::setValue(const std::string& xpath, gnmi::TypedValue val,
                          int64_t collectedNs) {
-    const std::string key = stripQuotes(xpath);
+    const std::string key = stripPathQuotes(xpath);
     std::unique_lock lock(mu_);
     leaves_[key] = Leaf{std::move(val), collectedNs};
 }
 
 void LeafStore::remove(const std::string& xpath) {
-    const std::string key = stripQuotes(xpath);
+    const std::string key = stripPathQuotes(xpath);
     std::unique_lock lock(mu_);
     leaves_.erase(key);
 }
 
 std::optional<LeafStore::Leaf> LeafStore::get(const std::string& xpath) const {
-    const std::string key = stripQuotes(xpath);
+    const std::string key = stripPathQuotes(xpath);
     std::shared_lock lock(mu_);
     auto it = leaves_.find(key);
     if (it == leaves_.end()) return std::nullopt;
@@ -106,7 +87,7 @@ std::optional<LeafStore::Leaf> LeafStore::get(const std::string& xpath) const {
 
 bool LeafStore::collect(const std::string& queryXpath,
                         RepeatedPtrField<Update>* list) const {
-    const std::string query = stripQuotes(queryXpath);
+    const std::string query = stripPathQuotes(queryXpath);
     std::shared_lock lock(mu_);
     const int before = list->size();
     for (const auto& [path, leaf] : leaves_) {
@@ -119,7 +100,7 @@ bool LeafStore::collect(const std::string& queryXpath,
 }
 
 LeafStore::Snapshot LeafStore::snapshot(const std::string& queryXpath) const {
-    const std::string query = stripQuotes(queryXpath);
+    const std::string query = stripPathQuotes(queryXpath);
     std::shared_lock lock(mu_);
     Snapshot out;
     for (const auto& [path, leaf] : leaves_)
