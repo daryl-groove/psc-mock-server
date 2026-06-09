@@ -564,6 +564,26 @@ AlarmProvider is a natural example: alarm paths like
 cleared. The Leaf Store `remove()` + Notification `delete` field handle this
 cleanly without any special-casing in `subscribe.cpp`.
 
+**Integration into existing `subscribe.cpp` (open for C to design):**
+The notes above describe ON_CHANGE in isolation. These integration points are *not*
+yet decided and are what C must work out — they live in `handleStream()`, whose
+current shape is a per-SAMPLE-subscription `chronomap` timer loop (the `default:`
+case of the `switch (sub.mode())` currently just logs "Unsupported mode").
+- **Mixed-mode lists:** one `SubscriptionList` may carry both SAMPLE and ON_CHANGE
+  `Subscription` entries (spec-legal). The single `while` loop must service both —
+  SAMPLE entries by timer, ON_CHANGE entries by diff — not assume the whole stream is
+  one mode.
+- **Detection cadence (poll, not push):** the `LeafStore` has no change
+  notification; ON_CHANGE detects changes by polling `snapshot()` + `diff()` on each
+  loop iteration (the loop is already capped at ~200ms). A push/notify on the store
+  is a possible later optimisation, deliberately deferred.
+- **`updates_only` + ON_CHANGE:** still take the baseline `prev = snapshot(query)` at
+  setup, but suppress the initial emit; send `sync_response` first, then only diffs.
+- **`TARGET_DEFINED` → ON_CHANGE:** the existing `preferredMode()` resolution already
+  routes per-leaf; the branch that currently logs "Phase 3" must route into the
+  ON_CHANGE path. (No current provider returns ON_CHANGE, so this path is wiring only
+  until an event-driven provider exists.)
+
 ---
 
 ### D. Parent Path Query Support
