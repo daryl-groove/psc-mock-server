@@ -510,10 +510,18 @@ To keep bundling honest (spec §3.5.2.1 — bundling MUST NOT obscure distinct
 timestamps), the background writer updates all leaves of a single tick under one
 timestamp T; leaves sharing T can then be bundled into one Notification accurately.
 
-**Remaining (Phase 3 / C):** wire `Notification.timestamp` to each leaf's
-`collected_ns`, and map `diff().removed → Notification.delete`. The external-injection
-API (`set()`/`remove()`) is already present; it gets exercised for real when wired to
-hardware.
+**Remaining (Phase 3 / C):**
+- Wire `Notification.timestamp` to each leaf's `collected_ns` (subscribe.cpp still stamps "now").
+- Map `diff().removed → Notification.delete`.
+- While wiring timestamps: `get_time_nanosec()` returns `uint64_t` but
+  `Notification.timestamp` / `collected_ns` are `int64`. Fold a return-type fix (or a
+  typed wrapper) into C to drop the scattered `static_cast<int64_t>`.
+
+**External injection (deferred until hardware wiring):** the `LeafStore` API
+(`set()`/`remove()`) is already present, but `PscPowerSensorProvider` keeps `store_`
+private with no accessor. An injection point (e.g. a `LeafStore& store()` accessor or
+a setter) is the small piece still needed before a hardware or test caller can push
+values in.
 
 ---
 
