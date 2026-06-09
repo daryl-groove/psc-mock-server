@@ -104,3 +104,33 @@ executable('psc-mock-server',
   ],
   install : false
 )
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+gtest_dep = dependency('gtest', main: true)
+
+test_data_provider = executable('test_data_provider',
+  ['tests/test_data_provider.cpp', gnmi_ext_proto, gnmi_proto],
+  dependencies : [proto_dep, grpc_dep, thread_dep, gtest_dep],
+  include_directories : [include_directories('src')],
+)
+
+test_psc_provider = executable('test_psc_provider',
+  ['tests/test_psc_provider.cpp',
+   'src/backend/psc_power_sensor_provider.cpp',
+   gnmi_ext_proto, gnmi_proto],
+  dependencies : [proto_dep, grpc_dep, thread_dep, boost_dep, gtest_dep],
+  include_directories : [include_directories('src')],
+)
+
+test_utils = executable('test_utils',
+  ['tests/test_utils.cpp', gnmi_ext_proto, gnmi_proto],
+  dependencies : [proto_dep, grpc_dep, thread_dep, gtest_dep],
+  include_directories : [include_directories('src')],
+)
+
+test('data_provider', test_data_provider)
+test('psc_provider',  test_psc_provider)
+test('utils',         test_utils)
