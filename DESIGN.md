@@ -152,23 +152,46 @@ gnmi::SubscriptionMode PreferredMode(xpath);  // default: SAMPLE
 
 ### Key distinction
 
-**"Does not exist (yet)"** — path is valid in the schema but has no data currently
-(e.g. hardware temporarily offline). Subscribe must not close the RPC; Get returns `NOT_FOUND`.
+The spec defines **three** outcomes, distinguished by two independent questions:
+**routing** (does any registered provider's prefix own this path's namespace?) and
+**data availability** (is a value actually present?).
 
-**"Not implemented"** — path is not supported by this server at all.
-Both Get and Subscribe must return `UNIMPLEMENTED`.
+| Outcome | Condition | Get | Subscribe (STREAM) |
+|---|---|---|---|
+| **Not implemented** | no registered prefix matches | `UNIMPLEMENTED` | `UNIMPLEMENTED` |
+| **Exists, no data (yet)** | a prefix matches, but no value is available | `NOT_FOUND` | silent — RPC **MUST NOT** be closed |
+| **Exists, has value** | a prefix matches and a value is available | return value(s) | return value(s) |
 
-For this mock server, any path not handled by any registered provider is treated as
-**"not implemented"** (`UNIMPLEMENTED`), not "does not exist". A mock server does not
-monitor for future hardware presence.
+**"Does not exist (yet)"** — path is valid in the schema and owned by a provider,
+but has no data currently (e.g. hardware temporarily offline, or store not yet
+seeded). Subscribe must not close the RPC; Get returns `NOT_FOUND`.
+
+**"Not implemented"** — no registered provider owns the path's namespace at all.
+Both Get and Subscribe return `UNIMPLEMENTED`. A mock server does not monitor for
+future hardware presence under a namespace it does not serve.
 
 ### Implementation
 
-`DataProviderRegistry::fill()` returns `bool` — true if at least one provider matched.
+Distinguishing all three requires `DataProviderRegistry::fill()` to report **two**
+signals, not a single bool:
+- **routed** — at least one provider's registered prefix matched the path
+- **produced** — at least one Update was appended
 
-- `get.cpp::buildGetUpdate()` → returns `NOT_FOUND` when `fill()` returns false (§3.3.4)
-- `subscribe.cpp::buildSubsUpdate()` → logs WARN when `fill()` returns false; RPC not closed (§3.5.1.3 MUST NOT close)
-- `tests/test_data_provider.cpp` → covers both true/false return paths
+| routed | produced | Get | Subscribe |
+|---|---|---|---|
+| false | — | `UNIMPLEMENTED` | `UNIMPLEMENTED` |
+| true | false | `NOT_FOUND` | WARN, RPC not closed (§3.5.1.3 MUST NOT close) |
+| true | true | OK | OK |
+
+- `get.cpp::buildGetUpdate()` → maps the two signals to the table above (§3.3.4)
+- `subscribe.cpp::buildSubsUpdate()` → `routed==false` → `UNIMPLEMENTED`; `routed && !produced` → silent, RPC not closed
+- `tests/test_data_provider.cpp` → covers all three outcomes
+
+> **Status:** the original implementation collapsed both signals into a single
+> `bool` (list growth) and returned `NOT_FOUND` for *unrouted* paths — which
+> contradicts the "not implemented → `UNIMPLEMENTED`" rule above. The two-signal
+> split lands with the Leaf Store work (B), which also introduces the
+> data-availability dimension (routed-but-empty → `NOT_FOUND`).
 
 ---
 
@@ -411,10 +434,10 @@ it is impossible to detect whether a value actually changed.
 
 ```
 Hardware thread / external caller
-       │  store.set(xpath, value)
+       │  store.set(xpath, value)   ← stamps collection time T
        ▼
-  LeafStore  ─  thread-safe path→TypedValue map
-       │  store.get(xpath)  /  store.changedSince(snapshot)
+  LeafStore  ─  thread-safe path→{value, collected_ns} map
+       │  store.get(xpath)  /  store.snapshot()  /  store.diff(snapshot)
        ▼
   Provider::fill() — reads from store, not from hardware directly
 ```
@@ -423,7 +446,7 @@ Key components:
 
 | Component | Role |
 |-----------|------|
-| `LeafStore` | `std::unordered_map<std::string, TypedValue>` protected by `std::shared_mutex`. Provides `set()`, `get()`, `snapshot()`, `diff(snapshot)`. |
+| `LeafStore` | `std::map<std::string, Leaf>` where `Leaf = {gnmi::TypedValue val; int64_t collected_ns;}`, protected by `std::shared_mutex`. Provides `set()`, `get()`, `snapshot()`, `diff(snapshot)`. Stores a per-leaf **collection timestamp**, not just the value (see Timestamp semantics below). |
 | `ILeafStoreProvider` | `IDataProvider` subclass whose `fill()` reads from its `LeafStore`. Exposes `setLeaf()` / `removeLeaf()` for external updates. |
 | Background thread | Hardware poller or simulator: calls `setLeaf()` at some interval. |
 
@@ -447,6 +470,18 @@ message Notification {
 }
 ```
 
+**Timestamp semantics (spec §2.1, §3.5.2.3):**
+`Notification.timestamp` MUST be the time the value was *collected from the underlying
+source* (or, for ON_CHANGE, the time the event occurred) — **not** the time the message
+is emitted. Under the current compute-on-the-fly design these coincide, so
+`subscribe.cpp` using `get_time_nanosec()` ("now") is accidentally correct. Once a
+background writer updates the store at time T and emission happens at T+δ, "now" is
+wrong. Therefore each leaf carries its own `collected_ns`, and emit uses that.
+
+To keep bundling honest (spec §3.5.2.1 — bundling MUST NOT obscure distinct
+timestamps), the background writer updates all leaves of a single tick under one
+timestamp T; leaves sharing T can then be bundled into one Notification accurately.
+
 **When:** Phase 3 (ON_CHANGE) is blocked on at least the per-leaf cache part of this.
 Full external-injection API is needed when connecting to real hardware.
 
@@ -459,16 +494,27 @@ decided during discussion.)*
 
 Depends on: **Leaf Store Architecture (B)** for the per-leaf previous-value cache.
 
-**`heartbeat_interval` + `suppress_redundant` interaction (spec §3.5.1.5.2):**
+**`suppress_redundant` is a SAMPLE-only field** (spec §3.5.1.5.2). ON_CHANGE already
+transmits only on change *by definition*, so it does not combine with ON_CHANGE — it
+is discussed here only because, like ON_CHANGE's heartbeat, it interacts with
+`heartbeat_interval`.
 
-| `suppress_redundant` | heartbeat behaviour |
-|---|---|
-| false (default) | Re-emit ALL leaves every `heartbeat_interval`, even unchanged |
-| true | At heartbeat time, skip leaves whose value has not changed since last emission |
+**`heartbeat_interval` + `suppress_redundant` interaction (SAMPLE, spec §3.5.1.5.2):**
+
+| `suppress_redundant` | normal sample tick | heartbeat tick |
+|---|---|---|
+| false (default) | emit all leaves | emit all leaves |
+| true | emit only changed leaves | **MUST emit regardless** — heartbeat overrides suppression |
+
+The key spec rule (previously documented backwards): a heartbeat tick MUST generate
+an update *regardless of whether `suppress_redundant` is true*. Heartbeat is a
+liveness signal — it forces a full re-emit even when nothing has changed.
 
 `suppress_redundant` is currently P3 in the Type B Gaps table. Implementing it
-correctly requires the Leaf Store to track both the current value and the
-last-emitted value per leaf.
+correctly requires the Leaf Store to track the **current** value per leaf, while the
+**last-emitted** state is tracked per-subscriber (in the subscribe handler), never in
+the shared store — otherwise concurrent subscribers would corrupt each other's
+suppression state.
 
 **ON_CHANGE for dynamic providers (e.g. AlarmProvider):**
 gNMI explicitly anticipates leaves appearing and disappearing during the life of a
