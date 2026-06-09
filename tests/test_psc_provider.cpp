@@ -2,40 +2,48 @@
 #include "backend/psc_power_sensor_provider.hpp"
 
 // ---------------------------------------------------------------------------
-// PscPowerSensorProvider::handles()
+// PscPowerSensorProvider::fill()
 // ---------------------------------------------------------------------------
 
-TEST(PscPowerSensorHandles, ExactLeafPath) {
+TEST(PscPowerSensorFill, ExactLeafProducesOneUpdate) {
     PscPowerSensorProvider p;
-    EXPECT_TRUE(p.handles("/components/component[name=PSC-0]/power-supply/state/output-voltage"));
+    RepeatedPtrField<Update> list;
+    p.fill(&list, "/components/component[name=PSC-0]/state/temperature/instant");
+    EXPECT_EQ(list.size(), 1);
 }
 
-TEST(PscPowerSensorHandles, SubtreePath) {
+TEST(PscPowerSensorFill, SubtreeProducesMultipleUpdates) {
     PscPowerSensorProvider p;
-    EXPECT_TRUE(p.handles("/components/component[name=PSC-0]/power-supply/state"));
+    RepeatedPtrField<Update> list;
+    p.fill(&list, "/components/component[name=PSC-0]/power-supply/state");
+    EXPECT_EQ(list.size(), 6);  // 6 power-supply leaves
 }
 
-TEST(PscPowerSensorHandles, ComponentWithoutKey) {
+TEST(PscPowerSensorFill, AllUnitsProducesUpdatesForBoth) {
     PscPowerSensorProvider p;
-    EXPECT_TRUE(p.handles("/components/component"));
+    RepeatedPtrField<Update> list;
+    p.fill(&list, "/components/component");
+    EXPECT_EQ(list.size(), 14);  // 7 leaves × 2 units
 }
 
-TEST(PscPowerSensorHandles, NonPscComponentIsAccepted) {
+TEST(PscPowerSensorFill, NonPscUnitProducesNoUpdates) {
     PscPowerSensorProvider p;
-    EXPECT_TRUE(p.handles("/components/component[name=FAN-0]/state"));
+    RepeatedPtrField<Update> list;
+    p.fill(&list, "/components/component[name=FAN-0]/state");
+    EXPECT_EQ(list.size(), 0);
 }
 
-TEST(PscPowerSensorHandles, DoesNotHandleSystemPath) {
+TEST(PscPowerSensorFill, UnrecognizedLeafProducesNoUpdates) {
     PscPowerSensorProvider p;
-    EXPECT_FALSE(p.handles("/system/alarms"));
+    RepeatedPtrField<Update> list;
+    p.fill(&list, "/components/component[name=PSC-0]/nonexistent/leaf");
+    EXPECT_EQ(list.size(), 0);
 }
 
-TEST(PscPowerSensorHandles, DoesNotHandleComponentsRoot) {
+TEST(PscPowerSensorFill, QuotedKeyProducesSameResultAsUnquoted) {
     PscPowerSensorProvider p;
-    EXPECT_FALSE(p.handles("/components"));
-}
-
-TEST(PscPowerSensorHandles, DoesNotHandleEmptyPath) {
-    PscPowerSensorProvider p;
-    EXPECT_FALSE(p.handles(""));
+    RepeatedPtrField<Update> unquoted, quoted;
+    p.fill(&unquoted, "/components/component[name=PSC-0]/state/temperature/instant");
+    p.fill(&quoted,   "/components/component[name=\"PSC-0\"]/state/temperature/instant");
+    EXPECT_EQ(unquoted.size(), quoted.size());
 }

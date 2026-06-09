@@ -21,16 +21,50 @@ static constexpr double NOMINAL_OUTPUT_CURR = 20.0;   // amps
 static constexpr double NOMINAL_OUTPUT_PWR  = 240.0;  // watts
 static constexpr double CAPACITY            = 300.0;  // watts (rated, static)
 
+// Known leaf suffixes — shared by handles() and fill() to stay in sync.
+static const char* const LEAF_SUFFIXES[] = {
+    "/state/temperature/instant",
+    "/power-supply/state/input-voltage",
+    "/power-supply/state/input-current",
+    "/power-supply/state/output-voltage",
+    "/power-supply/state/output-current",
+    "/power-supply/state/output-power",
+    "/power-supply/state/capacity",
+};
+
+// Strip quote characters introduced by gnmi_to_xpath (e.g. [name="PSC-0"]).
+static std::string normXpath(const std::string& xpath) {
+    std::string out;
+    out.reserve(xpath.size());
+    for (char c : xpath) if (c != '"') out += c;
+    return out;
+}
+
+// True if the full leaf path (e.g. /components/component[name=PSC-0]/state/...)
+// is matched by the query norm.  A match occurs when norm is a prefix of full
+// (subtree query), tested both with and without key brackets.
+static bool leafMatches(const std::string& norm, bool normHasKey,
+                        const std::string& full) {
+    if (full.rfind(norm, 0) == 0) return true;
+    if (!normHasKey) {
+        std::string keyless;
+        bool skip = false;
+        for (char c : full) {
+            if (c == '[') { skip = true;  continue; }
+            if (c == ']') { skip = false; continue; }
+            if (!skip) keyless += c;
+        }
+        if (keyless.rfind(norm, 0) == 0) return true;
+    }
+    return false;
+}
+
 PscPowerSensorProvider::PscPowerSensorProvider()
     : rng_(std::chrono::steady_clock::now().time_since_epoch().count()) {}
 
 // ---------------------------------------------------------------------------
 // IDataProvider interface
 // ---------------------------------------------------------------------------
-
-bool PscPowerSensorProvider::handles(const std::string& xpath) const {
-    return xpath.starts_with("/components/component");
-}
 
 void PscPowerSensorProvider::fill(RepeatedPtrField<Update>* list,
                                    const std::string& xpath) {
@@ -45,13 +79,8 @@ void PscPowerSensorProvider::fill(RepeatedPtrField<Update>* list,
         { "/power-supply/state/capacity",       &PscPowerSensorProvider::readCapacity      },
     };
 
-    // gnmi_to_xpath quotes key values (e.g. [name="PSC-0"]); strip quotes so
-    // canonical paths ([name=PSC-0]) compare correctly.
-    std::string norm;
-    norm.reserve(xpath.size());
-    for (char c : xpath) if (c != '"') norm += c;
-
-    const bool norm_has_key = (norm.find('[') != std::string::npos);
+    const std::string norm = normXpath(xpath);
+    const bool normHasKey  = (norm.find('[') != std::string::npos);
 
     std::vector<std::string> units;
     for (const auto& unit : PSC_UNITS)
@@ -61,29 +90,8 @@ void PscPowerSensorProvider::fill(RepeatedPtrField<Update>* list,
 
     for (const auto& unit : units) {
         const std::string base = "/components/component[name=" + unit + "]";
-
-        // Return true when the leaf's full path starts with norm.
-        // Case 1: direct starts_with (handles exact leaf, subtree, keyed path).
-        // Case 2: norm has no key filter — strip brackets from full path and retry
-        //         (e.g. /components/component matches /components/component[name=PSC-0]/...).
-        auto want = [&](const char* suffix) -> bool {
-            std::string full = base + suffix;
-            if (full.rfind(norm, 0) == 0) return true;
-            if (!norm_has_key) {
-                std::string keyless;
-                bool skip = false;
-                for (char c : full) {
-                    if (c == '[') { skip = true;  continue; }
-                    if (c == ']') { skip = false; continue; }
-                    if (!skip) keyless += c;
-                }
-                if (keyless.rfind(norm, 0) == 0) return true;
-            }
-            return false;
-        };
-
         for (const auto& leaf : LEAVES)
-            if (want(leaf.suffix))
+            if (leafMatches(norm, normHasKey, base + leaf.suffix))
                 addLeaf(list, base + leaf.suffix, (this->*leaf.read)(unit));
     }
 }

@@ -27,8 +27,6 @@ public:
     PscPowerSensorProvider();
     ~PscPowerSensorProvider() override = default;
 
-    bool handles(const std::string& xpath) const override;
-
     // Populates Update list with current mock sensor readings for xpath.
     void fill(RepeatedPtrField<Update>* list,
               const std::string& xpath) override;

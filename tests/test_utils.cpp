@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <gnmi.grpc.pb.h>
+#include <grpcpp/grpcpp.h>
 #include "utils/utils.h"
 
 // ---------------------------------------------------------------------------
@@ -89,6 +90,46 @@ TEST(XpathToGnmiPath, WithoutLeadingSlash) {
     ASSERT_EQ(path.elem_size(), 2);
     EXPECT_EQ(path.elem(0).name(), "components");
     EXPECT_EQ(path.elem(1).name(), "component");
+}
+
+// ---------------------------------------------------------------------------
+// validateGnmiPath
+// ---------------------------------------------------------------------------
+
+TEST(ValidateGnmiPath, ValidLeafPath) {
+    gnmi::Path path;
+    xpath_to_gnmi_path(
+        "/components/component[name=PSC-0]/state/temperature/instant", &path);
+    EXPECT_TRUE(validateGnmiPath(path).ok());
+}
+
+TEST(ValidateGnmiPath, EmptyPathIsValid) {
+    gnmi::Path path;
+    EXPECT_TRUE(validateGnmiPath(path).ok());
+}
+
+TEST(ValidateGnmiPath, ValidKeyIsOk) {
+    gnmi::Path path;
+    auto* elem = path.add_elem();
+    elem->set_name("component");
+    (*elem->mutable_key())["name"] = "PSC-0";
+    EXPECT_TRUE(validateGnmiPath(path).ok());
+}
+
+TEST(ValidateGnmiPath, EmptyElemNameIsInvalid) {
+    gnmi::Path path;
+    path.add_elem()->set_name("");
+    EXPECT_EQ(validateGnmiPath(path).error_code(),
+              grpc::StatusCode::INVALID_ARGUMENT);
+}
+
+TEST(ValidateGnmiPath, EmptyKeyNameIsInvalid) {
+    gnmi::Path path;
+    auto* elem = path.add_elem();
+    elem->set_name("component");
+    (*elem->mutable_key())[""] = "PSC-0";
+    EXPECT_EQ(validateGnmiPath(path).error_code(),
+              grpc::StatusCode::INVALID_ARGUMENT);
 }
 
 // ---------------------------------------------------------------------------

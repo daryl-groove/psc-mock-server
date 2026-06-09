@@ -35,7 +35,8 @@ Get::buildGetUpdate(RepeatedPtrField<Update>* updateList,
     case gnmi::JSON_IETF:
       // Delegate entirely to backend — it populates path + double_val per leaf.
       // Phase 4: wrap values in JSON_IETF once encoding layer is added.
-      registry_.fill(updateList, fullpath);
+      if (!registry_.fill(updateList, fullpath))
+        return Status(StatusCode::NOT_FOUND, "path not handled: " + fullpath);
       break;
 
     default:
@@ -63,6 +64,9 @@ Get::buildGetNotification(Notification* notification, const Path* prefix,
 
   fullpath += gnmi_to_xpath(path);
   BOOST_LOG_TRIVIAL(debug) << "GetRequest Path " << fullpath;
+
+  Status status = validateGnmiPath(path);
+  if (!status.ok()) return status;
 
   /* TODO: DataType CONFIG/STATE/OPERATIONAL filtering — get.cpp:120 */
   return buildGetUpdate(updateList, path, fullpath, encoding);

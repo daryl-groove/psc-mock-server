@@ -7,13 +7,8 @@
 
 class FakeProvider : public IDataProvider {
 public:
-    explicit FakeProvider(std::string prefix,
-                          gnmi::SubscriptionMode mode = gnmi::SAMPLE)
-        : prefix_(std::move(prefix)), mode_(mode) {}
-
-    bool handles(const std::string& xpath) const override {
-        return xpath.starts_with(prefix_);
-    }
+    explicit FakeProvider(gnmi::SubscriptionMode mode = gnmi::SAMPLE)
+        : mode_(mode) {}
 
     void fill(RepeatedPtrField<Update>* list,
               const std::string& xpath) override {
@@ -25,48 +20,90 @@ public:
     }
 
 private:
-    std::string prefix_;
     gnmi::SubscriptionMode mode_;
 };
 
 // ---------------------------------------------------------------------------
-// DataProviderRegistry
+// DataProviderRegistry — routing and fan-out
 // ---------------------------------------------------------------------------
 
 TEST(DataProviderRegistry, fillRoutesToMatchingProvider) {
     DataProviderRegistry reg;
-    reg.addProvider(std::make_unique<FakeProvider>("/foo"));
+    reg.addProvider("/foo", std::make_unique<FakeProvider>());
 
     RepeatedPtrField<Update> list;
-    reg.fill(&list, "/foo/bar");
-
+    EXPECT_TRUE(reg.fill(&list, "/foo/bar"));
     EXPECT_EQ(list.size(), 1);
 }
 
 TEST(DataProviderRegistry, fillSkipsNonMatchingProvider) {
     DataProviderRegistry reg;
-    reg.addProvider(std::make_unique<FakeProvider>("/foo"));
+    reg.addProvider("/foo", std::make_unique<FakeProvider>());
 
     RepeatedPtrField<Update> list;
-    reg.fill(&list, "/bar/baz");
+    EXPECT_FALSE(reg.fill(&list, "/bar/baz"));
+    EXPECT_EQ(list.size(), 0);
+}
 
+TEST(DataProviderRegistry, fillMatchesExactPrefix) {
+    DataProviderRegistry reg;
+    reg.addProvider("/foo", std::make_unique<FakeProvider>());
+
+    RepeatedPtrField<Update> list;
+    EXPECT_TRUE(reg.fill(&list, "/foo"));
+    EXPECT_EQ(list.size(), 1);
+}
+
+TEST(DataProviderRegistry, fillDoesNotMatchPartialSegment) {
+    DataProviderRegistry reg;
+    reg.addProvider("/foo", std::make_unique<FakeProvider>());
+
+    RepeatedPtrField<Update> list;
+    EXPECT_FALSE(reg.fill(&list, "/foobar"));
     EXPECT_EQ(list.size(), 0);
 }
 
 TEST(DataProviderRegistry, fillFansOutToAllMatchingProviders) {
     DataProviderRegistry reg;
-    reg.addProvider(std::make_unique<FakeProvider>("/foo"));
-    reg.addProvider(std::make_unique<FakeProvider>("/foo"));
+    reg.addProvider("/foo", std::make_unique<FakeProvider>());
+    reg.addProvider("/foo", std::make_unique<FakeProvider>());
 
     RepeatedPtrField<Update> list;
-    reg.fill(&list, "/foo/bar");
-
+    EXPECT_TRUE(reg.fill(&list, "/foo/bar"));
     EXPECT_EQ(list.size(), 2);
+}
+
+TEST(DataProviderRegistry, fillReturnsTrueWhenAnyProviderMatches) {
+    DataProviderRegistry reg;
+    reg.addProvider("/foo", std::make_unique<FakeProvider>());
+    reg.addProvider("/bar", std::make_unique<FakeProvider>());
+
+    RepeatedPtrField<Update> list;
+    EXPECT_TRUE(reg.fill(&list, "/foo/x"));
+    EXPECT_EQ(list.size(), 1);
+}
+
+TEST(DataProviderRegistry, fillReturnsFalseWhenNoProviderRegistered) {
+    DataProviderRegistry reg;
+
+    RepeatedPtrField<Update> list;
+    EXPECT_FALSE(reg.fill(&list, "/anything"));
+    EXPECT_EQ(list.size(), 0);
+}
+
+TEST(DataProviderRegistry, fillStripsQuotesForMatching) {
+    DataProviderRegistry reg;
+    reg.addProvider("/components/component", std::make_unique<FakeProvider>());
+
+    RepeatedPtrField<Update> list;
+    // gnmi_to_xpath produces quoted keys; registry must still match
+    EXPECT_TRUE(reg.fill(&list, "/components/component[name=\"PSC-0\"]/state"));
+    EXPECT_EQ(list.size(), 1);
 }
 
 TEST(DataProviderRegistry, preferredModeReturnsFirstMatch) {
     DataProviderRegistry reg;
-    reg.addProvider(std::make_unique<FakeProvider>("/foo", gnmi::ON_CHANGE));
+    reg.addProvider("/foo", std::make_unique<FakeProvider>(gnmi::ON_CHANGE));
 
     EXPECT_EQ(reg.preferredMode("/foo/bar"), gnmi::ON_CHANGE);
 }

@@ -20,6 +20,8 @@
 #include <chrono>
 #include <string>
 
+#include <grpcpp/grpcpp.h>
+
 using std::chrono::system_clock;
 using std::chrono::duration_cast;
 using std::chrono::nanoseconds;
@@ -105,6 +107,23 @@ inline void xpath_to_gnmi_path(const std::string& xpath, gnmi::Path* path)
 
     pos = next + 1;
   }
+}
+
+// Returns INVALID_ARGUMENT if the Path has structural issues:
+// empty element name or empty key name.
+// An empty path (no elems) is valid — it represents a root query.
+inline grpc::Status validateGnmiPath(const gnmi::Path& path) {
+    for (const auto& elem : path.elem()) {
+        if (elem.name().empty())
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                "path element has empty name");
+        for (const auto& kv : elem.key()) {
+            if (kv.first.empty())
+                return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                    "path element key has empty name");
+        }
+    }
+    return grpc::Status::OK;
 }
 
 #endif // _UTILS_H

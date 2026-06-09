@@ -128,6 +128,50 @@ gnmi::SubscriptionMode PreferredMode(xpath);  // default: SAMPLE
 
 ---
 
+## Path Error Handling
+
+### Spec requirements (§3.3.4 Get, §3.5.2.4 Subscribe)
+
+**Get RPC:**
+
+| Scenario | Required behavior |
+|---|---|
+| Path syntactically correct, exists or has YANG default | Return value(s) |
+| Path syntactically correct, does not exist (yet) | `NOT_FOUND` |
+| Path syntactically correct, not implemented by server | `UNIMPLEMENTED` |
+| Path syntactically incorrect | `INVALID_ARGUMENT` |
+
+**Subscribe RPC:**
+
+| Scenario | ONCE / POLL | STREAM |
+|---|---|---|
+| Path exists or has YANG default | Return value(s) | Return value(s) |
+| Path syntactically correct, does not exist (yet) | Silent — no value returned | Silent — RPC **MUST NOT** be closed |
+| Path not implemented by server | `UNIMPLEMENTED` | `UNIMPLEMENTED` |
+| Path syntactically incorrect | `INVALID_ARGUMENT` | `INVALID_ARGUMENT` |
+
+### Key distinction
+
+**"Does not exist (yet)"** — path is valid in the schema but has no data currently
+(e.g. hardware temporarily offline). Subscribe must not close the RPC; Get returns `NOT_FOUND`.
+
+**"Not implemented"** — path is not supported by this server at all.
+Both Get and Subscribe must return `UNIMPLEMENTED`.
+
+For this mock server, any path not handled by any registered provider is treated as
+**"not implemented"** (`UNIMPLEMENTED`), not "does not exist". A mock server does not
+monitor for future hardware presence.
+
+### Implementation
+
+`DataProviderRegistry::fill()` returns `bool` — true if at least one provider matched.
+
+- `get.cpp::buildGetUpdate()` → returns `NOT_FOUND` when `fill()` returns false (§3.3.4)
+- `subscribe.cpp::buildSubsUpdate()` → logs WARN when `fill()` returns false; RPC not closed (§3.5.1.3 MUST NOT close)
+- `tests/test_data_provider.cpp` → covers both true/false return paths
+
+---
+
 ## Reference Repos
 
 | Repo | Location | What we take from it |
@@ -286,6 +330,7 @@ Critical ones for this project:
 | P2 | `ON_CHANGE` not implemented | `subscribe.cpp:216` | Phase 3 |
 | P2 | `TARGET_DEFINED` silently ignored (proto3 default = 0) | `subscribe.cpp:159` | ✅ fixed — routes via `IDataProvider::PreferredMode()` per leaf; default SAMPLE |
 | P2 | `updates_only` ignored | `subscribe.cpp:139` | ✅ fixed |
+| P2 | Unrecognised path returns silent empty instead of `NOT_FOUND`/`UNIMPLEMENTED` | `get.cpp`, `subscribe.cpp`, `data_provider.hpp` | ✅ fixed — Get returns NOT_FOUND; Subscribe logs WARN, RPC not closed |
 | P3 | `suppress_redundant` not implemented | `subscribe.cpp:36` | pending |
 | P3 | `sample_interval=0` not handled | `subscribe.cpp:213` | ✅ non-issue — loop capped at 200ms, interval=0 fires every iteration = lowest possible |
 
@@ -296,3 +341,277 @@ limitation of the gnmic CLI — it is distinct from the `gnmi_cli` tool
 (openconfig/gnmi) which does send automatic poll triggers via `PollingInterval`.
 
 Use `tests/e2e/test_poll.py` to verify POLL behaviour end-to-end.
+
+---
+
+## Architecture Improvement Directions
+
+Improvements identified during design discussions. Ordered roughly by priority
+and dependency (later items often depend on earlier ones).
+
+---
+
+### A. StaticLeafProvider — Template Method Base Class
+
+**Problem:** `PscPowerSensorProvider::fill()` embeds unit-iteration and leaf-matching
+logic inline. Any future provider with a fixed leaf list (`PlatformInfoProvider`,
+`FanProvider`, …) would duplicate the same loop structure.
+
+**Improvement:** Extract a `StaticLeafProvider` abstract base class using the
+Template Method pattern. The base provides the `fill()` implementation; subclasses
+only supply a leaf table and per-leaf readers.
+
+```cpp
+// Sketch — final API TBD
+class StaticLeafProvider : public IDataProvider {
+protected:
+    struct LeafDef {
+        const char*                               suffix;
+        std::function<double(const std::string&)> read;
+    };
+    // Subclass supplies these three:
+    virtual std::vector<std::string> resolveUnits(const std::string& xpath) const = 0;
+    virtual std::string              basePath(const std::string& unit) const = 0;
+    virtual std::span<const LeafDef> leafTable() const = 0;
+public:
+    // Default fill() calls resolveUnits() + basePath() + leafTable() in a loop.
+    void fill(RepeatedPtrField<Update>* list, const std::string& xpath) override;
+};
+```
+
+**Trade-off:** Adds a base-class indirection. Only worth extracting when 2+ providers
+share the structure.
+
+**When:** When `PlatformInfoProvider` (or any second static provider) is added.
+
+---
+
+### B. Leaf Store Architecture
+
+**Why static/dynamic still matters at the business level:**
+PSC sensor paths are determined by hardware spec — they never disappear while the
+card is running. Alarm paths (`/system/alarms/alarm[id=TEMP-HIGH]`) genuinely appear
+and disappear at runtime. This distinction reflects *business semantics*, not a
+limitation of gNMI. The architecture should embrace both naturally.
+
+**Problem with current "compute on the fly" design:**
+`fill()` currently mixes two separate concerns in one call:
+- **Does this path exist?** (answered implicitly by whether fill() adds anything)
+- **What is its current value?** (computed fresh every call with rand())
+
+There is also no historical state — every call produces an independent value, so
+it is impossible to detect whether a value actually changed.
+
+**Problems this causes:**
+1. **ON_CHANGE detection** — need a previous value to diff against; not available.
+2. **External value injection** — no way for a background hardware thread (or test
+   code) to push updated values into the provider.
+
+**Architecture:**
+
+```
+Hardware thread / external caller
+       │  store.set(xpath, value)
+       ▼
+  LeafStore  ─  thread-safe path→TypedValue map
+       │  store.get(xpath)  /  store.changedSince(snapshot)
+       ▼
+  Provider::fill() — reads from store, not from hardware directly
+```
+
+Key components:
+
+| Component | Role |
+|-----------|------|
+| `LeafStore` | `std::unordered_map<std::string, TypedValue>` protected by `std::shared_mutex`. Provides `set()`, `get()`, `snapshot()`, `diff(snapshot)`. |
+| `ILeafStoreProvider` | `IDataProvider` subclass whose `fill()` reads from its `LeafStore`. Exposes `setLeaf()` / `removeLeaf()` for external updates. |
+| Background thread | Hardware poller or simulator: calls `setLeaf()` at some interval. |
+
+**ON_CHANGE integration (Phase 3 prerequisite):**
+- `LeafStore::diff(snapshot)` returns only leaves whose values changed since the snapshot.
+- `subscribe.cpp` ON_CHANGE handler: send initial snapshot, take a store snapshot,
+  then loop calling `diff()` and emitting only changed leaves.
+- `heartbeat_interval`: force full emit periodically even if no change.
+
+**Dynamic leaf management (e.g. AlarmProvider):**
+- `setLeaf(xpath, value)` — leaf appears; ON_CHANGE subscriber sees it as a new update.
+- `removeLeaf(xpath)` — leaf disappears; Notification `delete` field carries the path.
+- gNMI Notification supports both `update` (values) and `delete` (removed paths) in the
+  same message — use this for alarm clear events.
+
+**gNMI `delete` field in Notification (spec §2.1):**
+```protobuf
+message Notification {
+    repeated Update update = 4;
+    repeated Path   delete = 5;   // paths that were removed
+}
+```
+
+**When:** Phase 3 (ON_CHANGE) is blocked on at least the per-leaf cache part of this.
+Full external-injection API is needed when connecting to real hardware.
+
+---
+
+### C. ON_CHANGE — Additional Detail (Phase 3 supplement)
+
+*(Phase 3 is documented above under Implementation Phases. This records design details
+decided during discussion.)*
+
+Depends on: **Leaf Store Architecture (B)** for the per-leaf previous-value cache.
+
+**`heartbeat_interval` + `suppress_redundant` interaction (spec §3.5.1.5.2):**
+
+| `suppress_redundant` | heartbeat behaviour |
+|---|---|
+| false (default) | Re-emit ALL leaves every `heartbeat_interval`, even unchanged |
+| true | At heartbeat time, skip leaves whose value has not changed since last emission |
+
+`suppress_redundant` is currently P3 in the Type B Gaps table. Implementing it
+correctly requires the Leaf Store to track both the current value and the
+last-emitted value per leaf.
+
+**ON_CHANGE for dynamic providers (e.g. AlarmProvider):**
+gNMI explicitly anticipates leaves appearing and disappearing during the life of a
+subscription (STREAM mode MUST NOT close the RPC for a non-existent path). An
+AlarmProvider is a natural example: alarm paths like
+`/system/alarms/alarm[id=TEMP-HIGH]` appear when an alarm fires and disappear when
+cleared. The Leaf Store `removeLeaf()` + Notification `delete` field handle this
+cleanly without any special-casing in `subscribe.cpp`.
+
+---
+
+### D. Parent Path Query Support
+
+**Current behavior:** Registered prefix is `/components/component`. A client querying
+`/components` alone gets `NOT_FOUND` because no provider prefix matches.
+
+```
+gnmic get --path /components   →  NOT_FOUND   (current)
+                                  all PSC leaves  (desired)
+```
+
+**Options:**
+1. Register a synthetic aggregating provider under `/components` that delegates to
+   all known component providers.
+2. Extend `DataProviderRegistry::fill()` to also dispatch when the *query* is a
+   prefix of a *registered* prefix (inverted match direction).
+3. Register providers under the shortest relevant prefix so the provider can serve
+   the entire subtree.
+
+Option 2 risks partial results if providers only serve specific key instances.
+Option 3 shifts more responsibility to individual providers.
+Option 1 is most explicit but requires a manual aggregator per subtree root.
+
+**Decision:** Explicitly deferred. Serving full `/components` subtrees is spec-valid
+but not required for the PSC use case (clients query specific sensor paths).
+Revisit if an operator tool or telegraf config requests `/components` or root `/`.
+
+---
+
+### E. Trie-Based Routing
+
+**Current behavior:** `DataProviderRegistry::fill()` iterates `routes_` linearly:
+O(N) string comparison per `fill()` call, where N = number of registered providers.
+
+**Improvement:** Replace the `routes_` vector with a path-segment trie. `fill()`
+descends the trie along xpath segments and collects all providers at matching nodes.
+O(depth) lookup instead of O(N).
+
+**Trade-off:** Trie adds implementation complexity and only helps when N is large.
+With N ≤ 5–10 providers, the linear scan is faster due to CPU cache locality and
+no pointer chasing.
+
+**When:** If N exceeds ~10 providers. Not needed for Phase 1–4.
+
+---
+
+### F. YANG Schema Validation
+
+**Current `validateGnmiPath()`** (in `src/utils/utils.h`) checks only structural
+integrity: non-empty elem names, non-empty key names. It does NOT validate:
+- Whether the path exists in any loaded YANG module.
+- Whether required list keys are present (e.g. `component` requires a `name` key).
+- Whether leaf value types match the YANG-defined type.
+
+Spec §3.3.4: structurally invalid paths → `INVALID_ARGUMENT`. Paths valid in
+syntax but absent from the schema → currently `NOT_FOUND` for unregistered paths
+(acceptable for a mock server, but `UNIMPLEMENTED` would be more precise).
+
+**Full YANG validation** options:
+- **libyang** — correct but heavyweight; conflicts with the "no sysrepo/libyang" goal.
+- **Hardcoded path schema table** (prefix → required keys + allowed leaf names) — lightweight but manual maintenance burden.
+- **Path pattern matching** against a compile-time list of known-good paths — middle ground.
+
+**When:** Low priority for a mock server. Revisit if a compliance checker or fuzzer
+produces misleading responses for malformed-but-syntactically-valid paths.
+
+---
+
+### G. main.cpp Simplification (Production Cleanup)
+
+*(Already noted in the Deployment Model section at the top of this document.)*
+
+Remove the `getopt` loop and all CLI flags. Replace with build-time constants or a
+minimal config file read. `main()` becomes:
+
+```cpp
+int main() {
+    RunServer(kBindAddr, BuildCreds());
+}
+```
+
+**When:** After the server is verified end-to-end against real hardware. No
+functional changes are required before that point.
+
+---
+
+## Implementation Priority Analysis
+
+### Dependency Graph
+
+```
+B (Leaf Store)
+    └── C (ON_CHANGE / Phase 3)   ← blocked until B is done
+
+A (StaticLeafProvider)            ← independent, but see ordering note below
+D (Parent Path)                   ← independent
+E (Trie Routing)                  ← independent
+F (YANG Schema Validation)        ← independent
+G (main.cpp Simplification)       ← independent
+```
+
+**A vs B ordering note:** A extracts the loop structure; B replaces how values are
+computed (compute-on-the-fly → read from store). If A is done first, the
+extracted base class's `read()` signature will be designed for compute-on-the-fly
+and needs to be redesigned again when B is done — two touches to the same code.
+Recommended order: B first (migrate `PscPowerSensorProvider` to use a Leaf Store),
+then A (extract `StaticLeafProvider` from the already-migrated provider). The base
+class emerges in its final form in one pass.
+
+---
+
+### Multi-Dimensional Scoring
+
+| Item | Dependency blocker | Impact (what it unlocks) | Change cost | Deferral cost | Risk | **Score** |
+|------|--------------------|--------------------------|-------------|---------------|------|-----------|
+| **B** Leaf Store | None | Phase 3, hardware connection, dynamic leaves, proper data/behavior separation | High — rethinks provider data flow | **High** — each new provider added before B is one more class to migrate later | Medium (threading) | **1st** |
+| **C** ON_CHANGE | Requires B | Spec Phase 3 feature; enables `heartbeat_interval`, `suppress_redundant` | Medium — new subscribe.cpp path | High once B exists — cheapest right after B | Low (builds on B cleanly) | **2nd** |
+| **A** StaticLeafProvider | None (but best after B) | Reduces duplication for future static providers; keeps PSC provider clean | Low-Medium — refactor, no API change | Medium — grows with number of static providers | Low | **3rd** |
+| **G** main.cpp cleanup | None | Production deployment readiness | Very Low — isolated to main.cpp | Low — cost stays constant | Negligible | **4th** |
+| **D** Parent Path | None | Full-subtree queries (`/components`) work | Medium — registry fan-out change | Low — clients can always be pointed at specific paths | Low | **5th** |
+| **F** YANG Schema | None | Correctness of `INVALID_ARGUMENT` vs `NOT_FOUND` for malformed paths | High (libyang) or maintenance burden (hardcoded table) | Low — mock server clients use well-formed paths | Medium (new dependency) | **6th** |
+| **E** Trie Routing | None | O(depth) routing instead of O(N) | Medium — internal registry refactor | None — linear scan is fine at current scale | Low | **7th** |
+
+---
+
+### Recommended Implementation Order
+
+| Order | Item | Rationale |
+|-------|------|-----------|
+| 1 | **B — Leaf Store** | Foundational. Blocks Phase 3. Migration cost is lowest now (1 provider). The longer this is deferred, the more providers need to be migrated simultaneously. |
+| 2 | **C — ON_CHANGE (Phase 3)** | Highest-value feature once B is in place. The subscribe.cpp changes build directly on the Leaf Store API. Doing it immediately after B avoids context-switching back to this area later. |
+| 3 | **A — StaticLeafProvider** | Do before adding a second static provider (`PlatformInfoProvider`, etc.). At that point the base class emerges from real duplication, not speculation. With B already done, A produces the final-form base class in one pass. |
+| 4 | **G — main.cpp cleanup** | Do at production deployment time. Zero interaction with the data layer; safe to defer. |
+| 5 | **D — Parent Path** | Revisit only if an operator tool or monitoring system needs subtree queries. |
+| 6 | **F — YANG Schema** | Revisit only if a compliance or fuzz-testing requirement appears. |
+| 7 | **E — Trie Routing** | Revisit only when N providers exceeds ~10. Premature at current scale.

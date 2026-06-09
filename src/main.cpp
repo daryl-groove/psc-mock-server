@@ -35,7 +35,8 @@ void RunServer(const std::string& bind_addr,
   // Build registry and register providers.
   // To add a new data domain: addProvider() another IDataProvider here.
   DataProviderRegistry registry;
-  registry.addProvider(std::make_unique<PscPowerSensorProvider>());
+  registry.addProvider("/components/component",
+                       std::make_unique<PscPowerSensorProvider>());
 
   ServerBuilder builder;
   GNMIService gnmi(std::move(registry));
@@ -44,6 +45,11 @@ void RunServer(const std::string& bind_addr,
   builder.RegisterService(&gnmi);
   unique_ptr<Server> server(builder.BuildAndStart());
   cout << "Using grpc " << grpc::Version() << endl;
+
+  if (!server) {
+    cerr << "Failed to start server on " << bind_addr << endl;
+    return;
+  }
 
   if (bind_addr.find(":") == string::npos) {
     cout << "Server listening on " << bind_addr << ":443" << endl;

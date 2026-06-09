@@ -7,17 +7,17 @@
  *   AlarmProvider           →  /system/alarms/...               (future)
  *
  * DataProviderRegistry holds all registered providers and dispatches
- * fill() calls. gNMI RPC handlers (get.cpp, subscribe.cpp) only
- * interact with the registry — they are unaware of specific providers.
+ * fill() calls by prefix. gNMI RPC handlers (get.cpp, subscribe.cpp)
+ * only interact with the registry — they are unaware of specific providers.
  */
 
 #pragma once
 
 #include <memory>
-#include <vector>
 #include <string>
+#include <vector>
 
-#include <gnmi.grpc.pb.h>  // transitively includes repeated_field.h
+#include <gnmi.grpc.pb.h>
 #include <utils/utils.h>
 
 using google::protobuf::RepeatedPtrField;
@@ -78,11 +78,8 @@ class IDataProvider {
 public:
     virtual ~IDataProvider() = default;
 
-    // Return true if this provider has data for the given xpath.
-    // Used by DataProviderRegistry to route fill() calls.
-    virtual bool handles(const std::string& xpath) const = 0;
-
     // Populate gNMI Update list for the given xpath.
+    // Called only when the registered prefix matches — no need to re-check.
     // Appends entries to list — does NOT clear it.
     virtual void fill(RepeatedPtrField<Update>* list,
                       const std::string& xpath) = 0;
@@ -109,30 +106,48 @@ public:
     DataProviderRegistry(const DataProviderRegistry&) = delete;
     DataProviderRegistry& operator=(const DataProviderRegistry&) = delete;
 
-    void addProvider(std::unique_ptr<IDataProvider> provider) {
+    // Register provider to handle all paths whose xpath starts with prefix.
+    // Ownership transfers to the registry.
+    void addProvider(std::string prefix, std::unique_ptr<IDataProvider> provider) {
+        routes_.emplace_back(std::move(prefix), provider.get());
         providers_.push_back(std::move(provider));
     }
 
-    // Fan-out: calls fill() on every provider whose handles() returns true.
-    // Multiple providers may contribute updates for the same xpath.
-    void fill(RepeatedPtrField<Update>* list,
+    // Fan-out: calls fill() on every provider whose registered prefix matches xpath.
+    // Returns true if at least one Update was appended to list, false otherwise.
+    bool fill(RepeatedPtrField<Update>* list,
               const std::string& xpath) const {
-        for (auto& p : providers_) {
-            if (p->handles(xpath))
-                p->fill(list, xpath);
+        const int before = list->size();
+        for (const auto& [prefix, provider] : routes_) {
+            if (matches(xpath, prefix))
+                provider->fill(list, xpath);
         }
+        return list->size() > before;
     }
 
-    // Returns the first matching provider's preferred subscription mode.
+    // Returns the preferred subscription mode from the first matching provider.
     // Used by subscribe.cpp to resolve TARGET_DEFINED on a per-leaf basis.
     gnmi::SubscriptionMode preferredMode(const std::string& xpath) const {
-        for (auto& p : providers_) {
-            if (p->handles(xpath))
-                return p->preferredMode(xpath);
+        for (const auto& [prefix, provider] : routes_) {
+            if (matches(xpath, prefix))
+                return provider->preferredMode(xpath);
         }
         return gnmi::SAMPLE;
     }
 
 private:
-    std::vector<std::unique_ptr<IDataProvider>> providers_;
+    // True if xpath (after quote-stripping) starts with prefix at a segment
+    // boundary — preventing /foobar from matching prefix /foo.
+    static bool matches(const std::string& xpath, const std::string& prefix) {
+        std::string norm;
+        norm.reserve(xpath.size());
+        for (char c : xpath) if (c != '"') norm += c;
+        if (!norm.starts_with(prefix)) return false;
+        if (norm.size() == prefix.size()) return true;
+        const char next = norm[prefix.size()];
+        return next == '/' || next == '[';
+    }
+
+    std::vector<std::pair<std::string, IDataProvider*>> routes_;
+    std::vector<std::unique_ptr<IDataProvider>>         providers_;
 };

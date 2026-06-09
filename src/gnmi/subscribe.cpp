@@ -40,7 +40,8 @@ Subscribe::buildSubsUpdate(RepeatedPtrField<Update>* updateList,
     case gnmi::JSON_IETF:
       // Delegate entirely to backend — populates path + double_val per leaf.
       // Phase 4: add JSON_IETF wrapping once encoding layer is introduced.
-      registry_.fill(updateList, fullpath);
+      if (!registry_.fill(updateList, fullpath))
+        BOOST_LOG_TRIVIAL(warning) << "no provider handles path: " << fullpath;
       break;
 
     default:
@@ -95,6 +96,9 @@ Subscribe::buildSubscribeNotification(Notification *notification,
    * Update field contains only data elements that have changed values. */
   for (int i = 0; i < request.subscription_size(); i++) {
     Subscription sub = request.subscription(i);
+
+    status = validateGnmiPath(sub.path());
+    if (!status.ok()) return status;
 
     // Fetch all found counters value for a requested path
     status = buildSubsUpdate(updateList, sub.path(), gnmi_to_xpath(sub.path()),
