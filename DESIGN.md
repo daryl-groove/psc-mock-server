@@ -79,11 +79,12 @@ GNMIService (src/gnmi/gnmi.h)
     │  holds DataProviderRegistry registry_
     ├── Capabilities  → capabilities.cpp  (static model list)
     ├── Get           → get.cpp        ─┐
-    ├── Set           → set.cpp  (mock) ├─→ registry_.Fill(list, xpath)
+    ├── Set           → set.cpp  (mock) ├─→ registry_.fill(list, xpath) → FillResult
     └── Subscribe     → subscribe.cpp  ─┘         │
                                          DataProviderRegistry  (src/backend/data_provider.hpp)
-                                             │  fan-out to all matching providers
+                                             │  route by registered prefix, fan-out to matches
                                              ├── PscPowerSensorProvider   ✅ implemented
+                                             │       └── LeafStore  ← background jthread set()s values
                                              ├── PlatformInfoProvider     (future)
                                              ├── AlarmProvider            (future)
                                              └── ...
@@ -91,7 +92,7 @@ GNMIService (src/gnmi/gnmi.h)
 
 **Extensibility rule:** adding a new data domain requires exactly two changes:
 1. New `class XxxProvider : public IDataProvider` in `src/backend/`
-2. One `registry.Register(make_unique<XxxProvider>())` line in `main.cpp`
+2. One `registry.addProvider("/prefix", make_unique<XxxProvider>())` line in `main.cpp`
 gNMI layer (`get.cpp`, `subscribe.cpp`, `gnmi.h`) is never modified.
 
 **Key design decision:** `DataProviderRegistry` is the only boundary between
@@ -104,27 +105,30 @@ Reference for backend decoupling pattern: `impl/gnmi-grpc/src/gnmi_collector.cpp
 ```cpp
 class IDataProvider {
 public:
-    virtual bool Handles(const std::string& xpath) const = 0;
-    virtual void Fill(RepeatedPtrField<Update>* list,
-                      const std::string& xpath) = 0;
+    // const: serving a read never mutates provider state; values arrive
+    // out-of-band via the provider's LeafStore. Routing is by the prefix
+    // registered in addProvider() — there is no Handles().
+    virtual void fill(RepeatedPtrField<Update>* list,
+                      const std::string& xpath) const = 0;
+    // Per-leaf TARGET_DEFINED resolution; default SAMPLE.
+    virtual gnmi::SubscriptionMode preferredMode(const std::string&) const;
 };
+
+// routed   — some provider's prefix owns this path  (else UNIMPLEMENTED)
+// produced — some provider appended a value         (routed && !produced → NOT_FOUND)
+struct FillResult { bool routed; bool produced; };
 
 class DataProviderRegistry {
-    // Fan-out: calls Fill() on every provider whose Handles() returns true
-    void Fill(RepeatedPtrField<Update>* list, const std::string& xpath) const;
-    void Register(std::unique_ptr<IDataProvider>);
+    void addProvider(std::string prefix, std::unique_ptr<IDataProvider>);
+    FillResult fill(RepeatedPtrField<Update>* list, const std::string& xpath) const;
+    gnmi::SubscriptionMode preferredMode(const std::string& xpath) const;
 };
-
-// Shared helpers — available to all providers via #include "data_provider.hpp"
-void addLeaf(list, xpath, double value);      // double_val  (voltage, current, temp)
-void addLeaf(list, xpath, std::string value); // string_val  (status, firmware, enum)
-void addLeaf(list, xpath, bool value);        // bool_val    (enabled, alarm)
-void addLeaf(list, xpath, int64_t value);     // int_val     (signed counter)
-void addLeaf(list, xpath, uint64_t value);    // uint_val    (unsigned counter)
-
-// TARGET_DEFINED mode resolution — override in event-driven providers
-gnmi::SubscriptionMode PreferredMode(xpath);  // default: SAMPLE
 ```
+
+Store-backed providers write values through `LeafStore::set(...)` (typed overloads
+mirroring the scalar gNMI types) and serve reads via `store_.collect()`. The
+`addLeaf(list, xpath, value)` helpers in `data_provider.hpp` remain for building
+Updates directly (used by tests and any provider not backed by a store).
 
 ---
 
@@ -187,11 +191,11 @@ signals, not a single bool:
 - `subscribe.cpp::buildSubsUpdate()` → `routed==false` → `UNIMPLEMENTED`; `routed && !produced` → silent, RPC not closed
 - `tests/test_data_provider.cpp` → covers all three outcomes
 
-> **Status:** the original implementation collapsed both signals into a single
-> `bool` (list growth) and returned `NOT_FOUND` for *unrouted* paths — which
-> contradicts the "not implemented → `UNIMPLEMENTED`" rule above. The two-signal
-> split lands with the Leaf Store work (B), which also introduces the
-> data-availability dimension (routed-but-empty → `NOT_FOUND`).
+> **Status: ✅ implemented** (with the Leaf Store work, B). `fill()` now returns
+> `FillResult{routed, produced}`; Get maps to `UNIMPLEMENTED`/`NOT_FOUND`/OK and
+> Subscribe to `UNIMPLEMENTED`/silent/OK. The earlier single-`bool` version
+> wrongly returned `NOT_FOUND` for unrouted paths; that is fixed. Verified by
+> `tests/test_data_provider.cpp` and e2e T4/T5/T6.
 
 ---
 
@@ -216,9 +220,9 @@ signals, not a single bool:
 | `src/gnmi/gnmi.h` | ✅ done | Holds `DataProviderRegistry registry_`; constructor takes registry by move |
 | `src/gnmi/gnmi.cpp` | ✅ done | Passes `registry_` to each RPC handler |
 | `src/gnmi/capabilities.cpp` | ✅ done | Static `ModelData` list for openconfig-platform-psu |
-| `src/gnmi/get.cpp` | ✅ done | `registry_.Fill(updateList, fullpath)` |
+| `src/gnmi/get.cpp` | ✅ done | `registry_.fill(...)` → `FillResult` (UNIMPLEMENTED / NOT_FOUND / OK) |
 | `src/gnmi/set.cpp` | ✅ done | Mock no-op; returns OK for all operations |
-| `src/gnmi/subscribe.cpp` | ✅ done | `registry_.Fill(updateList, fullpath)` |
+| `src/gnmi/subscribe.cpp` | ✅ done | `registry_.fill(...)` → `FillResult` (UNIMPLEMENTED / silent / OK) |
 | `src/utils/utils.h` | ✅ done | Added `xpath_to_gnmi_path()`; no sysrepo deps |
 | `src/security/` | ✅ unchanged | No sysrepo dependency |
 | `src/utils/log.h/.cpp` | ✅ unchanged | No sysrepo dependency |
@@ -273,7 +277,7 @@ cd psc-mock-server && meson setup build && ninja -C build
 ### Phase 2 — Fix Type B Subscribe bugs
 - ✅ Fix POLL `sync_response` missing (`subscribe.cpp:267`) — MUST per spec §3.5.2
 - ✅ Fix `updates_only` flag (`subscribe.cpp:139`) — skip initial snapshot when set
-- ✅ Fix path filter in `Fill()` — return only leaves matching subscribed path
+- ✅ Fix path filter in `fill()` — return only leaves matching subscribed path
 - Non-existent path closes RPC (`subscribe.cpp:63`) — not applicable; our implementation returns empty updates gracefully, no error propagated
 - ✅ Add POLL initial snapshot — aligns with Go ref impl (see note below)
 - **Goal:** ✅ ONCE / POLL / STREAM all behave correctly per spec
@@ -292,7 +296,7 @@ snapshot + `sync_response` at POLL subscription establishment.
 
 ### Phase 3 — ON_CHANGE
 ON_CHANGE requires a fundamentally different data flow from STREAM SAMPLE.
-STREAM SAMPLE calls `Fill()` on every sample interval (pull/periodic);
+STREAM SAMPLE calls `fill()` on every sample interval (pull/periodic);
 ON_CHANGE must only emit a Notification when a value actually changes (event-driven).
 
 **Spec requirements (§3.5.1.3):**
@@ -300,12 +304,12 @@ ON_CHANGE must only emit a Notification when a value actually changes (event-dri
 - Changed values: **SHOULD** only transmit when value changes after the initial snapshot.
 - `heartbeat_interval`: if set, **MUST** re-send all values once per interval regardless of change.
 
-**Architecture (aligned with Go reference `spec/gnmi/subscribe/subscribe.go`):**
+**Architecture (now that B is in place — diff lives in the subscriber, not the provider):**
 
-- Add a per-leaf value cache inside `PscPowerSensorProvider` (previous reading per path)
-- `Fill()` compares new reading vs cached; emits only changed leaves
-- `subscribe.cpp` STREAM handler: send initial snapshot + `sync_response` first (MUST), then enter loop that calls `Fill()` and emits only if updateList is non-empty
-- Add `heartbeat_interval` support: force-emit all leaves periodically even if unchanged
+- `subscribe.cpp` STREAM ON_CHANGE handler: send initial snapshot + `sync_response` first (MUST), then take `prev = store.snapshot(query)`
+- Loop: `cur = store.snapshot(query)`; `d = LeafStore::diff(prev, cur)`; emit `d.updated` as Updates and `d.removed` as `Notification.delete` (§3.5.2.3); set `prev = cur`
+- The previous-value state (`prev` snapshot) is **per-subscriber**, held in the handler — never in the shared store (concurrent subscribers must not corrupt each other)
+- `heartbeat_interval` support: force-emit the full `snapshot()` periodically even if `diff` is empty
 
 **Notification semantics for ON_CHANGE vs STREAM SAMPLE:**
 
@@ -332,8 +336,9 @@ Spec allows setting `Notification.prefix` to a common path ancestor so each
 - Add `addLeafJsonIetf(list, xpath, json_string)` to `data_provider.hpp` — sets `json_ietf_val`
   instead of individual leaf `double_val` entries; needed because `json_ietf_val` and `string_val`
   are both `std::string` in C++ and cannot share the same `addLeaf` overload
-- Switch `PscPowerSensorProvider::Fill()` to return JSON_IETF subtree when encoding is JSON_IETF
-  (currently returns individual `double_val` leaves regardless of requested encoding)
+- Switch the read path (`fill()` → `LeafStore::collect()`) to return a JSON_IETF subtree
+  when encoding is JSON_IETF (currently `collect()` emits individual `double_val` leaves
+  regardless of requested encoding)
 - Verify JSON_IETF output has correct YANG namespace prefixes (e.g. `openconfig-platform:`)
 - **Goal:** gnmic / telegraf can discover and use the server without manual config
 
@@ -350,10 +355,10 @@ Critical ones for this project:
 | P1 | Non-existent path closes RPC | `subscribe.cpp:63` | ✅ non-issue — returns empty updates, no error |
 | P1 | POLL initial snapshot missing | `subscribe.cpp:246` | ✅ fixed — aligns with Go ref impl |
 | P1 | Path key filter not applied | `psc_power_sensor_provider.cpp` | ✅ fixed |
-| P2 | `ON_CHANGE` not implemented | `subscribe.cpp:216` | Phase 3 |
-| P2 | `TARGET_DEFINED` silently ignored (proto3 default = 0) | `subscribe.cpp:159` | ✅ fixed — routes via `IDataProvider::PreferredMode()` per leaf; default SAMPLE |
+| P2 | `ON_CHANGE` not implemented | `subscribe.cpp:216` | Phase 3 — prerequisites (`LeafStore::snapshot()`/`diff()`) ✅ ready; handler pending |
+| P2 | `TARGET_DEFINED` silently ignored (proto3 default = 0) | `subscribe.cpp:159` | ✅ fixed — routes via `IDataProvider::preferredMode()` per leaf; default SAMPLE |
 | P2 | `updates_only` ignored | `subscribe.cpp:139` | ✅ fixed |
-| P2 | Unrecognised path returns silent empty instead of `NOT_FOUND`/`UNIMPLEMENTED` | `get.cpp`, `subscribe.cpp`, `data_provider.hpp` | ✅ fixed — Get returns NOT_FOUND; Subscribe logs WARN, RPC not closed |
+| P2 | Unrecognised path returns silent empty instead of `NOT_FOUND`/`UNIMPLEMENTED` | `get.cpp`, `subscribe.cpp`, `data_provider.hpp` | ✅ fixed — three-state `FillResult{routed,produced}`: Get → UNIMPLEMENTED/NOT_FOUND; Subscribe → UNIMPLEMENTED/silent |
 | P3 | `suppress_redundant` not implemented | `subscribe.cpp:36` | pending |
 | P3 | `sample_interval=0` not handled | `subscribe.cpp:213` | ✅ non-issue — loop capped at 200ms, interval=0 fires every iteration = lowest possible |
 
@@ -374,58 +379,79 @@ and dependency (later items often depend on earlier ones).
 
 ---
 
-### A. StaticLeafProvider — Template Method Base Class
+### A. StoreBackedProvider — single base class
 
-**Problem:** `PscPowerSensorProvider::fill()` embeds unit-iteration and leaf-matching
-logic inline. Any future provider with a fixed leaf list (`PlatformInfoProvider`,
-`FanProvider`, …) would duplicate the same loop structure.
+> **Superseded framing.** This item was originally "StaticLeafProvider — a Template
+> Method base with `leafTable()`/`resolveUnits()`/`basePath()`". That design was for
+> the pre-B *compute-on-the-fly* `fill()`, which no longer exists. After B, `fill()`
+> is just `store_.collect()` — there is no leaf table or unit loop in `fill()` to
+> factor out, and path matching already lives in the store. The notes below replace
+> the old plan.
 
-**Improvement:** Extract a `StaticLeafProvider` abstract base class using the
-Template Method pattern. The base provides the `fill()` implementation; subclasses
-only supply a leaf table and per-leaf readers.
+**What is actually duplicated now:** every store-backed provider repeats the same
+two lines — own a `LeafStore`, and implement `fill()` as `store_.collect(xpath, list)`.
+
+**Improvement:** one base class, not two. There is no "static vs dynamic" split (see
+§B): a provider that never calls `remove()` is just a special case.
 
 ```cpp
-// Sketch — final API TBD
-class StaticLeafProvider : public IDataProvider {
+class StoreBackedProvider : public IDataProvider {
 protected:
-    struct LeafDef {
-        const char*                               suffix;
-        std::function<double(const std::string&)> read;
-    };
-    // Subclass supplies these three:
-    virtual std::vector<std::string> resolveUnits(const std::string& xpath) const = 0;
-    virtual std::string              basePath(const std::string& unit) const = 0;
-    virtual std::span<const LeafDef> leafTable() const = 0;
+    LeafStore store_;                       // subclass seeds / updates it
 public:
-    // Default fill() calls resolveUnits() + basePath() + leafTable() in a loop.
-    void fill(RepeatedPtrField<Update>* list, const std::string& xpath) override;
+    void fill(RepeatedPtrField<Update>* list,
+              const std::string& xpath) const final {   // final: no provider re-matches
+        store_.collect(xpath, list);
+    }
 };
 ```
 
-**Trade-off:** Adds a base-class indirection. Only worth extracting when 2+ providers
-share the structure.
+Subclasses differ only in **who drives `set()`/`remove()` and when** — a polled
+sensor runs a background `jthread`; an event-driven alarm provider sets/removes on
+triggers. That driver is provider-specific and stays in the subclass (as the
+`jthread` already does in `PscPowerSensorProvider`); it is **not** a reason for
+separate base classes.
 
-**When:** When `PlatformInfoProvider` (or any second static provider) is added.
+**Trade-off:** with a single provider today, extracting this is still speculative.
+
+**When:** when a second provider (`PlatformInfoProvider`, `AlarmProvider`, …) lands,
+so the base emerges from real duplication. Making `fill()` `final` here is also what
+structurally guarantees no provider reimplements path matching.
 
 ---
 
 ### B. Leaf Store Architecture
 
-**Why static/dynamic still matters at the business level:**
+> **Status: ✅ implemented.** `LeafStore` (`src/backend/leaf_store.{hpp,cpp}`) backs
+> `PscPowerSensorProvider`: a background `std::jthread` drifts values on a quantized
+> random walk (held value with occasional ±1-step), `fill()` is now `const` and reads
+> via `store_.collect()`. Each leaf carries its `collected_ns`. The path-match
+> primitives (`stripPathQuotes`, `isPathPrefix`) are shared in `utils.h`.
+> **Deferred to Phase 3 (C):** wiring `Notification.timestamp` to each leaf's
+> `collected_ns` (subscribe.cpp still stamps "now"), the `diff().removed →
+> Notification.delete` mapping, and the ON_CHANGE handler itself. `snapshot()`/`diff()`
+> are ready.
+> **Not done (item A):** a store-backed base class that makes `fill()` `final` —
+> defer until a 2nd provider exists.
+
+**Static vs dynamic is a description, not a type split:**
 PSC sensor paths are determined by hardware spec — they never disappear while the
 card is running. Alarm paths (`/system/alarms/alarm[id=TEMP-HIGH]`) genuinely appear
-and disappear at runtime. This distinction reflects *business semantics*, not a
-limitation of gNMI. The architecture should embrace both naturally.
+and disappear at runtime. This is a true *business-semantics* observation, but it
+does **not** drive the architecture: post-LeafStore there is one uniform mechanism
+(`set()`/`remove()`/`collect()`). A "static" provider is simply one that never calls
+`remove()`. So this distinction yields **no separate provider hierarchy** — see §A,
+which is a single `StoreBackedProvider` base.
 
-**Problem with current "compute on the fly" design:**
-`fill()` currently mixes two separate concerns in one call:
-- **Does this path exist?** (answered implicitly by whether fill() adds anything)
-- **What is its current value?** (computed fresh every call with rand())
+**Problem B solved (the old "compute on the fly" design):**
+The original `fill()` mixed two separate concerns in one call:
+- **Does this path exist?** (answered implicitly by whether fill() added anything)
+- **What is its current value?** (computed fresh every call with `rand()`)
 
-There is also no historical state — every call produces an independent value, so
-it is impossible to detect whether a value actually changed.
+There was also no historical state — every call produced an independent value, so
+it was impossible to detect whether a value actually changed.
 
-**Problems this causes:**
+**Problems that caused:**
 1. **ON_CHANGE detection** — need a previous value to diff against; not available.
 2. **External value injection** — no way for a background hardware thread (or test
    code) to push updated values into the provider.
@@ -447,8 +473,8 @@ Key components:
 | Component | Role |
 |-----------|------|
 | `LeafStore` | `std::map<std::string, Leaf>` where `Leaf = {gnmi::TypedValue val; int64_t collected_ns;}`, protected by `std::shared_mutex`. Provides `set()`, `get()`, `snapshot()`, `diff(snapshot)`. Stores a per-leaf **collection timestamp**, not just the value (see Timestamp semantics below). |
-| `ILeafStoreProvider` | `IDataProvider` subclass whose `fill()` reads from its `LeafStore`. Exposes `setLeaf()` / `removeLeaf()` for external updates. |
-| Background thread | Hardware poller or simulator: calls `setLeaf()` at some interval. |
+| Provider (`PscPowerSensorProvider`) | Holds a `LeafStore` member; `fill()` (const) serves reads via `store_.collect()`. A future single `StoreBackedProvider` base (§A) factors this out — note: **not** the originally-planned `ILeafStoreProvider`. |
+| Background thread | Hardware poller or simulator, owned by the provider (a `std::jthread`): calls `store_.set()` / `store_.remove()` at some interval. |
 
 **ON_CHANGE integration (Phase 3 prerequisite):**
 - `LeafStore::diff(snapshot)` returns only leaves whose values changed since the snapshot.
@@ -457,8 +483,8 @@ Key components:
 - `heartbeat_interval`: force full emit periodically even if no change.
 
 **Dynamic leaf management (e.g. AlarmProvider):**
-- `setLeaf(xpath, value)` — leaf appears; ON_CHANGE subscriber sees it as a new update.
-- `removeLeaf(xpath)` — leaf disappears; Notification `delete` field carries the path.
+- `store_.set(xpath, value)` — leaf appears; ON_CHANGE subscriber sees it as a new update.
+- `store_.remove(xpath)` — leaf disappears; Notification `delete` field carries the path.
 - gNMI Notification supports both `update` (values) and `delete` (removed paths) in the
   same message — use this for alarm clear events.
 
@@ -473,17 +499,21 @@ message Notification {
 **Timestamp semantics (spec §2.1, §3.5.2.3):**
 `Notification.timestamp` MUST be the time the value was *collected from the underlying
 source* (or, for ON_CHANGE, the time the event occurred) — **not** the time the message
-is emitted. Under the current compute-on-the-fly design these coincide, so
-`subscribe.cpp` using `get_time_nanosec()` ("now") is accidentally correct. Once a
-background writer updates the store at time T and emission happens at T+δ, "now" is
-wrong. Therefore each leaf carries its own `collected_ns`, and emit uses that.
+is emitted. Under the old compute-on-the-fly design they coincided, so
+`subscribe.cpp` using `get_time_nanosec()` ("now") was accidentally correct. Now that
+a background writer updates the store at time T while emission happens at T+δ, "now"
+is wrong. Each leaf therefore **stores** its `collected_ns` — but the wiring that
+makes `Notification.timestamp` use it (instead of "now") is still **pending in
+`subscribe.cpp`** (Phase 3 / C); B only put the timestamp into the store.
 
 To keep bundling honest (spec §3.5.2.1 — bundling MUST NOT obscure distinct
 timestamps), the background writer updates all leaves of a single tick under one
 timestamp T; leaves sharing T can then be bundled into one Notification accurately.
 
-**When:** Phase 3 (ON_CHANGE) is blocked on at least the per-leaf cache part of this.
-Full external-injection API is needed when connecting to real hardware.
+**Remaining (Phase 3 / C):** wire `Notification.timestamp` to each leaf's
+`collected_ns`, and map `diff().removed → Notification.delete`. The external-injection
+API (`set()`/`remove()`) is already present; it gets exercised for real when wired to
+hardware.
 
 ---
 
@@ -492,7 +522,9 @@ Full external-injection API is needed when connecting to real hardware.
 *(Phase 3 is documented above under Implementation Phases. This records design details
 decided during discussion.)*
 
-Depends on: **Leaf Store Architecture (B)** for the per-leaf previous-value cache.
+Depends on: **Leaf Store Architecture (B)** for `snapshot()`/`diff()`. The "previous
+value" is the subscriber's saved snapshot held in the subscribe handler — not a
+store-side cache.
 
 **`suppress_redundant` is a SAMPLE-only field** (spec §3.5.1.5.2). ON_CHANGE already
 transmits only on change *by definition*, so it does not combine with ON_CHANGE — it
@@ -521,7 +553,7 @@ gNMI explicitly anticipates leaves appearing and disappearing during the life of
 subscription (STREAM mode MUST NOT close the RPC for a non-existent path). An
 AlarmProvider is a natural example: alarm paths like
 `/system/alarms/alarm[id=TEMP-HIGH]` appear when an alarm fires and disappear when
-cleared. The Leaf Store `removeLeaf()` + Notification `delete` field handle this
+cleared. The Leaf Store `remove()` + Notification `delete` field handle this
 cleanly without any special-casing in `subscribe.cpp`.
 
 ---
@@ -616,23 +648,22 @@ functional changes are required before that point.
 ### Dependency Graph
 
 ```
-B (Leaf Store)
-    └── C (ON_CHANGE / Phase 3)   ← blocked until B is done
+B (Leaf Store)   ✅ done
+    └── C (ON_CHANGE / Phase 3)   ← next; unblocked now B is done
 
-A (StaticLeafProvider)            ← independent, but see ordering note below
+A (StoreBackedProvider)           ← independent, but see ordering note below
 D (Parent Path)                   ← independent
 E (Trie Routing)                  ← independent
 F (YANG Schema Validation)        ← independent
 G (main.cpp Simplification)       ← independent
 ```
 
-**A vs B ordering note:** A extracts the loop structure; B replaces how values are
-computed (compute-on-the-fly → read from store). If A is done first, the
-extracted base class's `read()` signature will be designed for compute-on-the-fly
-and needs to be redesigned again when B is done — two touches to the same code.
-Recommended order: B first (migrate `PscPowerSensorProvider` to use a Leaf Store),
-then A (extract `StaticLeafProvider` from the already-migrated provider). The base
-class emerges in its final form in one pass.
+**A vs B ordering note (resolved — B was done first, as recommended):** the original
+worry was that doing A first would shape its base-class API around compute-on-the-fly
+and force a redesign once B landed. By doing B first, A is no longer "factor out the
+fill() loop" at all — `fill()` is already one line (`store_.collect()`). A is now just
+"pull the `LeafStore` member + `final` `fill()` up into a single `StoreBackedProvider`
+base", to be extracted when a 2nd provider appears.
 
 ---
 
@@ -642,7 +673,7 @@ class emerges in its final form in one pass.
 |------|--------------------|--------------------------|-------------|---------------|------|-----------|
 | **B** Leaf Store | None | Phase 3, hardware connection, dynamic leaves, proper data/behavior separation | High — rethinks provider data flow | **High** — each new provider added before B is one more class to migrate later | Medium (threading) | **1st** |
 | **C** ON_CHANGE | Requires B | Spec Phase 3 feature; enables `heartbeat_interval`, `suppress_redundant` | Medium — new subscribe.cpp path | High once B exists — cheapest right after B | Low (builds on B cleanly) | **2nd** |
-| **A** StaticLeafProvider | None (but best after B) | Reduces duplication for future static providers; keeps PSC provider clean | Low-Medium — refactor, no API change | Medium — grows with number of static providers | Low | **3rd** |
+| **A** StoreBackedProvider | None (but best after B) | Reduces duplication for future providers; `final` `fill()` structurally bars re-matching | Low — pull `LeafStore` + `fill()` into one base | Medium — grows with number of providers | Low | **3rd** |
 | **G** main.cpp cleanup | None | Production deployment readiness | Very Low — isolated to main.cpp | Low — cost stays constant | Negligible | **4th** |
 | **D** Parent Path | None | Full-subtree queries (`/components`) work | Medium — registry fan-out change | Low — clients can always be pointed at specific paths | Low | **5th** |
 | **F** YANG Schema | None | Correctness of `INVALID_ARGUMENT` vs `NOT_FOUND` for malformed paths | High (libyang) or maintenance burden (hardcoded table) | Low — mock server clients use well-formed paths | Medium (new dependency) | **6th** |
@@ -654,9 +685,9 @@ class emerges in its final form in one pass.
 
 | Order | Item | Rationale |
 |-------|------|-----------|
-| 1 | **B — Leaf Store** | Foundational. Blocks Phase 3. Migration cost is lowest now (1 provider). The longer this is deferred, the more providers need to be migrated simultaneously. |
-| 2 | **C — ON_CHANGE (Phase 3)** | Highest-value feature once B is in place. The subscribe.cpp changes build directly on the Leaf Store API. Doing it immediately after B avoids context-switching back to this area later. |
-| 3 | **A — StaticLeafProvider** | Do before adding a second static provider (`PlatformInfoProvider`, etc.). At that point the base class emerges from real duplication, not speculation. With B already done, A produces the final-form base class in one pass. |
+| 1 | **B — Leaf Store** | ✅ **done.** `LeafStore` + background writer + routed/produced three-state. Path-match primitives shared in `utils.h`. |
+| 2 | **C — ON_CHANGE (Phase 3)** | ⬅ **next.** Builds directly on `LeafStore::snapshot()`/`diff()` (already in place). Adds the STREAM ON_CHANGE handler + `heartbeat_interval` + `diff().removed → Notification.delete`. |
+| 3 | **A — StoreBackedProvider** | Do before adding a second provider (`PlatformInfoProvider`, `AlarmProvider`, …). One base (no static/dynamic split — see §A/§B); emerges from real duplication, not speculation. |
 | 4 | **G — main.cpp cleanup** | Do at production deployment time. Zero interaction with the data layer; safe to defer. |
 | 5 | **D — Parent Path** | Revisit only if an operator tool or monitoring system needs subtree queries. |
 | 6 | **F — YANG Schema** | Revisit only if a compliance or fuzz-testing requirement appears. |
