@@ -9,7 +9,7 @@ Verifies:
   3. Client-supplied paths determine which updates are returned
 
 Usage:
-  python3 docs/test_poll.py
+  python3 tests/e2e/test_poll.py
   (server must be running: ./build/psc-mock-server --force-insecure --log-level 4)
 """
 

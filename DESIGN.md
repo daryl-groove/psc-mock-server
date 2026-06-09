@@ -295,4 +295,4 @@ but **never sends Poll trigger messages**; no data is returned. This is a known
 limitation of the gnmic CLI — it is distinct from the `gnmi_cli` tool
 (openconfig/gnmi) which does send automatic poll triggers via `PollingInterval`.
 
-Use `tests/test_poll.py` to verify POLL behaviour end-to-end.
+Use `tests/e2e/test_poll.py` to verify POLL behaviour end-to-end.
