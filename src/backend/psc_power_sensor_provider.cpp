@@ -29,12 +29,7 @@ PscPowerSensorProvider::PscPowerSensorProvider()
 // ---------------------------------------------------------------------------
 
 bool PscPowerSensorProvider::Handles(const std::string& xpath) const {
-    // Handles any path under a PSC component
-    return xpath.find("power-supply") != std::string::npos
-        || xpath.find("temperature")  != std::string::npos
-        || xpath.find("PSC-")         != std::string::npos
-        || (xpath.find("components")  != std::string::npos
-            && xpath.find("component")!= std::string::npos);
+    return xpath.starts_with("/components/component");
 }
 
 void PscPowerSensorProvider::Fill(RepeatedPtrField<Update>* list,
