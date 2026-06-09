@@ -7,7 +7,7 @@
  *   AlarmProvider           →  /system/alarms/...               (future)
  *
  * DataProviderRegistry holds all registered providers and dispatches
- * Fill() calls. gNMI RPC handlers (get.cpp, subscribe.cpp) only
+ * fill() calls. gNMI RPC handlers (get.cpp, subscribe.cpp) only
  * interact with the registry — they are unaware of specific providers.
  */
 
@@ -79,18 +79,18 @@ public:
     virtual ~IDataProvider() = default;
 
     // Return true if this provider has data for the given xpath.
-    // Used by DataProviderRegistry to route Fill() calls.
-    virtual bool Handles(const std::string& xpath) const = 0;
+    // Used by DataProviderRegistry to route fill() calls.
+    virtual bool handles(const std::string& xpath) const = 0;
 
     // Populate gNMI Update list for the given xpath.
     // Appends entries to list — does NOT clear it.
-    virtual void Fill(RepeatedPtrField<Update>* list,
+    virtual void fill(RepeatedPtrField<Update>* list,
                       const std::string& xpath) = 0;
 
     // Return the preferred subscription mode for this xpath under TARGET_DEFINED.
     // Default SAMPLE suits continuous sensor data; override to ON_CHANGE for
     // event-driven leaves (alarms, state transitions).
-    virtual gnmi::SubscriptionMode PreferredMode(const std::string&) const {
+    virtual gnmi::SubscriptionMode preferredMode(const std::string&) const {
         return gnmi::SAMPLE;
     }
 };
@@ -109,26 +109,26 @@ public:
     DataProviderRegistry(const DataProviderRegistry&) = delete;
     DataProviderRegistry& operator=(const DataProviderRegistry&) = delete;
 
-    void Register(std::unique_ptr<IDataProvider> provider) {
+    void addProvider(std::unique_ptr<IDataProvider> provider) {
         providers_.push_back(std::move(provider));
     }
 
-    // Fan-out: calls Fill() on every provider whose Handles() returns true.
+    // Fan-out: calls fill() on every provider whose handles() returns true.
     // Multiple providers may contribute updates for the same xpath.
-    void Fill(RepeatedPtrField<Update>* list,
+    void fill(RepeatedPtrField<Update>* list,
               const std::string& xpath) const {
         for (auto& p : providers_) {
-            if (p->Handles(xpath))
-                p->Fill(list, xpath);
+            if (p->handles(xpath))
+                p->fill(list, xpath);
         }
     }
 
     // Returns the first matching provider's preferred subscription mode.
     // Used by subscribe.cpp to resolve TARGET_DEFINED on a per-leaf basis.
-    gnmi::SubscriptionMode PreferredMode(const std::string& xpath) const {
+    gnmi::SubscriptionMode preferredMode(const std::string& xpath) const {
         for (auto& p : providers_) {
-            if (p->Handles(xpath))
-                return p->PreferredMode(xpath);
+            if (p->handles(xpath))
+                return p->preferredMode(xpath);
         }
         return gnmi::SAMPLE;
     }

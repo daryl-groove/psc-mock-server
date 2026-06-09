@@ -31,7 +31,7 @@ using google::protobuf::RepeatedPtrField;
 namespace impl {
 
 Status
-Subscribe::BuildSubsUpdate(RepeatedPtrField<Update>* updateList,
+Subscribe::buildSubsUpdate(RepeatedPtrField<Update>* updateList,
                             const Path& path, string fullpath,
                             gnmi::Encoding encoding)
 {
@@ -40,7 +40,7 @@ Subscribe::BuildSubsUpdate(RepeatedPtrField<Update>* updateList,
     case gnmi::JSON_IETF:
       // Delegate entirely to backend — populates path + double_val per leaf.
       // Phase 4: add JSON_IETF wrapping once encoding layer is introduced.
-      registry_.Fill(updateList, fullpath);
+      registry_.fill(updateList, fullpath);
       break;
 
     default:
@@ -51,14 +51,14 @@ Subscribe::BuildSubsUpdate(RepeatedPtrField<Update>* updateList,
 }
 
 /**
- * BuildSubscribeNotification - Build a Notification message.
+ * buildSubscribeNotification - Build a Notification message.
  * Contrary to Get Notification, gnmi specification highly recommands to
  * put multiple <xpath, value> in the same Notification message.
  * @param notification the notification that is constructed by this function.
  * @param request the SubscriptionList from SubscribeRequest to answer to.
  */
 Status
-Subscribe::BuildSubscribeNotification(Notification *notification,
+Subscribe::buildSubscribeNotification(Notification *notification,
                                       const SubscriptionList& request)
 {
   RepeatedPtrField<Update>* updateList = notification->mutable_update();
@@ -91,13 +91,13 @@ Subscribe::BuildSubscribeNotification(Notification *notification,
   if (request.has_prefix())
     notification->mutable_prefix()->CopyFrom(request.prefix());
 
-  /* Fill Update RepeatedPtrField in Notification message
+  /* fill Update RepeatedPtrField in Notification message
    * Update field contains only data elements that have changed values. */
   for (int i = 0; i < request.subscription_size(); i++) {
     Subscription sub = request.subscription(i);
 
     // Fetch all found counters value for a requested path
-    status = BuildSubsUpdate(updateList, sub.path(), gnmi_to_xpath(sub.path()),
+    status = buildSubsUpdate(updateList, sub.path(), gnmi_to_xpath(sub.path()),
                              request.encoding());
     if (!status.ok()) {
       BOOST_LOG_TRIVIAL(error) << "Fail building update for "
@@ -137,7 +137,7 @@ Status Subscribe::handleStream(
   // Send initial snapshot unless client requested updates_only.
   // sync_response is always sent to mark initial synchronisation complete.
   if (!request.subscribe().updates_only()) {
-    status = BuildSubscribeNotification(response.mutable_update(),
+    status = buildSubscribeNotification(response.mutable_update(),
                                         request.subscribe());
     if (!status.ok()) {
       context->TryCancel();
@@ -159,7 +159,7 @@ Status Subscribe::handleStream(
     switch (sub.mode()) {
       case TARGET_DEFINED:
         {
-          auto resolved = registry_.PreferredMode(gnmi_to_xpath(sub.path()));
+          auto resolved = registry_.preferredMode(gnmi_to_xpath(sub.path()));
           if (resolved == SAMPLE) {
             chronomap.emplace_back(sub, high_resolution_clock::now());
           } else {
@@ -200,7 +200,7 @@ Status Subscribe::handleStream(
     }
 
     if (updateList->subscription_size() > 0) {
-      status = BuildSubscribeNotification(response.mutable_update(),
+      status = buildSubscribeNotification(response.mutable_update(),
                                           updateRequest.subscribe());
       if(!status.ok()) {
         context->TryCancel();
@@ -229,7 +229,7 @@ Status Subscribe::handleOnce(ServerContext* context, SubscribeRequest request,
 
   // Sends a Notification message that updates all Subcriptions once
   SubscribeResponse response;
-  status = BuildSubscribeNotification(response.mutable_update(),
+  status = buildSubscribeNotification(response.mutable_update(),
                                       request.subscribe());
   if (!status.ok()) {
     context->TryCancel();
@@ -263,7 +263,7 @@ Status Subscribe::handlePoll(ServerContext* context, SubscribeRequest request,
   // client gets consistent state immediately without needing a first Poll trigger.
   {
     SubscribeResponse response;
-    status = BuildSubscribeNotification(response.mutable_update(),
+    status = buildSubscribeNotification(response.mutable_update(),
                                         subscription.subscribe());
     if (!status.ok()) {
       context->TryCancel();
@@ -282,7 +282,7 @@ Status Subscribe::handlePoll(ServerContext* context, SubscribeRequest request,
         {
           // Sends a Notification message that updates all Subcriptions once
           SubscribeResponse response;
-          status = BuildSubscribeNotification(response.mutable_update(),
+          status = buildSubscribeNotification(response.mutable_update(),
                                               subscription.subscribe());
           if (!status.ok()) {
             context->TryCancel();

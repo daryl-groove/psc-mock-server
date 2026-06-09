@@ -33,9 +33,9 @@ void RunServer(const std::string& bind_addr,
                std::shared_ptr<grpc::ServerCredentials> cred)
 {
   // Build registry and register providers.
-  // To add a new data domain: Register() another IDataProvider here.
+  // To add a new data domain: addProvider() another IDataProvider here.
   DataProviderRegistry registry;
-  registry.Register(std::make_unique<PscPowerSensorProvider>());
+  registry.addProvider(std::make_unique<PscPowerSensorProvider>());
 
   ServerBuilder builder;
   GNMIService gnmi(std::move(registry));

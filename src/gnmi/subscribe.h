@@ -38,10 +38,10 @@ class Subscribe {
                ServerReaderWriter<SubscribeResponse, SubscribeRequest>* stream);
 
   private:
-    Status BuildSubsUpdate(RepeatedPtrField<Update>* updateList,
+    Status buildSubsUpdate(RepeatedPtrField<Update>* updateList,
                            const Path& path, std::string fullpath,
                            gnmi::Encoding encoding);
-    Status BuildSubscribeNotification(Notification* notification,
+    Status buildSubscribeNotification(Notification* notification,
                                       const SubscriptionList& request);
     Status handleStream(ServerContext* context, SubscribeRequest request,
               ServerReaderWriter<SubscribeResponse, SubscribeRequest>* stream);

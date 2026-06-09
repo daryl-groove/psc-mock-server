@@ -11,16 +11,16 @@ public:
                           gnmi::SubscriptionMode mode = gnmi::SAMPLE)
         : prefix_(std::move(prefix)), mode_(mode) {}
 
-    bool Handles(const std::string& xpath) const override {
+    bool handles(const std::string& xpath) const override {
         return xpath.starts_with(prefix_);
     }
 
-    void Fill(RepeatedPtrField<Update>* list,
+    void fill(RepeatedPtrField<Update>* list,
               const std::string& xpath) override {
         addLeaf(list, xpath, 0.0);
     }
 
-    gnmi::SubscriptionMode PreferredMode(const std::string&) const override {
+    gnmi::SubscriptionMode preferredMode(const std::string&) const override {
         return mode_;
     }
 
@@ -33,48 +33,48 @@ private:
 // DataProviderRegistry
 // ---------------------------------------------------------------------------
 
-TEST(DataProviderRegistry, FillRoutesToMatchingProvider) {
+TEST(DataProviderRegistry, fillRoutesToMatchingProvider) {
     DataProviderRegistry reg;
-    reg.Register(std::make_unique<FakeProvider>("/foo"));
+    reg.addProvider(std::make_unique<FakeProvider>("/foo"));
 
     RepeatedPtrField<Update> list;
-    reg.Fill(&list, "/foo/bar");
+    reg.fill(&list, "/foo/bar");
 
     EXPECT_EQ(list.size(), 1);
 }
 
-TEST(DataProviderRegistry, FillSkipsNonMatchingProvider) {
+TEST(DataProviderRegistry, fillSkipsNonMatchingProvider) {
     DataProviderRegistry reg;
-    reg.Register(std::make_unique<FakeProvider>("/foo"));
+    reg.addProvider(std::make_unique<FakeProvider>("/foo"));
 
     RepeatedPtrField<Update> list;
-    reg.Fill(&list, "/bar/baz");
+    reg.fill(&list, "/bar/baz");
 
     EXPECT_EQ(list.size(), 0);
 }
 
-TEST(DataProviderRegistry, FillFansOutToAllMatchingProviders) {
+TEST(DataProviderRegistry, fillFansOutToAllMatchingProviders) {
     DataProviderRegistry reg;
-    reg.Register(std::make_unique<FakeProvider>("/foo"));
-    reg.Register(std::make_unique<FakeProvider>("/foo"));
+    reg.addProvider(std::make_unique<FakeProvider>("/foo"));
+    reg.addProvider(std::make_unique<FakeProvider>("/foo"));
 
     RepeatedPtrField<Update> list;
-    reg.Fill(&list, "/foo/bar");
+    reg.fill(&list, "/foo/bar");
 
     EXPECT_EQ(list.size(), 2);
 }
 
-TEST(DataProviderRegistry, PreferredModeReturnsFirstMatch) {
+TEST(DataProviderRegistry, preferredModeReturnsFirstMatch) {
     DataProviderRegistry reg;
-    reg.Register(std::make_unique<FakeProvider>("/foo", gnmi::ON_CHANGE));
+    reg.addProvider(std::make_unique<FakeProvider>("/foo", gnmi::ON_CHANGE));
 
-    EXPECT_EQ(reg.PreferredMode("/foo/bar"), gnmi::ON_CHANGE);
+    EXPECT_EQ(reg.preferredMode("/foo/bar"), gnmi::ON_CHANGE);
 }
 
-TEST(DataProviderRegistry, PreferredModeDefaultsSampleWhenNoMatch) {
+TEST(DataProviderRegistry, preferredModeDefaultsSampleWhenNoMatch) {
     DataProviderRegistry reg;
 
-    EXPECT_EQ(reg.PreferredMode("/nonexistent"), gnmi::SAMPLE);
+    EXPECT_EQ(reg.preferredMode("/nonexistent"), gnmi::SAMPLE);
 }
 
 // ---------------------------------------------------------------------------

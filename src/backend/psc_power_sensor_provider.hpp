@@ -1,7 +1,7 @@
 /*
  * PscPowerSensorProvider — IDataProvider implementation for PSC power sensors.
  *
- * Handles paths under:
+ * handles paths under:
  *   /components/component[name=PSC-x]/state/temperature/...
  *   /components/component[name=PSC-x]/power-supply/state/...
  *
@@ -27,14 +27,14 @@ public:
     PscPowerSensorProvider();
     ~PscPowerSensorProvider() override = default;
 
-    bool Handles(const std::string& xpath) const override;
+    bool handles(const std::string& xpath) const override;
 
     // Populates Update list with current mock sensor readings for xpath.
-    void Fill(RepeatedPtrField<Update>* list,
+    void fill(RepeatedPtrField<Update>* list,
               const std::string& xpath) override;
 
     // All PSC sensor leaves are continuous measured values — SAMPLE is correct.
-    gnmi::SubscriptionMode PreferredMode(const std::string&) const override {
+    gnmi::SubscriptionMode preferredMode(const std::string&) const override {
         return gnmi::SAMPLE;
     }
 

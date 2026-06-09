@@ -28,11 +28,11 @@ PscPowerSensorProvider::PscPowerSensorProvider()
 // IDataProvider interface
 // ---------------------------------------------------------------------------
 
-bool PscPowerSensorProvider::Handles(const std::string& xpath) const {
+bool PscPowerSensorProvider::handles(const std::string& xpath) const {
     return xpath.starts_with("/components/component");
 }
 
-void PscPowerSensorProvider::Fill(RepeatedPtrField<Update>* list,
+void PscPowerSensorProvider::fill(RepeatedPtrField<Update>* list,
                                    const std::string& xpath) {
     using Reader = double (PscPowerSensorProvider::*)(const std::string&);
     static const struct { const char* suffix; Reader read; } LEAVES[] = {

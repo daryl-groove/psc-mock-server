@@ -26,7 +26,7 @@ using google::protobuf::RepeatedPtrField;
 namespace impl {
 
 Status
-Get::BuildGetUpdate(RepeatedPtrField<Update>* updateList,
+Get::buildGetUpdate(RepeatedPtrField<Update>* updateList,
                     const Path& path, string fullpath,
                     gnmi::Encoding encoding)
 {
@@ -35,7 +35,7 @@ Get::BuildGetUpdate(RepeatedPtrField<Update>* updateList,
     case gnmi::JSON_IETF:
       // Delegate entirely to backend — it populates path + double_val per leaf.
       // Phase 4: wrap values in JSON_IETF once encoding layer is added.
-      registry_.Fill(updateList, fullpath);
+      registry_.fill(updateList, fullpath);
       break;
 
     default:
@@ -46,7 +46,7 @@ Get::BuildGetUpdate(RepeatedPtrField<Update>* updateList,
 }
 
 Status
-Get::BuildGetNotification(Notification* notification, const Path* prefix,
+Get::buildGetNotification(Notification* notification, const Path* prefix,
                           const Path& path, gnmi::Encoding encoding)
 {
   RepeatedPtrField<Update>* updateList = notification->mutable_update();
@@ -65,7 +65,7 @@ Get::BuildGetNotification(Notification* notification, const Path* prefix,
   BOOST_LOG_TRIVIAL(debug) << "GetRequest Path " << fullpath;
 
   /* TODO: DataType CONFIG/STATE/OPERATIONAL filtering — get.cpp:120 */
-  return BuildGetUpdate(updateList, path, fullpath, encoding);
+  return buildGetUpdate(updateList, path, fullpath, encoding);
 }
 
 static inline Status verifyGetRequest(const GetRequest* request)
@@ -114,11 +114,11 @@ Status Get::run(const GetRequest* req, GetResponse* response)
     auto* notification = notificationList->Add();
 
     status = req->has_prefix()
-      ? BuildGetNotification(notification, &req->prefix(), path, req->encoding())
-      : BuildGetNotification(notification, nullptr,       path, req->encoding());
+      ? buildGetNotification(notification, &req->prefix(), path, req->encoding())
+      : buildGetNotification(notification, nullptr,       path, req->encoding());
 
     if (!status.ok()) {
-      BOOST_LOG_TRIVIAL(error) << "BuildGetNotification failed: "
+      BOOST_LOG_TRIVIAL(error) << "buildGetNotification failed: "
                                << status.error_message();
       return status;
     }

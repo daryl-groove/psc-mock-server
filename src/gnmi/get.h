@@ -35,9 +35,9 @@ class Get {
     Status run(const GetRequest* req, GetResponse* response);
 
   private:
-    Status BuildGetNotification(Notification* notification, const Path* prefix,
+    Status buildGetNotification(Notification* notification, const Path* prefix,
                                 const Path& path, gnmi::Encoding encoding);
-    Status BuildGetUpdate(RepeatedPtrField<Update>* updateList,
+    Status buildGetUpdate(RepeatedPtrField<Update>* updateList,
                           const Path& path, std::string fullpath,
                           gnmi::Encoding encoding);
 
