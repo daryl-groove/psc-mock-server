@@ -11,7 +11,7 @@ public:
         : mode_(mode) {}
 
     void fill(RepeatedPtrField<Update>* list,
-              const std::string& xpath) override {
+              const std::string& xpath) const override {
         addLeaf(list, xpath, 0.0);
     }
 
@@ -23,6 +23,13 @@ private:
     gnmi::SubscriptionMode mode_;
 };
 
+// Routed but never produces a value — exercises the NOT_FOUND branch
+// (registered prefix matches, but no leaf is available).
+class EmptyProvider : public IDataProvider {
+public:
+    void fill(RepeatedPtrField<Update>*, const std::string&) const override {}
+};
+
 // ---------------------------------------------------------------------------
 // DataProviderRegistry — routing and fan-out
 // ---------------------------------------------------------------------------
@@ -32,7 +39,9 @@ TEST(DataProviderRegistry, fillRoutesToMatchingProvider) {
     reg.addProvider("/foo", std::make_unique<FakeProvider>());
 
     RepeatedPtrField<Update> list;
-    EXPECT_TRUE(reg.fill(&list, "/foo/bar"));
+    FillResult res = reg.fill(&list, "/foo/bar");
+    EXPECT_TRUE(res.routed);
+    EXPECT_TRUE(res.produced);
     EXPECT_EQ(list.size(), 1);
 }
 
@@ -41,7 +50,9 @@ TEST(DataProviderRegistry, fillSkipsNonMatchingProvider) {
     reg.addProvider("/foo", std::make_unique<FakeProvider>());
 
     RepeatedPtrField<Update> list;
-    EXPECT_FALSE(reg.fill(&list, "/bar/baz"));
+    FillResult res = reg.fill(&list, "/bar/baz");
+    EXPECT_FALSE(res.routed);
+    EXPECT_FALSE(res.produced);
     EXPECT_EQ(list.size(), 0);
 }
 
@@ -50,7 +61,7 @@ TEST(DataProviderRegistry, fillMatchesExactPrefix) {
     reg.addProvider("/foo", std::make_unique<FakeProvider>());
 
     RepeatedPtrField<Update> list;
-    EXPECT_TRUE(reg.fill(&list, "/foo"));
+    EXPECT_TRUE(reg.fill(&list, "/foo").produced);
     EXPECT_EQ(list.size(), 1);
 }
 
@@ -59,7 +70,20 @@ TEST(DataProviderRegistry, fillDoesNotMatchPartialSegment) {
     reg.addProvider("/foo", std::make_unique<FakeProvider>());
 
     RepeatedPtrField<Update> list;
-    EXPECT_FALSE(reg.fill(&list, "/foobar"));
+    EXPECT_FALSE(reg.fill(&list, "/foobar").routed);
+    EXPECT_EQ(list.size(), 0);
+}
+
+// Registered prefix matches but the provider yields nothing → routed && !produced.
+// This is the NOT_FOUND (Get) / silent (Subscribe) case, distinct from UNIMPLEMENTED.
+TEST(DataProviderRegistry, fillRoutedButNotProduced) {
+    DataProviderRegistry reg;
+    reg.addProvider("/foo", std::make_unique<EmptyProvider>());
+
+    RepeatedPtrField<Update> list;
+    FillResult res = reg.fill(&list, "/foo/bar");
+    EXPECT_TRUE(res.routed);
+    EXPECT_FALSE(res.produced);
     EXPECT_EQ(list.size(), 0);
 }
 
@@ -69,7 +93,7 @@ TEST(DataProviderRegistry, fillFansOutToAllMatchingProviders) {
     reg.addProvider("/foo", std::make_unique<FakeProvider>());
 
     RepeatedPtrField<Update> list;
-    EXPECT_TRUE(reg.fill(&list, "/foo/bar"));
+    EXPECT_TRUE(reg.fill(&list, "/foo/bar").produced);
     EXPECT_EQ(list.size(), 2);
 }
 
@@ -79,7 +103,7 @@ TEST(DataProviderRegistry, fillReturnsTrueWhenAnyProviderMatches) {
     reg.addProvider("/bar", std::make_unique<FakeProvider>());
 
     RepeatedPtrField<Update> list;
-    EXPECT_TRUE(reg.fill(&list, "/foo/x"));
+    EXPECT_TRUE(reg.fill(&list, "/foo/x").produced);
     EXPECT_EQ(list.size(), 1);
 }
 
@@ -87,7 +111,9 @@ TEST(DataProviderRegistry, fillReturnsFalseWhenNoProviderRegistered) {
     DataProviderRegistry reg;
 
     RepeatedPtrField<Update> list;
-    EXPECT_FALSE(reg.fill(&list, "/anything"));
+    FillResult res = reg.fill(&list, "/anything");
+    EXPECT_FALSE(res.routed);
+    EXPECT_FALSE(res.produced);
     EXPECT_EQ(list.size(), 0);
 }
 
@@ -97,7 +123,7 @@ TEST(DataProviderRegistry, fillStripsQuotesForMatching) {
 
     RepeatedPtrField<Update> list;
     // gnmi_to_xpath produces quoted keys; registry must still match
-    EXPECT_TRUE(reg.fill(&list, "/components/component[name=\"PSC-0\"]/state"));
+    EXPECT_TRUE(reg.fill(&list, "/components/component[name=\"PSC-0\"]/state").produced);
     EXPECT_EQ(list.size(), 1);
 }
 

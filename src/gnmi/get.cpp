@@ -32,12 +32,16 @@ Get::buildGetUpdate(RepeatedPtrField<Update>* updateList,
 {
   switch (encoding) {
     case gnmi::JSON:
-    case gnmi::JSON_IETF:
+    case gnmi::JSON_IETF: {
       // Delegate entirely to backend — it populates path + double_val per leaf.
       // Phase 4: wrap values in JSON_IETF once encoding layer is added.
-      if (!registry_.fill(updateList, fullpath))
-        return Status(StatusCode::NOT_FOUND, "path not handled: " + fullpath);
+      FillResult res = registry_.fill(updateList, fullpath);
+      if (!res.routed)                       // §3.3.4 not implemented
+        return Status(StatusCode::UNIMPLEMENTED, "path not implemented: " + fullpath);
+      if (!res.produced)                     // §3.3.4 exists (yet) but no data
+        return Status(StatusCode::NOT_FOUND, "path has no data: " + fullpath);
       break;
+    }
 
     default:
       return Status(StatusCode::UNIMPLEMENTED, Encoding_Name(encoding));

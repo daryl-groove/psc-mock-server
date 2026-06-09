@@ -160,16 +160,16 @@ if r.returncode != 0 and "NotFound" in r.stderr:
 else:
     fail_(f"expected NOT_FOUND, got exit={r.returncode}")
 
-# T6: entirely unknown prefix → NOT_FOUND
+# T6: entirely unknown prefix → UNIMPLEMENTED  (spec §3.3.4: no provider owns it)
 path = "/interfaces/interface[name=eth0]/state/oper-status"
-label("T6 · entirely unknown prefix  (expect NOT_FOUND)")
+label("T6 · entirely unknown prefix  (expect UNIMPLEMENTED)")
 path_line(path)
 r = gnmic("get", "--path", path)
 show(r.stderr)
-if r.returncode != 0 and "NotFound" in r.stderr:
-    pass_("got NOT_FOUND")
+if r.returncode != 0 and "Unimplemented" in r.stderr:
+    pass_("got UNIMPLEMENTED")
 else:
-    fail_(f"expected NOT_FOUND, got exit={r.returncode}")
+    fail_(f"expected UNIMPLEMENTED, got exit={r.returncode}")
 
 # ── Subscribe ONCE ────────────────────────────────────────────────────────────
 

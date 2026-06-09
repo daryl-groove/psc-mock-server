@@ -81,8 +81,10 @@ public:
     // Populate gNMI Update list for the given xpath.
     // Called only when the registered prefix matches — no need to re-check.
     // Appends entries to list — does NOT clear it.
+    // const: serving a read never mutates provider state; value updates arrive
+    // out-of-band through the provider's LeafStore.
     virtual void fill(RepeatedPtrField<Update>* list,
-                      const std::string& xpath) = 0;
+                      const std::string& xpath) const = 0;
 
     // Return the preferred subscription mode for this xpath under TARGET_DEFINED.
     // Default SAMPLE suits continuous sensor data; override to ON_CHANGE for
@@ -95,6 +97,18 @@ public:
 // ---------------------------------------------------------------------------
 // DataProviderRegistry
 // ---------------------------------------------------------------------------
+
+// Two independent signals needed to pick the spec-correct status code
+// (§3.3.4 / §3.5.2.4):
+//   routed   — some provider's registered prefix owns this path's namespace
+//   produced — some provider actually appended a value
+// not routed            → UNIMPLEMENTED
+// routed but !produced  → NOT_FOUND (Get) / silent, RPC not closed (Subscribe)
+// produced              → OK
+struct FillResult {
+    bool routed;
+    bool produced;
+};
 
 class DataProviderRegistry {
 public:
@@ -114,15 +128,19 @@ public:
     }
 
     // Fan-out: calls fill() on every provider whose registered prefix matches xpath.
-    // Returns true if at least one Update was appended to list, false otherwise.
-    bool fill(RepeatedPtrField<Update>* list,
-              const std::string& xpath) const {
+    // Reports routing and production separately so callers can distinguish
+    // "not implemented" from "exists but no data" (see FillResult).
+    FillResult fill(RepeatedPtrField<Update>* list,
+                    const std::string& xpath) const {
         const int before = list->size();
+        bool routed = false;
         for (const auto& [prefix, provider] : routes_) {
-            if (matches(xpath, prefix))
+            if (matches(xpath, prefix)) {
+                routed = true;
                 provider->fill(list, xpath);
+            }
         }
-        return list->size() > before;
+        return FillResult{routed, list->size() > before};
     }
 
     // Returns the preferred subscription mode from the first matching provider.

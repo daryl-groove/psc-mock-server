@@ -5,8 +5,9 @@
  *   /components/component[name=PSC-x]/state/temperature/...
  *   /components/component[name=PSC-x]/power-supply/state/...
  *
- * Mock: generates slowly-drifting values around ORv3 nominal operating points.
- * Real: replace readXxx() bodies with hardware register reads.
+ * fill() reads from a LeafStore; a background jthread drifts the values on a
+ * quantized random walk. Real hardware: replace simulate() with register reads
+ * that call store_.set().
  *
  * Modeled after impl/gnmi-grpc/src/gnmi_collector.cpp:StatConnector.
  */
@@ -14,10 +15,14 @@
 #pragma once
 
 #include "data_provider.hpp"
+#include "leaf_store.hpp"
 
-#include <string>
-#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <random>
+#include <string>
+#include <thread>
+#include <vector>
 
 // Simulated PSC unit names — match gNMI path component[name=<unit>]
 inline const std::vector<std::string> PSC_UNITS = { "PSC-0", "PSC-1" };
@@ -25,11 +30,11 @@ inline const std::vector<std::string> PSC_UNITS = { "PSC-0", "PSC-1" };
 class PscPowerSensorProvider final : public IDataProvider {
 public:
     PscPowerSensorProvider();
-    ~PscPowerSensorProvider() override = default;
+    ~PscPowerSensorProvider() override = default;  // sim_ jthread auto-stops + joins
 
-    // Populates Update list with current mock sensor readings for xpath.
+    // Reads current mock sensor readings for xpath from the store.
     void fill(RepeatedPtrField<Update>* list,
-              const std::string& xpath) override;
+              const std::string& xpath) const override;
 
     // All PSC sensor leaves are continuous measured values — SAMPLE is correct.
     gnmi::SubscriptionMode preferredMode(const std::string&) const override {
@@ -37,17 +42,14 @@ public:
     }
 
 private:
-    // Mock sensor reads — replace with hardware access for real hardware
-    double readTemperature(const std::string& unit);    // celsius
-    double readInputVoltage(const std::string& unit);   // volts
-    double readInputCurrent(const std::string& unit);   // amps
-    double readOutputVoltage(const std::string& unit);  // volts
-    double readOutputCurrent(const std::string& unit);  // amps
-    double readOutputPower(const std::string& unit);    // watts
-    double readCapacity(const std::string& unit);       // watts (static)
+    // Background simulator: drifts sensor values on a quantized random walk so
+    // that ON_CHANGE has genuine "no change" ticks to suppress. Each tick stamps
+    // all leaves with one collection timestamp (keeps bundling honest, §3.5.2.1).
+    void simulate(std::stop_token stop);
 
-    // Adds ±noise_pct% random drift to simulate sensor variation
-    double withNoise(double base, double noise_pct);
-
-    std::mt19937 rng_;
+    LeafStore                   store_;
+    std::mt19937                rng_;     // used only by the simulator thread
+    std::mutex                  simMu_;
+    std::condition_variable_any simCv_;
+    std::jthread                sim_;     // declared last: started after store_ seed
 };

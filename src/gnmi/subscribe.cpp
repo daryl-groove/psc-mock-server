@@ -37,12 +37,16 @@ Subscribe::buildSubsUpdate(RepeatedPtrField<Update>* updateList,
 {
   switch (encoding) {
     case gnmi::JSON:
-    case gnmi::JSON_IETF:
+    case gnmi::JSON_IETF: {
       // Delegate entirely to backend — populates path + double_val per leaf.
       // Phase 4: add JSON_IETF wrapping once encoding layer is introduced.
-      if (!registry_.fill(updateList, fullpath))
-        BOOST_LOG_TRIVIAL(warning) << "no provider handles path: " << fullpath;
+      FillResult res = registry_.fill(updateList, fullpath);
+      if (!res.routed)                       // §3.5.2.4 not implemented
+        return Status(StatusCode::UNIMPLEMENTED, "path not implemented: " + fullpath);
+      if (!res.produced)                     // §3.5.1.3 exists (yet): silent, do NOT close
+        BOOST_LOG_TRIVIAL(warning) << "path exists but has no data (yet): " << fullpath;
       break;
+    }
 
     default:
       return Status(StatusCode::UNIMPLEMENTED, Encoding_Name(encoding));

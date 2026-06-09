@@ -78,6 +78,7 @@ sources = [
   'src/gnmi/get.cpp',
   'src/gnmi/set.cpp',
   'src/gnmi/subscribe.cpp',
+  'src/backend/leaf_store.cpp',
   'src/backend/psc_power_sensor_provider.cpp',
   'src/security/authentication.cpp',
   'src/utils/log.cpp',
@@ -119,9 +120,18 @@ test_data_provider = executable('test_data_provider',
 
 test_psc_provider = executable('test_psc_provider',
   ['tests/test_psc_provider.cpp',
+   'src/backend/leaf_store.cpp',
    'src/backend/psc_power_sensor_provider.cpp',
    gnmi_ext_proto, gnmi_proto],
   dependencies : [proto_dep, grpc_dep, thread_dep, boost_dep, gtest_dep],
+  include_directories : [include_directories('src')],
+)
+
+test_leaf_store = executable('test_leaf_store',
+  ['tests/test_leaf_store.cpp',
+   'src/backend/leaf_store.cpp',
+   gnmi_ext_proto, gnmi_proto],
+  dependencies : [proto_dep, grpc_dep, thread_dep, gtest_dep],
   include_directories : [include_directories('src')],
 )
 
@@ -133,4 +143,5 @@ test_utils = executable('test_utils',
 
 test('data_provider', test_data_provider)
 test('psc_provider',  test_psc_provider)
+test('leaf_store',    test_leaf_store)
 test('utils',         test_utils)
