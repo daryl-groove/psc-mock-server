@@ -109,7 +109,7 @@ PscPowerSensorProvider::PscPowerSensorProvider() {
 
     // Seed synchronously so a Get/Subscribe arriving before the first simulator
     // tick finds data (avoids a cold-start NOT_FOUND race).
-    const int64_t now = static_cast<int64_t>(get_time_nanosec());
+    const int64_t now = get_time_nanosec();
     for (const auto& w : walks)
         store_.set(w.path, w.value, now);
 
