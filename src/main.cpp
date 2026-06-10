@@ -24,6 +24,7 @@
 
 #include "gnmi/gnmi.h"
 #include "backend/psc_power_sensor_provider.hpp"
+#include "backend/system_config_provider.hpp"
 #include <security/authentication.h>
 #include <utils/log.h>
 
@@ -37,6 +38,8 @@ void RunServer(const std::string& bind_addr,
   DataProviderRegistry registry;
   registry.addProvider("/components/component",
                        std::make_unique<PscPowerSensorProvider>());
+  registry.addProvider("/system/config",
+                       std::make_unique<SystemConfigProvider>());
 
   ServerBuilder builder;
   GNMIService gnmi(std::move(registry));

@@ -117,6 +117,23 @@ public:
     // collection-accurate timestamps (spec §3.5.2.3). A provider that only
     // implements fill() would not stream correctly, so this is required.
     virtual Snapshot snapshot(const std::string& xpath) const = 0;
+
+    // ---- write side (optional) -------------------------------------------
+    // Most providers serve read-only `state`; the defaults below refuse every
+    // write. A `config true` provider overrides them. Splitting the query
+    // (writable) from the mutation (applyUpdate/applyDelete) lets Set validate
+    // the whole request before touching any store — validate-then-apply.
+
+    // May this path be written at all? Called only for a matching prefix.
+    virtual bool writable(const std::string& /*xpath*/) const { return false; }
+
+    // Apply one Set update / delete. Returns false if the provider refused
+    // (e.g. read-only); the registry surfaces that so Set can map it to a
+    // status code. ts is the collection/event time to stamp the leaf with.
+    virtual bool applyUpdate(const std::string& /*xpath*/,
+                             const gnmi::TypedValue& /*val*/,
+                             int64_t /*ts*/) { return false; }
+    virtual bool applyDelete(const std::string& /*xpath*/) { return false; }
 };
 
 // ---------------------------------------------------------------------------
@@ -141,6 +158,18 @@ struct FillResult {
 struct SnapResult {
     Snapshot snap;
     bool     routed;
+};
+
+// Write fan-out result, mirroring FillResult's two signals for status mapping
+// (spec §3.4 SetResponse / §3.3.4):
+//   routed   — some provider's prefix owns this path (else UNIMPLEMENTED/NOT_FOUND)
+//   applied  — a provider accepted the write (routed && !applied = the path is
+//              read-only → INVALID_ARGUMENT)
+// writable() reuses this struct as a dry run: `applied` there means "would be
+// accepted", so Set can validate the whole request before mutating anything.
+struct WriteResult {
+    bool routed;
+    bool applied;
 };
 
 class DataProviderRegistry {
@@ -200,6 +229,47 @@ public:
                 return provider->preferredMode(xpath);
         }
         return gnmi::SAMPLE;
+    }
+
+    // ---- write fan-out --------------------------------------------------
+    // All three mirror fill()/snapshot(): visit every provider whose prefix
+    // owns xpath, OR-reducing routed/applied. writable() is the validate phase
+    // (no mutation); set()/del() are the apply phase. Set calls writable() for
+    // every path first and aborts on any !routed or read-only path, so a Set
+    // either fully applies or mutates nothing.
+
+    WriteResult writable(const std::string& xpath) const {
+        WriteResult res{false, false};
+        for (const auto& [prefix, provider] : routes_) {
+            if (matches(xpath, prefix)) {
+                res.routed = true;
+                if (provider->writable(xpath)) res.applied = true;
+            }
+        }
+        return res;
+    }
+
+    WriteResult set(const std::string& xpath, const gnmi::TypedValue& val,
+                    int64_t ts) {
+        WriteResult res{false, false};
+        for (const auto& [prefix, provider] : routes_) {
+            if (matches(xpath, prefix)) {
+                res.routed = true;
+                if (provider->applyUpdate(xpath, val, ts)) res.applied = true;
+            }
+        }
+        return res;
+    }
+
+    WriteResult del(const std::string& xpath) {
+        WriteResult res{false, false};
+        for (const auto& [prefix, provider] : routes_) {
+            if (matches(xpath, prefix)) {
+                res.routed = true;
+                if (provider->applyDelete(xpath)) res.applied = true;
+            }
+        }
+        return res;
     }
 
 private:

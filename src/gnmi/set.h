@@ -28,15 +28,14 @@ namespace impl {
 
 class Set {
   public:
-    // Registry held for future use (e.g. write-back to IConfigurableProvider).
-    // Unused in mock mode — Set is a no-op.
+    // The registry is the write target: validated paths are applied to the
+    // owning provider's store, which the Subscribe poll+diff loop turns into
+    // ON_CHANGE notifications. Writable providers (config true) accept writes;
+    // read-only ones refuse them.
     explicit Set(DataProviderRegistry& registry) : registry_(registry) {}
     ~Set() = default;
 
     Status run(const SetRequest* request, SetResponse* response);
-
-  private:
-    StatusCode handleUpdate(Update in, UpdateResult* out, std::string prefix);
 
   private:
     DataProviderRegistry& registry_;

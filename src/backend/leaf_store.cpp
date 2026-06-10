@@ -64,6 +64,11 @@ void LeafStore::set(const std::string& xpath, uint64_t value, int64_t collectedN
     setValue(xpath, std::move(v), collectedNs);
 }
 
+void LeafStore::set(const std::string& xpath, const gnmi::TypedValue& value,
+                    int64_t collectedNs) {
+    setValue(xpath, value, collectedNs);
+}
+
 void LeafStore::setValue(const std::string& xpath, gnmi::TypedValue val,
                          int64_t collectedNs) {
     const std::string key = stripPathQuotes(xpath);

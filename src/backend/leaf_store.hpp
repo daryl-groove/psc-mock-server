@@ -52,6 +52,10 @@ public:
     void set(const std::string& xpath, bool value,               int64_t collectedNs);
     void set(const std::string& xpath, int64_t value,            int64_t collectedNs);
     void set(const std::string& xpath, uint64_t value,           int64_t collectedNs);
+    // Set from an already-built TypedValue — the path the write side (gNMI Set)
+    // takes, since the wire value's type is not known at the call site.
+    void set(const std::string& xpath, const gnmi::TypedValue& value,
+             int64_t collectedNs);
     void remove(const std::string& xpath);
 
     // ---- read side: const, shared-locked ----

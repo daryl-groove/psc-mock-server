@@ -41,6 +41,28 @@ public:
     Snapshot snapshot(const std::string&) const override { return {}; }
 };
 
+// Accepts writes and records the last one, so the registry's write fan-out is
+// observable. FakeProvider/EmptyProvider keep the read-only defaults, serving as
+// the refusal case (routed && !applied).
+class WritableProvider : public IDataProvider {
+public:
+    void fill(RepeatedPtrField<Update>*, const std::string&) const override {}
+    Snapshot snapshot(const std::string&) const override { return {}; }
+
+    bool writable(const std::string&) const override { return true; }
+    bool applyUpdate(const std::string& xpath, const gnmi::TypedValue&,
+                     int64_t ts) override {
+        ++updates; lastUpdate = xpath; lastTs = ts; return true;
+    }
+    bool applyDelete(const std::string& xpath) override {
+        ++deletes; lastDelete = xpath; return true;
+    }
+
+    int         updates = 0, deletes = 0;
+    std::string lastUpdate, lastDelete;
+    int64_t     lastTs = 0;
+};
+
 // ---------------------------------------------------------------------------
 // DataProviderRegistry — routing and fan-out
 // ---------------------------------------------------------------------------
@@ -228,4 +250,91 @@ TEST(AddLeaf, Uint64SetsUintVal) {
 
     ASSERT_EQ(list.size(), 1);
     EXPECT_EQ(list[0].val().uint_val(), 100u);
+}
+
+// ---------------------------------------------------------------------------
+// DataProviderRegistry — write fan-out (writable / set / del)
+//
+// Two signals, like fill(): routed = a prefix owns the path (else NOT_FOUND);
+// applied = a provider accepted the write (routed && !applied = read-only →
+// INVALID_ARGUMENT). writable() is Set's dry-run validate phase.
+// ---------------------------------------------------------------------------
+
+TEST(DataProviderRegistryWrite, writableReportsWritableProvider) {
+    DataProviderRegistry reg;
+    reg.addProvider("/cfg", std::make_unique<WritableProvider>());
+
+    WriteResult wr = reg.writable("/cfg/x");
+    EXPECT_TRUE(wr.routed);
+    EXPECT_TRUE(wr.applied);
+}
+
+TEST(DataProviderRegistryWrite, writableReportsReadOnlyProvider) {
+    DataProviderRegistry reg;
+    reg.addProvider("/foo", std::make_unique<FakeProvider>());  // read-only default
+
+    WriteResult wr = reg.writable("/foo/x");
+    EXPECT_TRUE(wr.routed);
+    EXPECT_FALSE(wr.applied);   // routed but not writable → INVALID_ARGUMENT
+}
+
+TEST(DataProviderRegistryWrite, writableNotRoutedWhenNoPrefixMatches) {
+    DataProviderRegistry reg;
+    reg.addProvider("/cfg", std::make_unique<WritableProvider>());
+
+    WriteResult wr = reg.writable("/other");
+    EXPECT_FALSE(wr.routed);    // no owner → NOT_FOUND
+    EXPECT_FALSE(wr.applied);
+}
+
+TEST(DataProviderRegistryWrite, setAppliesToWritableProvider) {
+    DataProviderRegistry reg;
+    auto p = std::make_unique<WritableProvider>();
+    WritableProvider* raw = p.get();
+    reg.addProvider("/cfg", std::move(p));
+
+    gnmi::TypedValue v;
+    v.set_string_val("psc-mock");
+    WriteResult wr = reg.set("/cfg/hostname", v, 99);
+
+    EXPECT_TRUE(wr.routed);
+    EXPECT_TRUE(wr.applied);
+    EXPECT_EQ(raw->updates, 1);
+    EXPECT_EQ(raw->lastUpdate, "/cfg/hostname");
+    EXPECT_EQ(raw->lastTs, 99);             // transaction timestamp is forwarded
+}
+
+TEST(DataProviderRegistryWrite, setRefusedByReadOnlyProvider) {
+    DataProviderRegistry reg;
+    reg.addProvider("/foo", std::make_unique<FakeProvider>());
+
+    gnmi::TypedValue v;
+    v.set_double_val(1.0);
+    WriteResult wr = reg.set("/foo/x", v, 0);
+
+    EXPECT_TRUE(wr.routed);
+    EXPECT_FALSE(wr.applied);   // default applyUpdate refuses
+}
+
+TEST(DataProviderRegistryWrite, delAppliesToWritableProvider) {
+    DataProviderRegistry reg;
+    auto p = std::make_unique<WritableProvider>();
+    WritableProvider* raw = p.get();
+    reg.addProvider("/cfg", std::move(p));
+
+    WriteResult wr = reg.del("/cfg/hostname");
+
+    EXPECT_TRUE(wr.routed);
+    EXPECT_TRUE(wr.applied);
+    EXPECT_EQ(raw->deletes, 1);
+    EXPECT_EQ(raw->lastDelete, "/cfg/hostname");
+}
+
+TEST(DataProviderRegistryWrite, delNotRoutedWhenNoPrefixMatches) {
+    DataProviderRegistry reg;
+    reg.addProvider("/cfg", std::make_unique<WritableProvider>());
+
+    WriteResult wr = reg.del("/other");
+    EXPECT_FALSE(wr.routed);
+    EXPECT_FALSE(wr.applied);
 }
