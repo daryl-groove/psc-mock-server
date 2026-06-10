@@ -295,6 +295,21 @@ Decision: **implemented** — aligned with the Go reference impl, sends initial
 snapshot + `sync_response` at POLL subscription establishment.
 
 ### Phase 3 — ON_CHANGE
+
+> **Status: ✅ implemented.** STREAM ON_CHANGE works end-to-end. The Subscribe
+> read model is now `snapshot()` (not `fill()`): `IDataProvider::snapshot()` +
+> `DataProviderRegistry::snapshot()` (`SnapResult{snap, routed}`) mirror `fill()`
+> (which stays for Get). `handleStream()` runs two buckets in one loop — SAMPLE
+> by timer, ON_CHANGE by `snapshot()`+`diff()` — emitting `updated`→Update,
+> `removed`→`delete`, heartbeat→full re-emit; `updates_only` seeds the baseline
+> but suppresses the initial emit; `TARGET_DEFINED` resolves per-leaf.
+> `Notification.timestamp` is now each leaf's `collectedNs` (spec §3.5.2.3),
+> applied uniformly to initial/POLL/ONCE/SAMPLE/ON_CHANGE. The diff→Notification,
+> heartbeat, and mode-resolution logic is factored into pure helpers in
+> `subscribe_emit.{h,cpp}` and unit-tested (`test_subscribe_emit.cpp`);
+> `test_onchange.py` is the wiring smoke. `get_time_nanosec()` now returns
+> `int64_t`. Deferred: `suppress_redundant` (P3), Set→store injection (separate).
+
 ON_CHANGE requires a fundamentally different data flow from STREAM SAMPLE.
 STREAM SAMPLE calls `fill()` on every sample interval (pull/periodic);
 ON_CHANGE must only emit a Notification when a value actually changes (event-driven).
@@ -355,7 +370,7 @@ Critical ones for this project:
 | P1 | Non-existent path closes RPC | `subscribe.cpp:63` | ✅ non-issue — returns empty updates, no error |
 | P1 | POLL initial snapshot missing | `subscribe.cpp:246` | ✅ fixed — aligns with Go ref impl |
 | P1 | Path key filter not applied | `psc_power_sensor_provider.cpp` | ✅ fixed |
-| P2 | `ON_CHANGE` not implemented | `subscribe.cpp:216` | Phase 3 — prerequisites (`LeafStore::snapshot()`/`diff()`) ✅ ready; handler pending |
+| P2 | `ON_CHANGE` not implemented | `subscribe.cpp` `handleStream()` | ✅ done — `snapshot()`+`diff()` per-subscriber, `removed`→`delete`, `heartbeat_interval`, `collectedNs` timestamps; helpers in `subscribe_emit.{h,cpp}` |
 | P2 | `TARGET_DEFINED` silently ignored (proto3 default = 0) | `subscribe.cpp:159` | ✅ fixed — routes via `IDataProvider::preferredMode()` per leaf; default SAMPLE |
 | P2 | `updates_only` ignored | `subscribe.cpp:139` | ✅ fixed |
 | P2 | Unrecognised path returns silent empty instead of `NOT_FOUND`/`UNIMPLEMENTED` | `get.cpp`, `subscribe.cpp`, `data_provider.hpp` | ✅ fixed — three-state `FillResult{routed,produced}`: Get → UNIMPLEMENTED/NOT_FOUND; Subscribe → UNIMPLEMENTED/silent |
@@ -427,10 +442,10 @@ structurally guarantees no provider reimplements path matching.
 > random walk (held value with occasional ±1-step), `fill()` is now `const` and reads
 > via `store_.collect()`. Each leaf carries its `collected_ns`. The path-match
 > primitives (`stripPathQuotes`, `isPathPrefix`) are shared in `utils.h`.
-> **Deferred to Phase 3 (C):** wiring `Notification.timestamp` to each leaf's
-> `collected_ns` (subscribe.cpp still stamps "now"), the `diff().removed →
-> Notification.delete` mapping, and the ON_CHANGE handler itself. `snapshot()`/`diff()`
-> are ready.
+> **Done in Phase 3 (C):** `Notification.timestamp` is wired to each leaf's
+> `collectedNs`, `diff().removed → Notification.delete` is mapped, and the
+> ON_CHANGE handler is in place. (Subscribe now reads via `snapshot()` rather
+> than `fill()`; `fill()`/`collect()` remain for Get.)
 > **Not done (item A):** a store-backed base class that makes `fill()` `final` —
 > defer until a 2nd provider exists.
 
@@ -502,20 +517,20 @@ source* (or, for ON_CHANGE, the time the event occurred) — **not** the time th
 is emitted. Under the old compute-on-the-fly design they coincided, so
 `subscribe.cpp` using `get_time_nanosec()` ("now") was accidentally correct. Now that
 a background writer updates the store at time T while emission happens at T+δ, "now"
-is wrong. Each leaf therefore **stores** its `collected_ns` — but the wiring that
-makes `Notification.timestamp` use it (instead of "now") is still **pending in
-`subscribe.cpp`** (Phase 3 / C); B only put the timestamp into the store.
+is wrong. Each leaf therefore **stores** its `collectedNs`, and `subscribe.cpp` now
+stamps `Notification.timestamp` with the freshest emitted leaf's `collectedNs`
+(`emitSnapshot`/`emitDiff` return it; the handler falls back to "now" only when a
+Notification carries no collected leaf).
 
 To keep bundling honest (spec §3.5.2.1 — bundling MUST NOT obscure distinct
 timestamps), the background writer updates all leaves of a single tick under one
 timestamp T; leaves sharing T can then be bundled into one Notification accurately.
 
-**Remaining (Phase 3 / C):**
-- Wire `Notification.timestamp` to each leaf's `collected_ns` (subscribe.cpp still stamps "now").
-- Map `diff().removed → Notification.delete`.
-- While wiring timestamps: `get_time_nanosec()` returns `uint64_t` but
-  `Notification.timestamp` / `collected_ns` are `int64`. Fold a return-type fix (or a
-  typed wrapper) into C to drop the scattered `static_cast<int64_t>`.
+**Done (Phase 3 / C):**
+- ✅ `Notification.timestamp` wired to each leaf's `collectedNs` (uniformly across
+  initial/POLL/ONCE/SAMPLE/ON_CHANGE, via `snapshot()`-based emission).
+- ✅ `diff().removed → Notification.delete` mapped (`emitDiff`).
+- ✅ `get_time_nanosec()` now returns `int64_t`; scattered `static_cast<int64_t>` dropped.
 
 **External injection (deferred until hardware wiring):** the `LeafStore` API
 (`set()`/`remove()`) is already present, but `PscPowerSensorProvider` keeps `store_`
@@ -564,25 +579,25 @@ AlarmProvider is a natural example: alarm paths like
 cleared. The Leaf Store `remove()` + Notification `delete` field handle this
 cleanly without any special-casing in `subscribe.cpp`.
 
-**Integration into existing `subscribe.cpp` (open for C to design):**
-The notes above describe ON_CHANGE in isolation. These integration points are *not*
-yet decided and are what C must work out — they live in `handleStream()`, whose
-current shape is a per-SAMPLE-subscription `chronomap` timer loop (the `default:`
-case of the `switch (sub.mode())` currently just logs "Unsupported mode").
-- **Mixed-mode lists:** one `SubscriptionList` may carry both SAMPLE and ON_CHANGE
-  `Subscription` entries (spec-legal). The single `while` loop must service both —
-  SAMPLE entries by timer, ON_CHANGE entries by diff — not assume the whole stream is
-  one mode.
-- **Detection cadence (poll, not push):** the `LeafStore` has no change
-  notification; ON_CHANGE detects changes by polling `snapshot()` + `diff()` on each
-  loop iteration (the loop is already capped at ~200ms). A push/notify on the store
-  is a possible later optimisation, deliberately deferred.
-- **`updates_only` + ON_CHANGE:** still take the baseline `prev = snapshot(query)` at
-  setup, but suppress the initial emit; send `sync_response` first, then only diffs.
-- **`TARGET_DEFINED` → ON_CHANGE:** the existing `preferredMode()` resolution already
-  routes per-leaf; the branch that currently logs "Phase 3" must route into the
-  ON_CHANGE path. (No current provider returns ON_CHANGE, so this path is wiring only
-  until an event-driven provider exists.)
+**Integration into existing `subscribe.cpp` (✅ resolved by C):**
+These integration points are now implemented in `handleStream()`, which keeps two
+per-subscriber buckets (a SAMPLE `chronomap` and an `onChange` vector of
+`{sub, query, prev, lastHeartbeat}`) serviced by one `while` loop.
+- **Mixed-mode lists:** ✅ both buckets coexist; the loop services SAMPLE by timer
+  and ON_CHANGE by diff in the same iteration. Mode is resolved per-subscription via
+  `resolveStreamMode()` (`subscribe_emit`), so a list may freely mix modes.
+- **Detection cadence (poll, not push):** ✅ ON_CHANGE polls `snapshot()` + `diff()`
+  each loop iteration (capped at ~200ms). A push/notify on the store remains a
+  deliberately deferred optimisation — its full rationale (poll-vs-push, the
+  write-side `ILeafSink`/commit seam, deadband layering, `duplicates`) is captured
+  in [`docs/onchange-delivery-and-source-binding.md`](docs/onchange-delivery-and-source-binding.md).
+- **`updates_only` + ON_CHANGE:** ✅ the baseline `prev = snapshot(query)` is taken at
+  setup regardless of `updates_only`; only the initial emit is suppressed (the
+  existing pre-loop block already handles that), `sync_response` is sent, then diffs.
+- **`TARGET_DEFINED` → ON_CHANGE:** ✅ `resolveStreamMode()` expands `TARGET_DEFINED`
+  via `preferredMode()` and routes into the ON_CHANGE bucket. (No current provider
+  returns ON_CHANGE, so this path is wiring only until an event-driven provider
+  exists — exercised by `test_subscribe_emit.cpp` with a mode-stub provider.)
 
 ---
 
@@ -677,7 +692,7 @@ functional changes are required before that point.
 
 ```
 B (Leaf Store)   ✅ done
-    └── C (ON_CHANGE / Phase 3)   ← next; unblocked now B is done
+    └── C (ON_CHANGE / Phase 3)   ✅ done
 
 A (StoreBackedProvider)           ← independent, but see ordering note below
 D (Parent Path)                   ← independent
@@ -714,7 +729,7 @@ base", to be extracted when a 2nd provider appears.
 | Order | Item | Rationale |
 |-------|------|-----------|
 | 1 | **B — Leaf Store** | ✅ **done.** `LeafStore` + background writer + routed/produced three-state. Path-match primitives shared in `utils.h`. |
-| 2 | **C — ON_CHANGE (Phase 3)** | ⬅ **next.** Builds directly on `LeafStore::snapshot()`/`diff()` (already in place). Adds the STREAM ON_CHANGE handler + `heartbeat_interval` + `diff().removed → Notification.delete`. |
+| 2 | **C — ON_CHANGE (Phase 3)** | ✅ **done.** STREAM ON_CHANGE handler on `snapshot()`/`diff()` + `heartbeat_interval` + `diff().removed → Notification.delete` + `collectedNs` timestamps. Pure helpers in `subscribe_emit.{h,cpp}` (unit-tested); `test_onchange.py` smoke. |
 | 3 | **A — StoreBackedProvider** | Do before adding a second provider (`PlatformInfoProvider`, `AlarmProvider`, …). One base (no static/dynamic split — see §A/§B); emerges from real duplication, not speculation. |
 | 4 | **G — main.cpp cleanup** | Do at production deployment time. Zero interaction with the data layer; safe to defer. |
 | 5 | **D — Parent Path** | Revisit only if an operator tool or monitoring system needs subtree queries. |
