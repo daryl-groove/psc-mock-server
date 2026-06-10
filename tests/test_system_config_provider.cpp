@@ -93,3 +93,50 @@ TEST(SystemConfigWrite, ApplyDeleteAbsentLeafSucceeds) {
     SystemConfigProvider p;
     EXPECT_TRUE(p.applyDelete("/system/config/never-set"));
 }
+
+// We own a broad /system prefix, so only config-true paths may be written; a
+// hypothetical read-only /system/.../state leaf must be refused.
+TEST(SystemConfigWrite, NonConfigPathIsNotWritable) {
+    SystemConfigProvider p;
+    EXPECT_TRUE(p.writable("/system/ntp/servers/server[address=10.0.0.1]/config/port"));
+    EXPECT_FALSE(p.writable("/system/state/current-datetime"));
+}
+
+// ---------------------------------------------------------------------------
+// Atomic containers. NTP server records are atomic (the whole .../config record
+// is one atomic notification, spec §2.1.1); the flat /system/config scalars are
+// not. atomicPrefix() reports the owning container, or nullopt.
+// ---------------------------------------------------------------------------
+
+TEST(SystemConfigAtomic, NtpLeafReportsItsServerConfigContainer) {
+    SystemConfigProvider p;
+    const std::string container =
+        "/system/ntp/servers/server[address=10.0.0.1]/config";
+    auto ap = p.atomicPrefix(container + "/port");
+    ASSERT_TRUE(ap.has_value());
+    EXPECT_EQ(*ap, container);
+}
+
+TEST(SystemConfigAtomic, NtpConfigContainerItselfIsAtomic) {
+    SystemConfigProvider p;
+    const std::string container =
+        "/system/ntp/servers/server[address=10.0.0.1]/config";
+    auto ap = p.atomicPrefix(container);
+    ASSERT_TRUE(ap.has_value());
+    EXPECT_EQ(*ap, container);
+}
+
+TEST(SystemConfigAtomic, FlatConfigScalarsAreNotAtomic) {
+    SystemConfigProvider p;
+    EXPECT_FALSE(p.atomicPrefix("/system/config/hostname").has_value());
+}
+
+TEST(SystemConfigAtomic, SeededNtpRecordIsServedAsAtomicLeaves) {
+    SystemConfigProvider p;
+    Snapshot snap =
+        p.snapshot("/system/ntp/servers/server[address=10.0.0.1]/config");
+    // address, port, version, iburst, association-type
+    EXPECT_EQ(snap.size(), 5u);
+    EXPECT_EQ(snap.at("/system/ntp/servers/server[address=10.0.0.1]/config/port")
+                  .val.uint_val(), 123u);
+}

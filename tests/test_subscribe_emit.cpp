@@ -41,6 +41,35 @@ gnmi::Subscription subWith(gnmi::SubscriptionMode mode, const std::string& xpath
     return s;
 }
 
+// Declares one atomic container: every leaf under `container` belongs to it.
+class AtomicProvider : public IDataProvider {
+public:
+    explicit AtomicProvider(std::string container) : container_(std::move(container)) {}
+    void fill(RepeatedPtrField<gnmi::Update>*, const std::string&) const override {}
+    Snapshot snapshot(const std::string&) const override { return {}; }
+    std::optional<std::string> atomicPrefix(const std::string& xpath) const override {
+        if (xpath.compare(0, container_.size(), container_) == 0 &&
+            (xpath.size() == container_.size() || xpath[container_.size()] == '/'))
+            return container_;
+        return std::nullopt;
+    }
+private:
+    std::string container_;
+};
+
+// Registry routing "/c" to an atomic provider whose atomic container is "/c/cfg".
+DataProviderRegistry atomicRegistry() {
+    DataProviderRegistry reg;
+    reg.addProvider("/c", std::make_unique<AtomicProvider>("/c/cfg"));
+    return reg;
+}
+
+// Find the (single) atomic / non-atomic notification in a built list.
+const gnmi::Notification* findAtomic(const std::vector<gnmi::Notification>& v, bool atomic) {
+    for (const auto& n : v) if (n.atomic() == atomic) return &n;
+    return nullptr;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -159,4 +188,137 @@ TEST(ResolveStreamMode, TargetDefinedDefaultsSampleWhenNoProviderMatches) {
     DataProviderRegistry reg;
     EXPECT_EQ(impl::resolveStreamMode(subWith(gnmi::TARGET_DEFINED, "/nope"), reg),
               gnmi::SAMPLE);
+}
+
+// ---------------------------------------------------------------------------
+// emitAtomic — prefix set, paths relativised, atomic=true (spec §2.1.1)
+// ---------------------------------------------------------------------------
+
+TEST(EmitAtomic, SetsPrefixRelativisesPathsAndFlagsAtomic) {
+    Snapshot snap;
+    snap.emplace("/c/cfg/x", leaf(1.0, 100));
+    snap.emplace("/c/cfg/y", leaf(2.0, 400));   // newest
+
+    gnmi::Notification n;
+    int64_t ts = impl::emitAtomic(snap, "/c/cfg", &n);
+
+    EXPECT_TRUE(n.atomic());
+    EXPECT_EQ(pathStr(n.prefix()), "/c/cfg");
+    ASSERT_EQ(n.update_size(), 2);
+    EXPECT_EQ(pathStr(n.update(0).path()), "/x");   // relative: prefix ++ path == leaf
+    EXPECT_EQ(pathStr(n.update(1).path()), "/y");
+    EXPECT_EQ(ts, 400);
+}
+
+// ---------------------------------------------------------------------------
+// buildFullNotifications — atomic container split off from non-atomic remainder
+// ---------------------------------------------------------------------------
+
+TEST(BuildFullNotifications, SplitsAtomicContainerFromNonAtomicLeaves) {
+    DataProviderRegistry reg = atomicRegistry();
+    Snapshot snap;
+    snap.emplace("/c/cfg/x", leaf(1.0, 100));   // atomic container
+    snap.emplace("/c/cfg/y", leaf(2.0, 100));
+    snap.emplace("/c/plain", leaf(9.0, 100));   // non-atomic
+
+    auto notes = impl::buildFullNotifications(snap, reg);
+    ASSERT_EQ(notes.size(), 2u);
+
+    const gnmi::Notification* na = findAtomic(notes, false);
+    const gnmi::Notification* at = findAtomic(notes, true);
+    ASSERT_NE(na, nullptr);
+    ASSERT_NE(at, nullptr);
+
+    // Non-atomic carries the plain leaf with its full path, no prefix.
+    ASSERT_EQ(na->update_size(), 1);
+    EXPECT_EQ(pathStr(na->update(0).path()), "/c/plain");
+
+    // Atomic carries the whole container, relativised, under its prefix.
+    EXPECT_EQ(pathStr(at->prefix()), "/c/cfg");
+    ASSERT_EQ(at->update_size(), 2);
+    EXPECT_EQ(pathStr(at->update(0).path()), "/x");
+    EXPECT_EQ(pathStr(at->update(1).path()), "/y");
+}
+
+TEST(BuildFullNotifications, PureAtomicQueryYieldsOnlyAtomicNotification) {
+    DataProviderRegistry reg = atomicRegistry();
+    Snapshot snap;
+    snap.emplace("/c/cfg/x", leaf(1.0, 100));
+
+    auto notes = impl::buildFullNotifications(snap, reg);
+    ASSERT_EQ(notes.size(), 1u);
+    EXPECT_TRUE(notes[0].atomic());
+}
+
+// ---------------------------------------------------------------------------
+// buildChangeNotifications — atomic = full re-send on any change (spec §2.1.1)
+// ---------------------------------------------------------------------------
+
+TEST(BuildChangeNotifications, AtomicContainerResendsCompleteStateOnChange) {
+    DataProviderRegistry reg = atomicRegistry();
+    Snapshot prev, cur;
+    prev.emplace("/c/cfg/x", leaf(1.0, 100));
+    prev.emplace("/c/cfg/y", leaf(2.0, 100));
+    cur.emplace("/c/cfg/x", leaf(1.0, 100));    // unchanged
+    cur.emplace("/c/cfg/y", leaf(3.0, 500));    // changed
+
+    auto notes = impl::buildChangeNotifications(prev, cur, reg);
+    ASSERT_EQ(notes.size(), 1u);
+    EXPECT_TRUE(notes[0].atomic());
+    // Whole record re-sent, not just the changed leaf.
+    ASSERT_EQ(notes[0].update_size(), 2);
+    EXPECT_EQ(pathStr(notes[0].prefix()), "/c/cfg");
+}
+
+TEST(BuildChangeNotifications, OmittedLeafIsImplicitlyDeletedViaFullResend) {
+    DataProviderRegistry reg = atomicRegistry();
+    Snapshot prev, cur;
+    prev.emplace("/c/cfg/x", leaf(1.0, 100));
+    prev.emplace("/c/cfg/y", leaf(2.0, 100));
+    cur.emplace("/c/cfg/x", leaf(1.0, 100));    // y removed
+
+    auto notes = impl::buildChangeNotifications(prev, cur, reg);
+    ASSERT_EQ(notes.size(), 1u);
+    EXPECT_TRUE(notes[0].atomic());
+    // No explicit delete: the absent leaf is implicitly deleted by re-sending
+    // the (now smaller) complete state.
+    ASSERT_EQ(notes[0].update_size(), 1);
+    EXPECT_EQ(pathStr(notes[0].update(0).path()), "/x");
+    EXPECT_EQ(notes[0].delete__size(), 0);
+}
+
+TEST(BuildChangeNotifications, EmptiedContainerEmitsPrefixDelete) {
+    DataProviderRegistry reg = atomicRegistry();
+    Snapshot prev, cur;
+    prev.emplace("/c/cfg/x", leaf(1.0, 100));   // whole record gone in cur
+
+    auto notes = impl::buildChangeNotifications(prev, cur, reg);
+    ASSERT_EQ(notes.size(), 1u);
+    EXPECT_TRUE(notes[0].atomic());
+    EXPECT_EQ(pathStr(notes[0].prefix()), "/c/cfg");
+    EXPECT_GE(notes[0].delete__size(), 1);
+    EXPECT_EQ(notes[0].update_size(), 0);
+}
+
+TEST(BuildChangeNotifications, UnchangedContainerEmitsNothing) {
+    DataProviderRegistry reg = atomicRegistry();
+    Snapshot prev, cur;
+    prev.emplace("/c/cfg/x", leaf(1.0, 100));
+    cur.emplace("/c/cfg/x", leaf(1.0, 999));    // same value, newer ts only
+
+    auto notes = impl::buildChangeNotifications(prev, cur, reg);
+    EXPECT_TRUE(notes.empty());                 // value unchanged → no re-send
+}
+
+TEST(BuildChangeNotifications, NonAtomicLeavesStillDiff) {
+    DataProviderRegistry reg = atomicRegistry();
+    Snapshot prev, cur;
+    prev.emplace("/c/plain", leaf(1.0, 100));
+    cur.emplace("/c/plain", leaf(2.0, 200));    // changed, non-atomic
+
+    auto notes = impl::buildChangeNotifications(prev, cur, reg);
+    ASSERT_EQ(notes.size(), 1u);
+    EXPECT_FALSE(notes[0].atomic());
+    ASSERT_EQ(notes[0].update_size(), 1);
+    EXPECT_EQ(pathStr(notes[0].update(0).path()), "/c/plain");
 }

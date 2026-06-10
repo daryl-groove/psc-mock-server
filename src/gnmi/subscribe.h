@@ -17,6 +17,8 @@
 #ifndef _GNMI_SUBSCRIBE_H
 #define _GNMI_SUBSCRIBE_H
 
+#include <vector>
+
 #include <gnmi.grpc.pb.h>
 #include "backend/data_provider.hpp"
 
@@ -38,8 +40,11 @@ class Subscribe {
                ServerReaderWriter<SubscribeResponse, SubscribeRequest>* stream);
 
   private:
-    Status buildSubscribeNotification(Notification* notification,
-                                      const SubscriptionList& request);
+    // Build the Notification(s) for a SubscriptionList's initial/ONCE/POLL emit.
+    // Returns more than one when the query spans atomic containers: each atomic
+    // container is its own Notification (spec §2.1.1). Callers write each in turn.
+    Status buildSubscribeNotifications(std::vector<Notification>& out,
+                                       const SubscriptionList& request);
     Status handleStream(ServerContext* context, SubscribeRequest request,
               ServerReaderWriter<SubscribeResponse, SubscribeRequest>* stream);
     Status handleOnce(ServerContext* context, SubscribeRequest request,

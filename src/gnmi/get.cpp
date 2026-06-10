@@ -17,6 +17,7 @@
 #include <grpc/grpc.h>
 
 #include "get.h"
+#include "subscribe_emit.h"   // buildFullNotifications — atomic-aware emit, shared with Subscribe
 #include <utils/utils.h>
 #include <utils/log.h>
 
@@ -26,54 +27,42 @@ using google::protobuf::RepeatedPtrField;
 namespace impl {
 
 Status
-Get::buildGetUpdate(RepeatedPtrField<Update>* updateList,
-                    const Path& path, string fullpath,
-                    gnmi::Encoding encoding)
+Get::buildGetNotifications(RepeatedPtrField<Notification>* out,
+                           const Path* prefix, const Path& path,
+                           gnmi::Encoding encoding)
 {
-  switch (encoding) {
-    case gnmi::JSON:
-    case gnmi::JSON_IETF: {
-      // Delegate entirely to backend — it populates path + double_val per leaf.
-      // Phase 4: wrap values in JSON_IETF once encoding layer is added.
-      FillResult res = registry_.fill(updateList, fullpath);
-      if (!res.routed)                       // §3.3.4 not implemented
-        return Status(StatusCode::UNIMPLEMENTED, "path not implemented: " + fullpath);
-      if (!res.produced)                     // §3.3.4 exists (yet) but no data
-        return Status(StatusCode::NOT_FOUND, "path has no data: " + fullpath);
-      break;
-    }
-
-    default:
-      return Status(StatusCode::UNIMPLEMENTED, Encoding_Name(encoding));
-  }
-
-  return Status::OK;
-}
-
-Status
-Get::buildGetNotification(Notification* notification, const Path* prefix,
-                          const Path& path, gnmi::Encoding encoding)
-{
-  RepeatedPtrField<Update>* updateList = notification->mutable_update();
-  string fullpath;
-
-  notification->set_timestamp(get_time_nanosec());
-
-  if (prefix != nullptr) {
-    string str = gnmi_to_xpath(*prefix);
-    BOOST_LOG_TRIVIAL(debug) << "prefix is " << str;
-    notification->mutable_prefix()->CopyFrom(*prefix);
-    fullpath += str;
-  }
-
-  fullpath += gnmi_to_xpath(path);
-  BOOST_LOG_TRIVIAL(debug) << "GetRequest Path " << fullpath;
+  // Encoding is already validated in verifyGetRequest; only JSON/JSON_IETF reach
+  // here. Phase 4 wraps values in JSON_IETF once the encoding layer is added.
+  if (encoding != gnmi::JSON && encoding != gnmi::JSON_IETF)
+    return Status(StatusCode::UNIMPLEMENTED, Encoding_Name(encoding));
 
   Status status = validateGnmiPath(path);
   if (!status.ok()) return status;
 
+  string fullpath;
+  if (prefix != nullptr)
+    fullpath += gnmi_to_xpath(*prefix);
+  fullpath += gnmi_to_xpath(path);
+  BOOST_LOG_TRIVIAL(debug) << "GetRequest Path " << fullpath;
+
   /* TODO: DataType CONFIG/STATE/OPERATIONAL filtering — get.cpp:120 */
-  return buildGetUpdate(updateList, path, fullpath, encoding);
+  SnapResult res = registry_.snapshot(fullpath);
+  if (!res.routed)                         // §3.3.4 not implemented
+    return Status(StatusCode::UNIMPLEMENTED, "path not implemented: " + fullpath);
+  if (res.snap.empty())                    // §3.3.4 exists (yet) but no data
+    return Status(StatusCode::NOT_FOUND, "path has no data: " + fullpath);
+
+  // Same atomic-aware partition as Subscribe: each atomic container becomes its
+  // own atomic Notification (spec §3.5.2.5), the rest a single non-atomic one.
+  std::vector<Notification> notes = buildFullNotifications(res.snap, registry_);
+  for (auto& n : notes) {
+    // A request prefix applies to the non-atomic notification only; atomic ones
+    // carry their own container prefix.
+    if (prefix != nullptr && !n.atomic())
+      n.mutable_prefix()->CopyFrom(*prefix);
+    *out->Add() = std::move(n);
+  }
+  return Status::OK;
 }
 
 static inline Status verifyGetRequest(const GetRequest* request)
@@ -119,14 +108,13 @@ Status Get::run(const GetRequest* req, GetResponse* response)
 
   auto* notificationList = response->mutable_notification();
   for (auto path : req->path()) {
-    auto* notification = notificationList->Add();
-
+    // One path may yield several Notifications when it spans atomic containers.
     status = req->has_prefix()
-      ? buildGetNotification(notification, &req->prefix(), path, req->encoding())
-      : buildGetNotification(notification, nullptr,       path, req->encoding());
+      ? buildGetNotifications(notificationList, &req->prefix(), path, req->encoding())
+      : buildGetNotifications(notificationList, nullptr,       path, req->encoding());
 
     if (!status.ok()) {
-      BOOST_LOG_TRIVIAL(error) << "buildGetNotification failed: "
+      BOOST_LOG_TRIVIAL(error) << "buildGetNotifications failed: "
                                << status.error_message();
       return status;
     }

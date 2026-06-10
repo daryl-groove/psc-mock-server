@@ -17,6 +17,8 @@
 #ifndef _GNMI_GET_H
 #define _GNMI_GET_H
 
+#include <vector>
+
 #include <gnmi.grpc.pb.h>
 #include "backend/data_provider.hpp"
 
@@ -35,11 +37,12 @@ class Get {
     Status run(const GetRequest* req, GetResponse* response);
 
   private:
-    Status buildGetNotification(Notification* notification, const Path* prefix,
-                                const Path& path, gnmi::Encoding encoding);
-    Status buildGetUpdate(RepeatedPtrField<Update>* updateList,
-                          const Path& path, std::string fullpath,
-                          gnmi::Encoding encoding);
+    // Append the Notification(s) answering one requested path. Atomic containers
+    // are returned as their own atomic Notification (spec §3.5.2.5), so a single
+    // path may yield more than one — hence appending to the response list.
+    Status buildGetNotifications(RepeatedPtrField<Notification>* out,
+                                 const Path* prefix, const Path& path,
+                                 gnmi::Encoding encoding);
 
   private:
     DataProviderRegistry& registry_;

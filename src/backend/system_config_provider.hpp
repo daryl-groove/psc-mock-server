@@ -1,19 +1,33 @@
 /*
  * SystemConfigProvider — system configuration (openconfig-system).
  *
- * Serves /system/config/... (hostname, banners). Unlike the sensor provider,
- * config is event-driven and writable: there is NO background simulator —
- * values change only when a client issues gNMI Set. That makes this the
- * deterministic ON_CHANGE source (Set update -> Update, Set delete -> delete)
- * and the natural, semantically-correct home for the write path (config is
- * `config true`, unlike read-only sensor `state`).
+ * Owns the writable /system config domain. Unlike the sensor provider, config
+ * is event-driven and writable: there is NO background simulator — values
+ * change only when a client issues gNMI Set. That makes this the deterministic
+ * ON_CHANGE source (Set update -> Update, Set delete -> delete) and the natural,
+ * semantically-correct home for the write path (config is `config true`, unlike
+ * read-only sensor `state`).
  *
- * Piece A (this file) is read-only: it seeds defaults and serves Get/Subscribe.
- * The write side (applyUpdate/applyDelete + registry write fan-out) lands in
- * Piece B. See docs/onchange-delivery-and-source-binding.md §6.1.
+ * Two shapes of config coexist here, which is the point:
+ *   /system/config/...                          flat scalars (hostname, banners)
+ *                                               — per-leaf, NON-atomic.
+ *   /system/ntp/servers/server[address=X]/config/...
+ *                                               an ATOMIC container: the whole
+ *                                               NTP server record is delivered
+ *                                               as one atomic Notification
+ *                                               (spec §2.1.1 — telemetry-atomic
+ *                                               style record), so changing one
+ *                                               field re-sends the whole record
+ *                                               and an omitted field is
+ *                                               implicitly deleted.
+ *
+ * See docs/onchange-delivery-and-source-binding.md §6.1 / §7 (atomic framing).
  */
 
 #pragma once
+
+#include <optional>
+#include <string>
 
 #include "data_provider.hpp"
 #include "leaf_store.hpp"
@@ -37,14 +51,21 @@ public:
     }
 
     // ---- write side (Piece B) ----
-    // /system/config is `config true`: every leaf under our prefix is writable.
-    // The registry only calls these for a matching path, so an unconditional
-    // true is correct. Mutating store_ here is what the existing poll+diff loop
-    // turns into an ON_CHANGE Update / delete — no new trigger needed.
-    bool writable(const std::string&) const override { return true; }
+    // Only `config true` leaves are writable. We own a broad /system prefix, so
+    // restrict writes to config containers (a write to a hypothetical read-only
+    // /system/.../state leaf must be refused → INVALID_ARGUMENT). Mutating store_
+    // here is what the existing poll+diff loop turns into an ON_CHANGE Update /
+    // delete — no new trigger needed.
+    bool writable(const std::string& xpath) const override;
     bool applyUpdate(const std::string& xpath, const gnmi::TypedValue& val,
                      int64_t ts) override;
     bool applyDelete(const std::string& xpath) override;
+
+    // ---- atomic containers ----
+    // NTP server records (/system/ntp/servers/server[address=X]/config) are
+    // atomic; the flat /system/config scalars are not. Returns the owning
+    // server's `.../config` container prefix, or nullopt.
+    std::optional<std::string> atomicPrefix(const std::string& xpath) const override;
 
 private:
     LeafStore store_;

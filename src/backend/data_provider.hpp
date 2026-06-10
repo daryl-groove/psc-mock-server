@@ -15,6 +15,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -134,6 +135,17 @@ public:
                              const gnmi::TypedValue& /*val*/,
                              int64_t /*ts*/) { return false; }
     virtual bool applyDelete(const std::string& /*xpath*/) { return false; }
+
+    // ---- atomic containers (optional) ------------------------------------
+    // If xpath falls within an atomic container this provider owns, return that
+    // container's absolute prefix; else nullopt (the default — most data is
+    // per-leaf, eventually-consistent). All leaves sharing an atomic prefix MUST
+    // be emitted as ONE atomic Notification carrying the complete state of the
+    // prefix at one timestamp (spec §2.1.1 / §3.5.2.5): omitted leaves are
+    // implicitly deleted, so a changed container is re-sent in full, never diffed.
+    virtual std::optional<std::string> atomicPrefix(const std::string&) const {
+        return std::nullopt;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -229,6 +241,18 @@ public:
                 return provider->preferredMode(xpath);
         }
         return gnmi::SAMPLE;
+    }
+
+    // Atomic-container prefix owning xpath, from the first matching provider, or
+    // nullopt. The emit side groups leaves by this so each atomic container
+    // becomes one atomic Notification (spec §2.1.1).
+    std::optional<std::string> atomicPrefix(const std::string& xpath) const {
+        for (const auto& [prefix, provider] : routes_) {
+            if (matches(xpath, prefix)) {
+                if (auto ap = provider->atomicPrefix(xpath)) return ap;
+            }
+        }
+        return std::nullopt;
     }
 
     // ---- write fan-out --------------------------------------------------

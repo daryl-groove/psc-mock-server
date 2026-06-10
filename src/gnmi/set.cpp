@@ -88,6 +88,15 @@ Status Set::run(const SetRequest* request, SetResponse* response)
   // Deleting a nonexistent in-schema leaf is silently accepted (§3.4.6): del()
   // is idempotent. We treat replace as update — flat scalar leaves have no
   // subtree to prune, so there are no omitted siblings to revert.
+  //
+  // NOTE (atomic write coherence — the other half of atomic, not yet done):
+  // each leaf is applied under the store's own per-leaf lock, so a concurrent
+  // Subscribe poll can observe an atomic container half-updated (a "torn"
+  // record) when one Set RPC writes several of its leaves. Emission is already
+  // atomic (Notification.atomic); making the *write* atomic needs a batched
+  // commit that applies a record's leaves under one lock (the ILeafSink/commit
+  // seam, docs/onchange-delivery-and-source-binding.md §3.2). Latent today:
+  // single-leaf Sets cannot tear.
   for (const auto& delpath : request->delete_()) {
     registry_.del(prefix + gnmi_to_xpath(delpath));
     UpdateResult* res = response->add_response();

@@ -84,4 +84,97 @@ Verify  : Script sends 3 Poll triggers at 1.5s intervals.
           Each trigger receives sensor data followed by sync_response=True.
           Output ends with "PASS — sync_response=true received after every poll".
 
+
+================================================================================
+Set — Write Config (writable /system/config)
+================================================================================
+Purpose : /system is config-true and writable via the gNMI Set RPC. A Set
+          mutates the store, which the ON_CHANGE poll loop turns into telemetry.
+
+  # update a leaf
+  gnmic -a localhost:50051 --insecure --encoding json_ietf \
+    set --update-path "/system/config/hostname" --update-value edge-psc
+
+  # delete a leaf
+  gnmic -a localhost:50051 --insecure \
+    set --delete "/system/config/motd-banner"
+
+Verify  : update returns op:UPDATE, delete returns op:DELETE. A read-only path
+          (e.g. a sensor /components/.../state/...) returns INVALID_ARGUMENT; an
+          unowned path returns NOT_FOUND.
+
+
+================================================================================
+Subscribe: ON_CHANGE — Non-atomic Config (per-leaf diff)
+================================================================================
+Purpose : Baseline (NON-atomic) ON_CHANGE, to contrast with the atomic container
+          below. /system/config scalars stream per-leaf: a change sends only the
+          changed leaf; a delete sends an explicit Notification.delete.
+
+  # terminal 1: subscribe
+  gnmic -a localhost:50051 --insecure --encoding json_ietf \
+    subscribe --path "/system/config" \
+    --mode stream --stream-mode on_change --format prototext
+
+  # terminal 2: drive changes
+  gnmic -a localhost:50051 --insecure --encoding json_ietf \
+    set --update-path "/system/config/hostname" --update-value edge-psc
+  gnmic -a localhost:50051 --insecure \
+    set --delete "/system/config/motd-banner"
+
+Verify  : NO "atomic: true" field. The hostname change arrives as a single
+          update for /system/config/hostname only. The delete arrives as an
+          explicit "delete:" entry for /system/config/motd-banner.
+          (Equivalent CI assertion: python3 tests/e2e/test_set_onchange.py)
+
+
+================================================================================
+Subscribe: ON_CHANGE — Atomic Container (NTP server record)
+================================================================================
+Purpose : The NTP server record is an ATOMIC container (spec 2.1.1): the whole
+          record is delivered as ONE atomic Notification, and any change re-sends
+          the COMPLETE current state — an omitted leaf is implicitly deleted, not
+          sent as an explicit delete.
+
+Note    : Use --format prototext (or protojson). The "event"/json formats hide
+          the "atomic: true" flag and the prefix. Subscribe must use
+          --encoding json_ietf (the server rejects proto encoding with
+          UNIMPLEMENTED).
+
+  # terminal 1: subscribe to the whole record
+  gnmic -a localhost:50051 --insecure --encoding json_ietf \
+    subscribe \
+    --path "/system/ntp/servers/server[address=10.0.0.1]/config" \
+    --mode stream --stream-mode on_change --format prototext
+
+  # terminal 2: change one field, then delete one field
+  gnmic -a localhost:50051 --insecure --encoding json_ietf \
+    set --update-path \
+    "/system/ntp/servers/server[address=10.0.0.1]/config/version" \
+    --update-value 5
+  gnmic -a localhost:50051 --insecure \
+    set --delete "/system/ntp/servers/server[address=10.0.0.1]/config/iburst"
+
+Verify  : Initial + every re-send carries "atomic: true", a prefix ending in
+          .../config, and RELATIVE leaf paths (address, port, version, ...).
+          - version Set : the WHOLE record (5 leaves) is re-sent, version=5.
+          - iburst Set delete : the record is re-sent with only 4 leaves, iburst
+            absent, and NO "delete:" entry (implicit deletion).
+          (Equivalent CI assertion: python3 tests/e2e/test_atomic.py)
+
+
+================================================================================
+Get — Atomic Container
+================================================================================
+Purpose : Get on an atomic container also returns an atomic response (spec
+          3.5.2.5), consistent with Subscribe.
+
+  gnmic -a localhost:50051 --insecure --encoding json_ietf \
+    get --path "/system/ntp/servers/server[address=10.0.0.1]/config" \
+    --format prototext
+
+Verify  : The notification has "atomic: true", prefix .../config, and relative
+          leaf paths. Contrast: get on "/system/config" has NO atomic flag and
+          carries full leaf paths.
+
 ================================================================================

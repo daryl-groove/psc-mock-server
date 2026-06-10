@@ -38,7 +38,7 @@ void RunServer(const std::string& bind_addr,
   DataProviderRegistry registry;
   registry.addProvider("/components/component",
                        std::make_unique<PscPowerSensorProvider>());
-  registry.addProvider("/system/config",
+  registry.addProvider("/system",
                        std::make_unique<SystemConfigProvider>());
 
   ServerBuilder builder;

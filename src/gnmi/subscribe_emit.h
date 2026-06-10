@@ -10,6 +10,8 @@
 
 #include <chrono>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include <gnmi.grpc.pb.h>
 
@@ -28,6 +30,28 @@ int64_t emitSnapshot(const Snapshot& snap,
 // removed paths as Notification.delete (spec §3.5.2.3). Returns the newest
 // collection time among the updated leaves (0 if none).
 int64_t emitDiff(const LeafStore::Diff& diff, gnmi::Notification* notification);
+
+// Emit a snapshot as a single ATOMIC notification (spec §2.1.1): sets
+// Notification.prefix to the atomic container, relativises every leaf path
+// against it (so prefix ++ path == the leaf), and sets atomic=true. Returns the
+// newest collection time (0 if empty); the caller stamps the timestamp.
+int64_t emitAtomic(const Snapshot& snap, const std::string& atomicPrefix,
+                   gnmi::Notification* notification);
+
+// Partition a full snapshot into Notifications: one atomic Notification per
+// atomic container present (atomic=true, relativised), plus one non-atomic
+// Notification for the rest. Each carries its own freshest-leaf timestamp. Used
+// for the initial emit, ONCE, POLL, and the ON_CHANGE heartbeat (full re-send).
+std::vector<gnmi::Notification> buildFullNotifications(
+    const Snapshot& snap, const DataProviderRegistry& registry);
+
+// ON_CHANGE per poll: produce only the Notifications that represent a change.
+// Non-atomic leaves emit a diff (updates + deletes); an atomic container that
+// changed at all re-sends its COMPLETE current state (omitted leaves implicitly
+// deleted, spec §2.1.1), and a container that became empty emits a prefix delete.
+std::vector<gnmi::Notification> buildChangeNotifications(
+    const Snapshot& prev, const Snapshot& cur,
+    const DataProviderRegistry& registry);
 
 // True when a heartbeat is due. intervalNs == 0 disables heartbeats.
 bool heartbeatDue(uint64_t intervalNs,

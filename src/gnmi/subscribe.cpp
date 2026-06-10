@@ -35,19 +35,35 @@ using google::protobuf::RepeatedPtrField;
 
 namespace impl {
 
+namespace {
+
+// Write each Notification as its own SubscribeResponse. Atomic containers split
+// a query across several Notifications (spec §2.1.1), so emit sites loop here.
+void writeAll(std::vector<Notification>& notes,
+              ServerReaderWriter<SubscribeResponse, SubscribeRequest>* stream)
+{
+  SubscribeResponse response;
+  for (auto& n : notes) {
+    *response.mutable_update() = std::move(n);
+    stream->Write(response);
+    response.Clear();
+  }
+}
+
+} // namespace
+
 /**
- * buildSubscribeNotification - Build a Notification message.
- * Contrary to Get Notification, gnmi specification highly recommands to
- * put multiple <xpath, value> in the same Notification message.
- * @param notification the notification that is constructed by this function.
+ * buildSubscribeNotifications - Build the Notification(s) for a SubscriptionList.
+ * gnmi specification highly recommends bundling multiple <xpath, value> into one
+ * Notification. Atomic containers are the exception: each is delivered as its own
+ * atomic Notification (spec §2.1.1), so this may produce several.
+ * @param out  receives one or more Notifications, in emit order.
  * @param request the SubscriptionList from SubscribeRequest to answer to.
  */
 Status
-Subscribe::buildSubscribeNotification(Notification *notification,
-                                      const SubscriptionList& request)
+Subscribe::buildSubscribeNotifications(std::vector<Notification>& out,
+                                       const SubscriptionList& request)
 {
-  RepeatedPtrField<Update>* updateList = notification->mutable_update();
-
   switch (request.encoding()) {
     case gnmi::JSON:
     case gnmi::JSON_IETF:
@@ -66,16 +82,12 @@ Subscribe::buildSubscribeNotification(Notification *notification,
   }
 
   // use_aliases was reserved/removed in proto 0.10.0; no action needed.
-
   /* updates_only is handled by the caller (handleStream); no action here */
 
-  if (request.has_prefix())
-    notification->mutable_prefix()->CopyFrom(request.prefix());
-
-  /* Read the current snapshot for each subscribed path and emit it. The
-   * Notification timestamp is the freshest leaf's collection time, not "now"
-   * (spec §3.5.2.3); Phase 4 adds JSON_IETF subtree wrapping here. */
-  int64_t ts = 0;
+  /* Merge the current snapshot of every subscribed path, then partition it into
+   * atomic + non-atomic Notifications. Timestamps are collection-accurate, not
+   * "now" (spec §3.5.2.3); Phase 4 adds JSON_IETF subtree wrapping here. */
+  Snapshot merged;
   for (int i = 0; i < request.subscription_size(); i++) {
     Subscription sub = request.subscription(i);
 
@@ -89,12 +101,16 @@ Subscribe::buildSubscribeNotification(Notification *notification,
     if (res.snap.empty())                  // §3.5.1.3 exists (yet): silent, do NOT close
       BOOST_LOG_TRIVIAL(warning) << "path exists but has no data (yet): " << xpath;
 
-    ts = max(ts, emitSnapshot(res.snap, updateList));
+    merged.merge(res.snap);
   }
 
-  // Fall back to now only when nothing was produced (still a valid Notification).
-  notification->set_timestamp(ts ? ts : get_time_nanosec());
-  notification->set_atomic(false);
+  out = buildFullNotifications(merged, registry_);
+
+  // A request prefix applies to the non-atomic notification only; atomic ones
+  // carry their own container prefix (mixing the two is out of scope — see §2.1.1).
+  if (request.has_prefix())
+    for (auto& n : out)
+      if (!n.atomic()) n.mutable_prefix()->CopyFrom(request.prefix());
 
   return Status::OK;
 }
@@ -125,14 +141,13 @@ Status Subscribe::handleStream(
   // Send initial snapshot unless client requested updates_only.
   // sync_response is always sent to mark initial synchronisation complete.
   if (!request.subscribe().updates_only()) {
-    status = buildSubscribeNotification(response.mutable_update(),
-                                        request.subscribe());
+    std::vector<Notification> notes;
+    status = buildSubscribeNotifications(notes, request.subscribe());
     if (!status.ok()) {
       context->TryCancel();
       return status;
     }
-    stream->Write(response);
-    response.Clear();
+    writeAll(notes, stream);
   }
 
   response.set_sync_response(true);
@@ -202,14 +217,13 @@ Status Subscribe::handleStream(
     }
 
     if (updateList->subscription_size() > 0) {
-      status = buildSubscribeNotification(response.mutable_update(),
-                                          updateRequest.subscribe());
+      std::vector<Notification> notes;
+      status = buildSubscribeNotifications(notes, updateRequest.subscribe());
       if(!status.ok()) {
         context->TryCancel();
         return status;
       }
-      stream->Write(response);
-      response.Clear();
+      writeAll(notes, stream);
     }
 
     // ---- ON_CHANGE: poll each subscriber's snapshot and diff vs its previous ----
@@ -218,24 +232,16 @@ Status Subscribe::handleStream(
       const auto now = high_resolution_clock::now();
 
       if (heartbeatDue(oc.sub.heartbeat_interval(), oc.lastHeartbeat, now)) {
-        // Heartbeat re-emits the full state regardless of change (spec §3.5.1.5.2).
-        Notification* n = response.mutable_update();
-        int64_t ts = emitSnapshot(cur, n->mutable_update());
-        n->set_timestamp(ts ? ts : get_time_nanosec());
-        n->set_atomic(false);
-        stream->Write(response);
-        response.Clear();
+        // Heartbeat re-emits the full state regardless of change (spec §3.5.1.5.2),
+        // atomic containers re-sent atomically.
+        std::vector<Notification> notes = buildFullNotifications(cur, registry_);
+        writeAll(notes, stream);
         oc.lastHeartbeat = now;
       } else {
-        LeafStore::Diff d = LeafStore::diff(oc.prev, cur);
-        if (!d.updated.empty() || !d.removed.empty()) {
-          Notification* n = response.mutable_update();
-          int64_t ts = emitDiff(d, n);
-          n->set_timestamp(ts ? ts : get_time_nanosec());
-          n->set_atomic(false);
-          stream->Write(response);
-          response.Clear();
-        }
+        // Non-atomic leaves diff; an atomic container that changed re-sends in full.
+        std::vector<Notification> notes =
+            buildChangeNotifications(oc.prev, cur, registry_);
+        writeAll(notes, stream);
       }
 
       oc.prev = std::move(cur);
@@ -260,15 +266,14 @@ Status Subscribe::handleOnce(ServerContext* context, SubscribeRequest request,
 
   // Sends a Notification message that updates all Subcriptions once
   SubscribeResponse response;
-  status = buildSubscribeNotification(response.mutable_update(),
-                                      request.subscribe());
+  std::vector<Notification> notes;
+  status = buildSubscribeNotifications(notes, request.subscribe());
   if (!status.ok()) {
     context->TryCancel();
     return status;
   }
 
-  stream->Write(response);
-  response.Clear();
+  writeAll(notes, stream);
 
   // Sends a message that indicates that initial synchronization
   // has completed, i.e. each Subscription has been updated once
@@ -294,14 +299,13 @@ Status Subscribe::handlePoll(ServerContext* context, SubscribeRequest request,
   // client gets consistent state immediately without needing a first Poll trigger.
   {
     SubscribeResponse response;
-    status = buildSubscribeNotification(response.mutable_update(),
-                                        subscription.subscribe());
+    std::vector<Notification> notes;
+    status = buildSubscribeNotifications(notes, subscription.subscribe());
     if (!status.ok()) {
       context->TryCancel();
       return status;
     }
-    stream->Write(response);
-    response.Clear();
+    writeAll(notes, stream);
     response.set_sync_response(true);
     stream->Write(response);
     response.Clear();
@@ -313,14 +317,13 @@ Status Subscribe::handlePoll(ServerContext* context, SubscribeRequest request,
         {
           // Sends a Notification message that updates all Subcriptions once
           SubscribeResponse response;
-          status = buildSubscribeNotification(response.mutable_update(),
-                                              subscription.subscribe());
+          std::vector<Notification> notes;
+          status = buildSubscribeNotifications(notes, subscription.subscribe());
           if (!status.ok()) {
             context->TryCancel();
             return status;
           }
-          stream->Write(response);
-          response.Clear();
+          writeAll(notes, stream);
 
           response.set_sync_response(true);
           stream->Write(response);

@@ -4,8 +4,8 @@
 
 namespace {
 
-// Default config leaves (openconfig-system). All string-valued. Seeded at
-// construction; thereafter they change only via gNMI Set (Piece B).
+// Flat scalar config leaves (openconfig-system). All string-valued, per-leaf,
+// NON-atomic. Seeded at construction; thereafter they change only via gNMI Set.
 struct ConfigLeaf {
     const char* path;
     const char* value;
@@ -17,6 +17,21 @@ const ConfigLeaf DEFAULTS[] = {
     { "/system/config/motd-banner",  "ORv3 PSC mock"  },
 };
 
+// An NTP server record is an atomic container: address (key), port, version,
+// iburst, association-type form one logical record delivered together.
+const char* NTP_CONFIG =
+    "/system/ntp/servers/server[address=10.0.0.1]/config";
+
+// A `config true` path is writable. We own a broad /system prefix but only model
+// config containers, so gate writes on a /config segment: a write to a
+// hypothetical read-only /system/.../state leaf is refused (INVALID_ARGUMENT).
+bool isConfigPath(const std::string& p) {
+    if (p.find("/config/") != std::string::npos) return true;
+    static const std::string tail = "/config";
+    return p.size() >= tail.size() &&
+           p.compare(p.size() - tail.size(), tail.size(), tail) == 0;
+}
+
 } // namespace
 
 SystemConfigProvider::SystemConfigProvider() {
@@ -24,11 +39,23 @@ SystemConfigProvider::SystemConfigProvider() {
     for (const auto& c : DEFAULTS)
         // Wrap in std::string: a bare const char* would bind to set(bool,...).
         store_.set(c.path, std::string(c.value), now);
+
+    // Seed one NTP server record — mixed-type leaves under an atomic container.
+    const std::string ntp = NTP_CONFIG;
+    store_.set(ntp + "/address",          std::string("10.0.0.1"), now);
+    store_.set(ntp + "/port",             uint64_t{123},           now);
+    store_.set(ntp + "/version",          uint64_t{4},             now);
+    store_.set(ntp + "/iburst",           true,                    now);
+    store_.set(ntp + "/association-type", std::string("SERVER"),   now);
 }
 
 void SystemConfigProvider::fill(RepeatedPtrField<Update>* list,
                                 const std::string& xpath) const {
     store_.collect(xpath, list);
+}
+
+bool SystemConfigProvider::writable(const std::string& xpath) const {
+    return isConfigPath(stripPathQuotes(xpath));
 }
 
 bool SystemConfigProvider::applyUpdate(const std::string& xpath,
@@ -41,4 +68,20 @@ bool SystemConfigProvider::applyUpdate(const std::string& xpath,
 bool SystemConfigProvider::applyDelete(const std::string& xpath) {
     store_.remove(xpath);
     return true;
+}
+
+std::optional<std::string>
+SystemConfigProvider::atomicPrefix(const std::string& xpath) const {
+    const std::string p = stripPathQuotes(xpath);
+    static const std::string root = "/system/ntp/servers/server[";
+    if (p.compare(0, root.size(), root) != 0) return std::nullopt;
+
+    // The atomic boundary is the server entry's `.../config` container.
+    static const std::string marker = "/config";
+    if (size_t c = p.find(marker + "/"); c != std::string::npos)
+        return p.substr(0, c + marker.size());          // ".../config/<leaf>"
+    if (p.size() >= marker.size() &&
+        p.compare(p.size() - marker.size(), marker.size(), marker) == 0)
+        return p;                                        // the container itself
+    return std::nullopt;
 }
