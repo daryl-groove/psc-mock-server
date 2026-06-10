@@ -14,13 +14,18 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <thread>
 #include <chrono>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <grpc/grpc.h>
 
 #include "subscribe.h"
+#include "subscribe_emit.h"
+#include "backend/leaf_store.hpp"
 #include <utils/utils.h>
 #include <utils/log.h>
 
@@ -29,31 +34,6 @@ using namespace chrono;
 using google::protobuf::RepeatedPtrField;
 
 namespace impl {
-
-Status
-Subscribe::buildSubsUpdate(RepeatedPtrField<Update>* updateList,
-                            const Path& path, string fullpath,
-                            gnmi::Encoding encoding)
-{
-  switch (encoding) {
-    case gnmi::JSON:
-    case gnmi::JSON_IETF: {
-      // Delegate entirely to backend — populates path + double_val per leaf.
-      // Phase 4: add JSON_IETF wrapping once encoding layer is introduced.
-      FillResult res = registry_.fill(updateList, fullpath);
-      if (!res.routed)                       // §3.5.2.4 not implemented
-        return Status(StatusCode::UNIMPLEMENTED, "path not implemented: " + fullpath);
-      if (!res.produced)                     // §3.5.1.3 exists (yet): silent, do NOT close
-        BOOST_LOG_TRIVIAL(warning) << "path exists but has no data (yet): " << fullpath;
-      break;
-    }
-
-    default:
-      return Status(StatusCode::UNIMPLEMENTED, Encoding_Name(encoding));
-  }
-
-  return Status::OK;
-}
 
 /**
  * buildSubscribeNotification - Build a Notification message.
@@ -67,7 +47,6 @@ Subscribe::buildSubscribeNotification(Notification *notification,
                                       const SubscriptionList& request)
 {
   RepeatedPtrField<Update>* updateList = notification->mutable_update();
-  Status status;
 
   switch (request.encoding()) {
     case gnmi::JSON:
@@ -90,30 +69,31 @@ Subscribe::buildSubscribeNotification(Notification *notification,
 
   /* updates_only is handled by the caller (handleStream); no action here */
 
-  /* Get time since epoch in milliseconds */
-  notification->set_timestamp(get_time_nanosec());
-
   if (request.has_prefix())
     notification->mutable_prefix()->CopyFrom(request.prefix());
 
-  /* fill Update RepeatedPtrField in Notification message
-   * Update field contains only data elements that have changed values. */
+  /* Read the current snapshot for each subscribed path and emit it. The
+   * Notification timestamp is the freshest leaf's collection time, not "now"
+   * (spec §3.5.2.3); Phase 4 adds JSON_IETF subtree wrapping here. */
+  int64_t ts = 0;
   for (int i = 0; i < request.subscription_size(); i++) {
     Subscription sub = request.subscription(i);
 
-    status = validateGnmiPath(sub.path());
+    Status status = validateGnmiPath(sub.path());
     if (!status.ok()) return status;
 
-    // Fetch all found counters value for a requested path
-    status = buildSubsUpdate(updateList, sub.path(), gnmi_to_xpath(sub.path()),
-                             request.encoding());
-    if (!status.ok()) {
-      BOOST_LOG_TRIVIAL(error) << "Fail building update for "
-                               << gnmi_to_xpath(sub.path());
-      return status;
-    }
+    const string xpath = gnmi_to_xpath(sub.path());
+    SnapResult res = registry_.snapshot(xpath);
+    if (!res.routed)                       // §3.5.2.4 not implemented
+      return Status(StatusCode::UNIMPLEMENTED, "path not implemented: " + xpath);
+    if (res.snap.empty())                  // §3.5.1.3 exists (yet): silent, do NOT close
+      BOOST_LOG_TRIVIAL(warning) << "path exists but has no data (yet): " << xpath;
+
+    ts = max(ts, emitSnapshot(res.snap, updateList));
   }
 
+  // Fall back to now only when nothing was produced (still a valid Notification).
+  notification->set_timestamp(ts ? ts : get_time_nanosec());
   notification->set_atomic(false);
 
   return Status::OK;
@@ -159,40 +139,54 @@ Status Subscribe::handleStream(
   stream->Write(response);
   response.Clear();
 
-  // We use a vector of pairs instead of a map as we are going to iterate more
-  // than we are going to retrieve specific keys.
+  // Per-subscriber streaming state, split by mode. A single SubscriptionList may
+  // legally mix SAMPLE and ON_CHANGE entries, so both buckets coexist and the
+  // one loop below services each on its own terms.
+  //   SAMPLE    — emit on a timer (sample_interval)
+  //   ON_CHANGE — emit when a polled snapshot differs from the previous one
+  // chronomap stays a vector (iterated, not keyed).
   vector<pair<Subscription, time_point<high_resolution_clock>>> chronomap;
+
+  struct OnChangeSub {
+    Subscription                      sub;
+    string                            query;
+    Snapshot                          prev;           // last state seen by this subscriber
+    time_point<high_resolution_clock> lastHeartbeat;
+  };
+  vector<OnChangeSub> onChange;
+
   for (int i=0; i<request.subscribe().subscription_size(); i++) {
     Subscription sub = request.subscribe().subscription(i);
-    switch (sub.mode()) {
-      case TARGET_DEFINED:
-        {
-          auto resolved = registry_.preferredMode(gnmi_to_xpath(sub.path()));
-          if (resolved == SAMPLE) {
-            chronomap.emplace_back(sub, high_resolution_clock::now());
-          } else {
-            BOOST_LOG_TRIVIAL(warning) << "TARGET_DEFINED resolved to ON_CHANGE: Phase 3";
-          }
-          break;
-        }
+    const auto now = high_resolution_clock::now();
+
+    // Resolve TARGET_DEFINED per leaf via the owning provider (default SAMPLE).
+    switch (resolveStreamMode(sub, registry_)) {
       case SAMPLE:
-        chronomap.emplace_back(sub, high_resolution_clock::now());
+        chronomap.emplace_back(sub, now);
         break;
+      case ON_CHANGE: {
+        // Baseline snapshot is taken regardless of updates_only — the latter only
+        // suppresses the *initial emit* (handled above), never the baseline, so
+        // the first diff reports nothing already sent (spec §3.5.1.5.2).
+        const string query = gnmi_to_xpath(sub.path());
+        onChange.push_back({sub, query, registry_.snapshot(query).snap, now});
+        break;
+      }
       default:
-        BOOST_LOG_TRIVIAL(warning) << "Unsupported mode";
-        // TODO: Handle ON_CHANGE mode (Phase 3)
-        // Ref: 3.5.1.5.2
+        BOOST_LOG_TRIVIAL(warning) << "Unsupported subscription mode";
         break;
     }
   }
 
-  /* Periodically updates paths that require SAMPLE updates
-   * Note : There is only one Path per Subscription, but repeated
-   * Subscriptions in a SubscriptionList, each Subscription can
-   * have its own sample interval */
+  /* Single loop, capped at ~5 iterations/second, serving both buckets:
+   * SAMPLE by timer, ON_CHANGE by snapshot diff. The store has no change-notify,
+   * so ON_CHANGE detection polls each iteration (push/notify is a later optim).
+   * Note: one Path per Subscription, but repeated Subscriptions in a list, each
+   * with its own sample_interval / heartbeat_interval. */
   while(!context->IsCancelled()) {
     auto start = high_resolution_clock::now();
 
+    // ---- SAMPLE: batch all due subscriptions into one Notification ----
     SubscribeRequest updateRequest(request);
     SubscriptionList* updateList(updateRequest.mutable_subscribe());
     updateList->clear_subscription();
@@ -216,6 +210,35 @@ Status Subscribe::handleStream(
       }
       stream->Write(response);
       response.Clear();
+    }
+
+    // ---- ON_CHANGE: poll each subscriber's snapshot and diff vs its previous ----
+    for (auto& oc : onChange) {
+      Snapshot cur = registry_.snapshot(oc.query).snap;
+      const auto now = high_resolution_clock::now();
+
+      if (heartbeatDue(oc.sub.heartbeat_interval(), oc.lastHeartbeat, now)) {
+        // Heartbeat re-emits the full state regardless of change (spec §3.5.1.5.2).
+        Notification* n = response.mutable_update();
+        int64_t ts = emitSnapshot(cur, n->mutable_update());
+        n->set_timestamp(ts ? ts : get_time_nanosec());
+        n->set_atomic(false);
+        stream->Write(response);
+        response.Clear();
+        oc.lastHeartbeat = now;
+      } else {
+        LeafStore::Diff d = LeafStore::diff(oc.prev, cur);
+        if (!d.updated.empty() || !d.removed.empty()) {
+          Notification* n = response.mutable_update();
+          int64_t ts = emitDiff(d, n);
+          n->set_timestamp(ts ? ts : get_time_nanosec());
+          n->set_atomic(false);
+          stream->Write(response);
+          response.Clear();
+        }
+      }
+
+      oc.prev = std::move(cur);
     }
 
     // Caps the loop at 5 iterations per second

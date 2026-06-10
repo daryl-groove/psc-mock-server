@@ -19,6 +19,16 @@ public:
         return mode_;
     }
 
+    // One leaf at the queried path, stamped with a fixed collection time so
+    // timestamp wiring is observable in tests.
+    Snapshot snapshot(const std::string& xpath) const override {
+        gnmi::TypedValue v;
+        v.set_double_val(0.0);
+        Snapshot s;
+        s.emplace(xpath, Leaf{v, 42});
+        return s;
+    }
+
 private:
     gnmi::SubscriptionMode mode_;
 };
@@ -28,6 +38,7 @@ private:
 class EmptyProvider : public IDataProvider {
 public:
     void fill(RepeatedPtrField<Update>*, const std::string&) const override {}
+    Snapshot snapshot(const std::string&) const override { return {}; }
 };
 
 // ---------------------------------------------------------------------------
@@ -125,6 +136,41 @@ TEST(DataProviderRegistry, fillStripsQuotesForMatching) {
     // gnmi_to_xpath produces quoted keys; registry must still match
     EXPECT_TRUE(reg.fill(&list, "/components/component[name=\"PSC-0\"]/state").produced);
     EXPECT_EQ(list.size(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// DataProviderRegistry::snapshot — fan-out read model for Subscribe
+// ---------------------------------------------------------------------------
+
+TEST(DataProviderRegistry, snapshotRoutesAndCarriesCollectionTime) {
+    DataProviderRegistry reg;
+    reg.addProvider("/foo", std::make_unique<FakeProvider>());
+
+    SnapResult res = reg.snapshot("/foo/bar");
+    EXPECT_TRUE(res.routed);
+    ASSERT_EQ(res.snap.size(), 1u);
+    const Leaf& leaf = res.snap.at("/foo/bar");
+    EXPECT_DOUBLE_EQ(leaf.val.double_val(), 0.0);
+    EXPECT_EQ(leaf.collectedNs, 42);          // feeds Notification.timestamp
+}
+
+TEST(DataProviderRegistry, snapshotNotRoutedWhenNoPrefixMatches) {
+    DataProviderRegistry reg;
+    reg.addProvider("/foo", std::make_unique<FakeProvider>());
+
+    SnapResult res = reg.snapshot("/bar/baz");
+    EXPECT_FALSE(res.routed);
+    EXPECT_TRUE(res.snap.empty());
+}
+
+// Routed but empty → owned namespace, no data yet (Subscribe stays silent).
+TEST(DataProviderRegistry, snapshotRoutedButEmpty) {
+    DataProviderRegistry reg;
+    reg.addProvider("/foo", std::make_unique<EmptyProvider>());
+
+    SnapResult res = reg.snapshot("/foo/bar");
+    EXPECT_TRUE(res.routed);
+    EXPECT_TRUE(res.snap.empty());
 }
 
 TEST(DataProviderRegistry, preferredModeReturnsFirstMatch) {

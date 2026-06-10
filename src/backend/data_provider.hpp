@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -22,6 +23,24 @@
 
 using google::protobuf::RepeatedPtrField;
 using gnmi::Update;
+
+// ---------------------------------------------------------------------------
+// Provider read model — the snapshot a Subscribe handler diffs against.
+//
+// fill()/collect() produce Updates (path + value) for Get; Subscribe needs the
+// per-leaf collection timestamp too, because Notification.timestamp MUST be the
+// time the value was collected / the event occurred (spec §3.5.2.3), not the
+// emission time. These types carry that timestamp. LeafStore is one producer of
+// them; the interface stays independent of LeafStore by owning the types here.
+// ---------------------------------------------------------------------------
+
+struct Leaf {
+    gnmi::TypedValue val;
+    int64_t          collectedNs;
+};
+
+// Path → Leaf for a query. Ordered for deterministic diff/iteration order.
+using Snapshot = std::map<std::string, Leaf>;
 
 // ---------------------------------------------------------------------------
 // addLeaf — shared helpers for all IDataProvider implementations
@@ -92,6 +111,12 @@ public:
     virtual gnmi::SubscriptionMode preferredMode(const std::string&) const {
         return gnmi::SAMPLE;
     }
+
+    // Current value + collection timestamp of every leaf selected by xpath.
+    // This is the read model Subscribe diffs for ON_CHANGE and stamps for
+    // collection-accurate timestamps (spec §3.5.2.3). A provider that only
+    // implements fill() would not stream correctly, so this is required.
+    virtual Snapshot snapshot(const std::string& xpath) const = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -108,6 +133,14 @@ public:
 struct FillResult {
     bool routed;
     bool produced;
+};
+
+// Subscribe's snapshot fan-out result. `routed` mirrors FillResult.routed so the
+// handler can still answer UNIMPLEMENTED for a path no provider owns; `snap` is
+// the merged read model across every matching provider.
+struct SnapResult {
+    Snapshot snap;
+    bool     routed;
 };
 
 class DataProviderRegistry {
@@ -141,6 +174,22 @@ public:
             }
         }
         return FillResult{routed, list->size() > before};
+    }
+
+    // Fan-out snapshot: merges the read model of every provider whose prefix
+    // matches xpath. Mirrors fill() so Subscribe can stamp collection-accurate
+    // timestamps and diff for ON_CHANGE (spec §3.5.2.3). `routed` distinguishes
+    // "no provider owns this path" (UNIMPLEMENTED) from "owned but empty".
+    SnapResult snapshot(const std::string& xpath) const {
+        SnapResult res{{}, false};
+        for (const auto& [prefix, provider] : routes_) {
+            if (matches(xpath, prefix)) {
+                res.routed = true;
+                Snapshot s = provider->snapshot(xpath);
+                res.snap.merge(s);
+            }
+        }
+        return res;
     }
 
     // Returns the preferred subscription mode from the first matching provider.

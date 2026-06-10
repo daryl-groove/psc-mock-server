@@ -90,7 +90,7 @@ void runSimulator(LeafStore& store, std::vector<Walk> walks,
     std::condition_variable_any cv;
     std::unique_lock lock(mu);
     do {
-        const int64_t now = static_cast<int64_t>(get_time_nanosec());
+        const int64_t now = get_time_nanosec();
         for (auto& w : walks) {
             if (w.step > 0.0 && stepNow(rng)) {
                 w.value += stepUp(rng) ? w.step : -w.step;

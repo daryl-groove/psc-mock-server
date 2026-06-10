@@ -26,8 +26,10 @@ using std::chrono::system_clock;
 using std::chrono::duration_cast;
 using std::chrono::nanoseconds;
 
-/* Get current time since epoch in nanosec */
-inline uint64_t get_time_nanosec()
+/* Get current time since epoch in nanosec.
+ * Returns int64_t to match gNMI Notification.timestamp / Leaf.collectedNs
+ * (spec §2.2.1 mandates a signed 64-bit value), avoiding scattered casts. */
+inline int64_t get_time_nanosec()
 {
   nanoseconds ts;
   ts = duration_cast<nanoseconds>(system_clock::now().time_since_epoch());

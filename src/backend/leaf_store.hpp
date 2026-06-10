@@ -25,22 +25,19 @@
 #include <gnmi.grpc.pb.h>
 #include <utils/utils.h>
 
+#include "data_provider.hpp"   // Leaf, Snapshot — the shared provider read model
+
 using google::protobuf::RepeatedPtrField;
 using gnmi::Update;
 
 class LeafStore {
 public:
-    // A stored leaf: its value plus the time it was collected from the source.
-    // collectedNs feeds Notification.timestamp directly (spec §2.1, §3.5.2.3);
-    // emission time would misreport collection time once a writer fills the store.
-    struct Leaf {
-        gnmi::TypedValue val;
-        int64_t          collectedNs;
-    };
-
-    // Path → Leaf, scoped to a query in snapshot(). Ordered for deterministic
-    // iteration (stable test output, stable diff order).
-    using Snapshot = std::map<std::string, Leaf>;
+    // The stored leaf and snapshot types are the provider read model, owned by
+    // data_provider.hpp so the Subscribe interface does not depend on LeafStore.
+    // A Leaf carries its collection timestamp because Notification.timestamp MUST
+    // reflect collection / event time, not emission time (spec §2.1, §3.5.2.3).
+    using Leaf     = ::Leaf;
+    using Snapshot = ::Snapshot;
 
     // Result of comparing two snapshots. ON_CHANGE emits `updated` as Updates and
     // `removed` as Notification.delete paths (spec §3.5.2.3).

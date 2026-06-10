@@ -33,6 +33,11 @@ public:
         return gnmi::SAMPLE;
     }
 
+    // Read model for Subscribe: current value + collection timestamp per leaf.
+    Snapshot snapshot(const std::string& xpath) const override {
+        return store_.snapshot(xpath);
+    }
+
 private:
     LeafStore    store_;
     std::jthread sim_;   // declared last: started only after store_ is seeded
