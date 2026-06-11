@@ -42,7 +42,8 @@ class Get {
     // path may yield more than one — hence appending to the response list.
     Status buildGetNotifications(RepeatedPtrField<Notification>* out,
                                  const Path* prefix, const Path& path,
-                                 gnmi::Encoding encoding);
+                                 gnmi::Encoding encoding,
+                                 GetRequest::DataType type);
 
   private:
     DataProviderRegistry& registry_;

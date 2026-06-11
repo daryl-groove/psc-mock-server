@@ -161,7 +161,18 @@ test_system_config = executable('test_system_config',
   include_directories : [include_directories('src')],
 )
 
+test_get = executable('test_get',
+  ['tests/test_get.cpp',
+   'src/gnmi/get.cpp',
+   'src/gnmi/subscribe_emit.cpp',
+   'src/backend/leaf_store.cpp',
+   gnmi_ext_proto, gnmi_proto],
+  dependencies : [proto_dep, grpc_dep, thread_dep, boost_dep, gtest_dep],
+  include_directories : [include_directories('src')],
+)
+
 test('data_provider',   test_data_provider)
+test('get',             test_get)
 test('psc_provider',    test_psc_provider)
 test('leaf_store',      test_leaf_store)
 test('utils',           test_utils)

@@ -42,7 +42,7 @@ void LeafStore::commit(const WriteBatch& batch) {
         const std::string key = stripPathQuotes(op.xpath);
         switch (op.kind) {
             case WriteOp::Kind::Set:
-                leaves_[key] = Leaf{op.val, op.collectedNs};
+                leaves_[key] = Leaf{op.val, op.collectedNs, op.type};
                 break;
             case WriteOp::Kind::Remove:
                 leaves_.erase(key);

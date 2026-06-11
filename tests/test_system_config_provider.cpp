@@ -119,6 +119,22 @@ TEST(SystemConfigWrite, NonConfigPathIsNotWritable) {
     EXPECT_FALSE(p.writable("/system/state/current-datetime"));
 }
 
+// The schema is stable, independent of current data: deleting a config leaf and
+// setting it again works, and the revived leaf still carries LeafType::Config —
+// the type comes from the schema, never from whether a value happens to exist.
+TEST(SystemConfigWrite, ResetAfterDeleteKeepsConfigType) {
+    SystemConfigProvider p;
+    const std::string path = "/system/config/hostname";
+    EXPECT_TRUE(p.applyBatch(WriteBatch{}.remove(path)));
+    EXPECT_TRUE(p.snapshot(path).empty());
+
+    EXPECT_TRUE(p.applyBatch(WriteBatch{}.set(path, std::string("revived"), 9)));
+    Snapshot snap = p.snapshot(path);
+    ASSERT_EQ(snap.size(), 1u);
+    EXPECT_EQ(snap.at(path).val.string_val(), "revived");
+    EXPECT_EQ(snap.at(path).type, LeafType::Config);
+}
+
 // ---------------------------------------------------------------------------
 // Atomic containers. NTP server records are atomic (the whole .../config record
 // is one atomic notification, spec §2.1.1); the flat /system/config scalars are

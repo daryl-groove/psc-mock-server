@@ -41,6 +41,7 @@ public:
               const std::string& xpath) const override;
 
     Snapshot snapshot(const std::string& xpath) const override {
+        // Leaves already carry their schema type (stamped at creation); just serve.
         return store_.snapshot(xpath);
     }
 
@@ -50,11 +51,11 @@ public:
         return gnmi::ON_CHANGE;
     }
 
-    // ---- write side (Piece B) ----
+    // ---- write side ----
     // Only `config true` leaves are writable. We own a broad /system prefix, so
     // restrict writes to config containers (a write to a hypothetical read-only
-    // /system/.../state leaf must be refused → INVALID_ARGUMENT). Mutating store_
-    // here is what the existing poll+diff loop turns into an ON_CHANGE Update /
+    // /system/.../state leaf is refused → INVALID_ARGUMENT). Mutating store_ via
+    // Set is what the existing poll+diff loop turns into an ON_CHANGE Update /
     // delete — no new trigger needed.
     bool writable(const std::string& xpath) const override;
     bool applyBatch(const WriteBatch& batch) override;
@@ -66,5 +67,11 @@ public:
     std::optional<std::string> atomicPrefix(const std::string& xpath) const override;
 
 private:
+    // Single source of truth for both writability and a leaf's LeafType: the schema
+    // type of a path, from this provider's declared config subtrees.
+    LeafType schemaType(const std::string& xpath) const;
+    // Stamp each created leaf's type from schemaType, then commit the batch.
+    void applyStamped(const WriteBatch& batch);
+
     LeafStore store_;
 };

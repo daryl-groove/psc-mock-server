@@ -26,10 +26,35 @@ using google::protobuf::RepeatedPtrField;
 
 namespace impl {
 
+// gNMI DataType filter (spec §3.3.4, GetRequest.type). The spec treats CONFIG/
+// STATE/OPERATIONAL as a disjoint partition annotated per leaf in the schema, so
+// each leaf carries exactly one LeafType — stamped by its provider when produced.
+// Atomic containers are homogeneous (a `.../config` container is wholly Config),
+// so leaf-level filtering can never tear one.
+static bool matchesType(LeafType leaf, GetRequest::DataType requested)
+{
+  switch (requested) {
+    case GetRequest::CONFIG:      return leaf == LeafType::Config;
+    case GetRequest::STATE:       return leaf == LeafType::State;
+    case GetRequest::OPERATIONAL: return leaf == LeafType::Operational;
+    default:                      return true;   // ALL — handled by caller anyway
+  }
+}
+
+static void filterByDataType(Snapshot& snap, GetRequest::DataType type)
+{
+  if (type == GetRequest::ALL) return;
+  for (auto it = snap.begin(); it != snap.end(); ) {
+    if (matchesType(it->second.type, type)) ++it;
+    else                                     it = snap.erase(it);
+  }
+}
+
 Status
 Get::buildGetNotifications(RepeatedPtrField<Notification>* out,
                            const Path* prefix, const Path& path,
-                           gnmi::Encoding encoding)
+                           gnmi::Encoding encoding,
+                           GetRequest::DataType type)
 {
   // Encoding is already validated in verifyGetRequest; only JSON/JSON_IETF reach
   // here. Phase 4 wraps values in JSON_IETF once the encoding layer is added.
@@ -45,10 +70,13 @@ Get::buildGetNotifications(RepeatedPtrField<Notification>* out,
   fullpath += gnmi_to_xpath(path);
   BOOST_LOG_TRIVIAL(debug) << "GetRequest Path " << fullpath;
 
-  /* TODO: DataType CONFIG/STATE/OPERATIONAL filtering — get.cpp:120 */
   SnapResult res = registry_.snapshot(fullpath);
   if (!res.routed)                         // §3.3.4 not implemented
     return Status(StatusCode::UNIMPLEMENTED, "path not implemented: " + fullpath);
+
+  // Drop leaves outside the requested config/state type before the empty check,
+  // so a path that exists but holds nothing of the requested type is NOT_FOUND.
+  filterByDataType(res.snap, type);
   if (res.snap.empty())                    // §3.3.4 exists (yet) but no data
     return Status(StatusCode::NOT_FOUND, "path has no data: " + fullpath);
 
@@ -110,8 +138,10 @@ Status Get::run(const GetRequest* req, GetResponse* response)
   for (auto path : req->path()) {
     // One path may yield several Notifications when it spans atomic containers.
     status = req->has_prefix()
-      ? buildGetNotifications(notificationList, &req->prefix(), path, req->encoding())
-      : buildGetNotifications(notificationList, nullptr,       path, req->encoding());
+      ? buildGetNotifications(notificationList, &req->prefix(), path,
+                              req->encoding(), req->type())
+      : buildGetNotifications(notificationList, nullptr,       path,
+                              req->encoding(), req->type());
 
     if (!status.ok()) {
       BOOST_LOG_TRIVIAL(error) << "buildGetNotifications failed: "

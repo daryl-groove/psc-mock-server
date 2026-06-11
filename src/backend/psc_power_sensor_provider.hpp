@@ -34,6 +34,8 @@ public:
     }
 
     // Read model for Subscribe: current value + collection timestamp per leaf.
+    // Sensor readings are runtime measurements → Operational, which is Leaf's
+    // default type, so no stamping is needed here.
     Snapshot snapshot(const std::string& xpath) const override {
         return store_.snapshot(xpath);
     }

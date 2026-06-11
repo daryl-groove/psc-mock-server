@@ -35,9 +35,25 @@ using gnmi::Update;
 // them; the interface stays independent of LeafStore by owning the types here.
 // ---------------------------------------------------------------------------
 
+// Schema type of a leaf, for GetRequest.type filtering (spec §3.3.4). The gNMI
+// spec requires the schema to annotate ONE type per leaf and treats CONFIG/STATE/
+// OPERATIONAL as a disjoint partition ("the target MUST return CONFIG, STATE and
+// OPERATIONAL"), so a client never sees a leaf as two types at once:
+//   Config       — read/write intended config (`config true` in YANG)
+//   State        — read-only applied config (the config-false mirror of a config leaf)
+//   Operational  — read-only data from running processes (counters, sensor readings)
+// State and Operational are both `config false`; YANG alone cannot tell them apart,
+// so the producing provider stamps the finer annotation the spec mandates. A leaf
+// is never "ALL" — ALL is only a request filter, never a leaf property — which is
+// why this is deliberately distinct from gnmi::GetRequest::DataType.
+enum class LeafType { Config, State, Operational };
+
 struct Leaf {
     gnmi::TypedValue val;
     int64_t          collectedNs;
+    // The owning provider stamps this when it produces the leaf; Get filters on
+    // it. Default Operational — runtime/sensor data, unless a provider says otherwise.
+    LeafType         type = LeafType::Operational;
 };
 
 // Path → Leaf for a query. Ordered for deterministic diff/iteration order.
@@ -62,6 +78,9 @@ struct WriteOp {
     Kind             kind;
     gnmi::TypedValue val;          // Set only
     int64_t          collectedNs;  // Set only
+    // The leaf's schema type, stamped by the owning provider before commit (Set
+    // only). Decided once, at creation — see docs/leaf-type-and-schema-model.md.
+    LeafType         type = LeafType::Operational;
 };
 
 class WriteBatch {
@@ -198,6 +217,9 @@ public:
     // request before touching any store — validate-then-apply.
 
     // May this path be written at all? Called only for a matching prefix.
+    // Writability is a write-side, path-level question — it must answer for a path
+    // that does not exist yet (creating a config leaf), so it is independent of a
+    // produced leaf's read-side LeafType. Default: refuse (read-only).
     virtual bool writable(const std::string& /*xpath*/) const { return false; }
 
     // Apply one write transaction (already partitioned to this provider's

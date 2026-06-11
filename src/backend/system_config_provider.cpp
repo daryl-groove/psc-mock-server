@@ -22,15 +22,14 @@ const ConfigLeaf DEFAULTS[] = {
 const char* NTP_CONFIG =
     "/system/ntp/servers/server[address=10.0.0.1]/config";
 
-// A `config true` path is writable. We own a broad /system prefix but only model
-// config containers, so gate writes on a /config segment: a write to a
-// hypothetical read-only /system/.../state leaf is refused (INVALID_ARGUMENT).
-bool isConfigPath(const std::string& p) {
-    if (p.find("/config/") != std::string::npos) return true;
-    static const std::string tail = "/config";
-    return p.size() >= tail.size() &&
-           p.compare(p.size() - tail.size(), tail.size(), tail) == 0;
-}
+// The provider's config schema, declared here at build time: a path under any of
+// these subtrees is `config true` (writable) and carries LeafType::Config. This is
+// an explicit server declaration — NOT inferred from the literal segment "config"
+// appearing in a path — so path naming stays free. Everything else is State.
+const char* CONFIG_SUBTREES[] = {
+    "/system/config",
+    "/system/ntp",
+};
 
 } // namespace
 
@@ -49,7 +48,7 @@ SystemConfigProvider::SystemConfigProvider() {
     seed.set(ntp + "/version",          uint64_t{4},             now);
     seed.set(ntp + "/iburst",           true,                    now);
     seed.set(ntp + "/association-type", std::string("SERVER"),   now);
-    store_.commit(seed);
+    applyStamped(seed);
 }
 
 void SystemConfigProvider::fill(RepeatedPtrField<Update>* list,
@@ -57,14 +56,31 @@ void SystemConfigProvider::fill(RepeatedPtrField<Update>* list,
     store_.collect(xpath, list);
 }
 
+LeafType SystemConfigProvider::schemaType(const std::string& xpath) const {
+    const std::string p = stripPathQuotes(xpath);
+    for (const char* root : CONFIG_SUBTREES)
+        if (isPathPrefix(root, p)) return LeafType::Config;
+    return LeafType::State;   // owned but not config (would be applied config)
+}
+
 bool SystemConfigProvider::writable(const std::string& xpath) const {
-    return isConfigPath(stripPathQuotes(xpath));
+    return schemaType(xpath) == LeafType::Config;   // config true ⟺ writable
+}
+
+void SystemConfigProvider::applyStamped(const WriteBatch& batch) {
+    // The single point where a leaf's LeafType is decided: bind each created leaf's
+    // type from this provider's schema, then commit under the store's one lock.
+    WriteBatch stamped;
+    for (auto op : batch.ops()) {
+        if (op.kind == WriteOp::Kind::Set) op.type = schemaType(op.xpath);
+        stamped.add(op);
+    }
+    store_.commit(stamped);
 }
 
 bool SystemConfigProvider::applyBatch(const WriteBatch& batch) {
-    // The registry has already routed these ops to us and Set validated each path
-    // as writable; apply the whole transaction under the store's single lock.
-    store_.commit(batch);
+    // Registry routed these to us and Set validated each path as writable.
+    applyStamped(batch);
     return true;
 }
 
