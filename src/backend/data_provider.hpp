@@ -44,6 +44,78 @@ struct Leaf {
 using Snapshot = std::map<std::string, Leaf>;
 
 // ---------------------------------------------------------------------------
+// Provider write model — the transaction a gNMI Set, or a source driver's tick,
+// applies to a store.
+//
+// A WriteBatch groups every mutation that must land together. commit() applies
+// the whole batch under one store lock, so a concurrent reader never observes a
+// record half-written — which is what makes an atomic container's *write* side as
+// coherent as its telemetry (spec §2.1.1). A single-leaf write is just a one-op
+// batch; there is deliberately no lock-per-leaf write path a loop could use to
+// tear a multi-leaf record. The batch is store-agnostic: path normalisation
+// (quote/key stripping) happens in the store at commit time, not here.
+// ---------------------------------------------------------------------------
+
+struct WriteOp {
+    enum class Kind { Set, Remove };
+    std::string      xpath;
+    Kind             kind;
+    gnmi::TypedValue val;          // Set only
+    int64_t          collectedNs;  // Set only
+};
+
+class WriteBatch {
+public:
+    // Typed builders mirror the gNMI scalar types (see addLeaf): each constructs
+    // the TypedValue at the call site, where the value's static type is known.
+    // A bare const char* would bind to the bool overload, so string callers must
+    // pass std::string explicitly.
+    WriteBatch& set(const std::string& xpath, double value, int64_t collectedNs) {
+        gnmi::TypedValue v; v.set_double_val(value);
+        return set(xpath, v, collectedNs);
+    }
+    WriteBatch& set(const std::string& xpath, const std::string& value,
+                    int64_t collectedNs) {
+        gnmi::TypedValue v; v.set_string_val(value);
+        return set(xpath, v, collectedNs);
+    }
+    WriteBatch& set(const std::string& xpath, bool value, int64_t collectedNs) {
+        gnmi::TypedValue v; v.set_bool_val(value);
+        return set(xpath, v, collectedNs);
+    }
+    WriteBatch& set(const std::string& xpath, int64_t value, int64_t collectedNs) {
+        gnmi::TypedValue v; v.set_int_val(value);
+        return set(xpath, v, collectedNs);
+    }
+    WriteBatch& set(const std::string& xpath, uint64_t value, int64_t collectedNs) {
+        gnmi::TypedValue v; v.set_uint_val(value);
+        return set(xpath, v, collectedNs);
+    }
+    // The path the gNMI Set side takes: the wire value's type is not known at the
+    // call site, so it is forwarded already built.
+    WriteBatch& set(const std::string& xpath, const gnmi::TypedValue& value,
+                    int64_t collectedNs) {
+        ops_.push_back(WriteOp{xpath, WriteOp::Kind::Set, value, collectedNs});
+        return *this;
+    }
+    WriteBatch& remove(const std::string& xpath) {
+        ops_.push_back(WriteOp{xpath, WriteOp::Kind::Remove, {}, 0});
+        return *this;
+    }
+    // Append a pre-built op — lets the registry partition a batch by owning prefix.
+    WriteBatch& add(WriteOp op) {
+        ops_.push_back(std::move(op));
+        return *this;
+    }
+
+    const std::vector<WriteOp>& ops() const { return ops_; }
+    bool empty() const { return ops_.empty(); }
+
+private:
+    std::vector<WriteOp> ops_;
+};
+
+// ---------------------------------------------------------------------------
 // addLeaf — shared helpers for all IDataProvider implementations
 //
 // Each overload sets the path from xpath and the appropriate TypedValue field.
@@ -122,19 +194,17 @@ public:
     // ---- write side (optional) -------------------------------------------
     // Most providers serve read-only `state`; the defaults below refuse every
     // write. A `config true` provider overrides them. Splitting the query
-    // (writable) from the mutation (applyUpdate/applyDelete) lets Set validate
-    // the whole request before touching any store — validate-then-apply.
+    // (writable) from the mutation (applyBatch) lets Set validate the whole
+    // request before touching any store — validate-then-apply.
 
     // May this path be written at all? Called only for a matching prefix.
     virtual bool writable(const std::string& /*xpath*/) const { return false; }
 
-    // Apply one Set update / delete. Returns false if the provider refused
-    // (e.g. read-only); the registry surfaces that so Set can map it to a
-    // status code. ts is the collection/event time to stamp the leaf with.
-    virtual bool applyUpdate(const std::string& /*xpath*/,
-                             const gnmi::TypedValue& /*val*/,
-                             int64_t /*ts*/) { return false; }
-    virtual bool applyDelete(const std::string& /*xpath*/) { return false; }
+    // Apply one write transaction (already partitioned to this provider's
+    // prefix by the registry). Returns false if the provider refused (e.g.
+    // read-only); the registry surfaces that so Set can map it to a status code.
+    // The batch's ops land together under the store's lock — see WriteBatch.
+    virtual bool applyBatch(const WriteBatch& /*batch*/) { return false; }
 
     // ---- atomic containers (optional) ------------------------------------
     // If xpath falls within an atomic container this provider owns, return that
@@ -256,11 +326,11 @@ public:
     }
 
     // ---- write fan-out --------------------------------------------------
-    // All three mirror fill()/snapshot(): visit every provider whose prefix
-    // owns xpath, OR-reducing routed/applied. writable() is the validate phase
-    // (no mutation); set()/del() are the apply phase. Set calls writable() for
-    // every path first and aborts on any !routed or read-only path, so a Set
-    // either fully applies or mutates nothing.
+    // Both mirror fill()/snapshot(): visit every provider whose prefix owns the
+    // path, OR-reducing routed/applied. writable() is the validate phase (no
+    // mutation); commit() is the apply phase. Set calls writable() for every
+    // path first and aborts on any !routed or read-only path, so a Set either
+    // fully applies or mutates nothing.
 
     WriteResult writable(const std::string& xpath) const {
         WriteResult res{false, false};
@@ -273,25 +343,20 @@ public:
         return res;
     }
 
-    WriteResult set(const std::string& xpath, const gnmi::TypedValue& val,
-                    int64_t ts) {
+    // Apply a write transaction. Partitions the batch by owning prefix and hands
+    // each provider only the ops it owns, so every provider applies its slice
+    // under its own store lock in one shot. An atomic container lives wholly in
+    // one provider, so per-provider atomicity is sufficient — gNMI promises no
+    // atomicity across providers.
+    WriteResult commit(const WriteBatch& batch) {
         WriteResult res{false, false};
         for (const auto& [prefix, provider] : routes_) {
-            if (matches(xpath, prefix)) {
-                res.routed = true;
-                if (provider->applyUpdate(xpath, val, ts)) res.applied = true;
-            }
-        }
-        return res;
-    }
-
-    WriteResult del(const std::string& xpath) {
-        WriteResult res{false, false};
-        for (const auto& [prefix, provider] : routes_) {
-            if (matches(xpath, prefix)) {
-                res.routed = true;
-                if (provider->applyDelete(xpath)) res.applied = true;
-            }
+            WriteBatch slice;
+            for (const auto& op : batch.ops())
+                if (matches(op.xpath, prefix)) slice.add(op);
+            if (slice.empty()) continue;
+            res.routed = true;
+            if (provider->applyBatch(slice)) res.applied = true;
         }
         return res;
     }

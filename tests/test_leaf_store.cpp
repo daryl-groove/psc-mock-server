@@ -3,24 +3,35 @@
 
 namespace {
 
-// Seed a small two-unit sensor tree mirroring the PSC layout.
+// Commit helpers — most tests only need a leaf present to exercise a read path;
+// commit() itself is exercised directly in the Commit* tests below. A single
+// write is just a one-op batch.
+void put(LeafStore& s, const std::string& path, double value, int64_t ts) {
+    s.commit(WriteBatch{}.set(path, value, ts));
+}
+void del(LeafStore& s, const std::string& path) {
+    s.commit(WriteBatch{}.remove(path));
+}
+
+// Seed a small two-unit sensor tree mirroring the PSC layout, in one commit.
 // LeafStore is non-movable (holds a shared_mutex), so seed a reference.
 void seed(LeafStore& s) {
-    s.set("/components/component[name=PSC-0]/state/temperature/instant", 45.0, 10);
-    s.set("/components/component[name=PSC-0]/power-supply/state/input-voltage", 54.0, 10);
-    s.set("/components/component[name=PSC-0]/power-supply/state/output-power", 240.0, 10);
-    s.set("/components/component[name=PSC-1]/state/temperature/instant", 46.0, 10);
+    s.commit(WriteBatch{}
+        .set("/components/component[name=PSC-0]/state/temperature/instant", 45.0, 10)
+        .set("/components/component[name=PSC-0]/power-supply/state/input-voltage", 54.0, 10)
+        .set("/components/component[name=PSC-0]/power-supply/state/output-power", 240.0, 10)
+        .set("/components/component[name=PSC-1]/state/temperature/instant", 46.0, 10));
 }
 
 } // namespace
 
 // ---------------------------------------------------------------------------
-// set / get
+// commit / get
 // ---------------------------------------------------------------------------
 
 TEST(LeafStore, GetReturnsValueAndTimestamp) {
     LeafStore s;
-    s.set("/a/b", 3.5, 123);
+    put(s, "/a/b", 3.5, 123);
 
     auto leaf = s.get("/a/b");
     ASSERT_TRUE(leaf.has_value());
@@ -35,8 +46,8 @@ TEST(LeafStore, GetMissingReturnsNullopt) {
 
 TEST(LeafStore, SetOverwritesValueAndTimestamp) {
     LeafStore s;
-    s.set("/a", 1.0, 10);
-    s.set("/a", 2.0, 20);
+    put(s, "/a", 1.0, 10);
+    put(s, "/a", 2.0, 20);
 
     auto leaf = s.get("/a");
     ASSERT_TRUE(leaf.has_value());
@@ -46,15 +57,55 @@ TEST(LeafStore, SetOverwritesValueAndTimestamp) {
 
 TEST(LeafStore, QuotedAndUnquotedKeysAreEquivalent) {
     LeafStore s;
-    s.set("/components/component[name=PSC-0]/x", 7.0, 1);
+    put(s, "/components/component[name=PSC-0]/x", 7.0, 1);
     EXPECT_TRUE(s.get("/components/component[name=\"PSC-0\"]/x").has_value());
 }
 
 TEST(LeafStore, RemoveDeletesLeaf) {
     LeafStore s;
-    s.set("/a", 1.0, 1);
-    s.remove("/a");
+    put(s, "/a", 1.0, 1);
+    del(s, "/a");
     EXPECT_FALSE(s.get("/a").has_value());
+}
+
+// ---------------------------------------------------------------------------
+// commit — one transaction, applied together
+// ---------------------------------------------------------------------------
+
+TEST(LeafStore, CommitAppliesEveryOp) {
+    LeafStore s;
+    s.commit(WriteBatch{}
+        .set("/a", 1.0, 5)
+        .set("/b", std::string("hi"), 5)
+        .set("/c", true, 5));
+
+    EXPECT_DOUBLE_EQ(s.get("/a")->val.double_val(), 1.0);
+    EXPECT_EQ(s.get("/b")->val.string_val(), "hi");
+    EXPECT_TRUE(s.get("/c")->val.bool_val());
+}
+
+// Ops apply in batch order, so a delete then a set of the same leaf in one
+// transaction ends as the set (mirrors the gNMI Set delete -> update order).
+TEST(LeafStore, CommitAppliesOpsInOrder) {
+    LeafStore s;
+    put(s, "/a", 1.0, 1);
+    s.commit(WriteBatch{}.remove("/a").set("/a", 9.0, 2));
+
+    auto leaf = s.get("/a");
+    ASSERT_TRUE(leaf.has_value());
+    EXPECT_DOUBLE_EQ(leaf->val.double_val(), 9.0);
+    EXPECT_EQ(leaf->collectedNs, 2);
+}
+
+TEST(LeafStore, CommitMixesSetAndRemove) {
+    LeafStore s;
+    put(s, "/keep", 1.0, 1);
+    put(s, "/drop", 2.0, 1);
+    s.commit(WriteBatch{}.set("/add", 3.0, 2).remove("/drop"));
+
+    EXPECT_TRUE(s.get("/keep").has_value());
+    EXPECT_TRUE(s.get("/add").has_value());
+    EXPECT_FALSE(s.get("/drop").has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +145,7 @@ TEST(LeafStore, CollectNoMatchReturnsFalse) {
 
 TEST(LeafStore, CollectRespectsSegmentBoundary) {
     LeafStore s;
-    s.set("/a/power-supply/x", 1.0, 1);
+    put(s, "/a/power-supply/x", 1.0, 1);
     RepeatedPtrField<Update> list;
     // "/a/power" must not match "/a/power-supply/..."
     EXPECT_FALSE(s.collect("/a/power", &list));
@@ -117,9 +168,9 @@ TEST(LeafStore, DiffDetectsChangedValueOnly) {
     auto prev = s.snapshot(query);
 
     // Same value, new timestamp → must NOT count as a change.
-    s.set("/components/component[name=PSC-0]/state/temperature/instant", 45.0, 99);
+    put(s, "/components/component[name=PSC-0]/state/temperature/instant", 45.0, 99);
     // Different value → must count as a change.
-    s.set("/components/component[name=PSC-1]/state/temperature/instant", 50.0, 99);
+    put(s, "/components/component[name=PSC-1]/state/temperature/instant", 50.0, 99);
 
     auto cur  = s.snapshot(query);
     auto diff = LeafStore::diff(prev, cur);
@@ -135,8 +186,9 @@ TEST(LeafStore, DiffReportsAddedAndRemoved) {
     const std::string query = "/components/component";
     auto prev = s.snapshot(query);
 
-    s.set("/components/component[name=PSC-0]/alarm", true, 99);  // added
-    s.remove("/components/component[name=PSC-1]/state/temperature/instant");  // removed
+    s.commit(WriteBatch{}
+        .set("/components/component[name=PSC-0]/alarm", true, 99)              // added
+        .remove("/components/component[name=PSC-1]/state/temperature/instant")); // removed
 
     auto cur  = s.snapshot(query);
     auto diff = LeafStore::diff(prev, cur);

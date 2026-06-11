@@ -33,53 +33,22 @@ bool valueEquals(const gnmi::TypedValue& a, const gnmi::TypedValue& b) {
 
 } // namespace
 
-void LeafStore::set(const std::string& xpath, double value, int64_t collectedNs) {
-    gnmi::TypedValue v;
-    v.set_double_val(value);
-    setValue(xpath, std::move(v), collectedNs);
-}
-
-void LeafStore::set(const std::string& xpath, const std::string& value,
-                    int64_t collectedNs) {
-    gnmi::TypedValue v;
-    v.set_string_val(value);
-    setValue(xpath, std::move(v), collectedNs);
-}
-
-void LeafStore::set(const std::string& xpath, bool value, int64_t collectedNs) {
-    gnmi::TypedValue v;
-    v.set_bool_val(value);
-    setValue(xpath, std::move(v), collectedNs);
-}
-
-void LeafStore::set(const std::string& xpath, int64_t value, int64_t collectedNs) {
-    gnmi::TypedValue v;
-    v.set_int_val(value);
-    setValue(xpath, std::move(v), collectedNs);
-}
-
-void LeafStore::set(const std::string& xpath, uint64_t value, int64_t collectedNs) {
-    gnmi::TypedValue v;
-    v.set_uint_val(value);
-    setValue(xpath, std::move(v), collectedNs);
-}
-
-void LeafStore::set(const std::string& xpath, const gnmi::TypedValue& value,
-                    int64_t collectedNs) {
-    setValue(xpath, value, collectedNs);
-}
-
-void LeafStore::setValue(const std::string& xpath, gnmi::TypedValue val,
-                         int64_t collectedNs) {
-    const std::string key = stripPathQuotes(xpath);
+void LeafStore::commit(const WriteBatch& batch) {
+    // One lock for the whole batch: this is the write-side atomicity guarantee.
+    // Ops apply in batch order, so a delete-then-set of the same leaf within one
+    // transaction ends as the set (spec Set order delete -> replace -> update).
     std::unique_lock lock(mu_);
-    leaves_[key] = Leaf{std::move(val), collectedNs};
-}
-
-void LeafStore::remove(const std::string& xpath) {
-    const std::string key = stripPathQuotes(xpath);
-    std::unique_lock lock(mu_);
-    leaves_.erase(key);
+    for (const auto& op : batch.ops()) {
+        const std::string key = stripPathQuotes(op.xpath);
+        switch (op.kind) {
+            case WriteOp::Kind::Set:
+                leaves_[key] = Leaf{op.val, op.collectedNs};
+                break;
+            case WriteOp::Kind::Remove:
+                leaves_.erase(key);
+                break;
+        }
+    }
 }
 
 std::optional<LeafStore::Leaf> LeafStore::get(const std::string& xpath) const {

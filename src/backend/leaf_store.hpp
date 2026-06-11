@@ -46,17 +46,13 @@ public:
         std::vector<std::string>                  removed;  // in prev, gone in cur
     };
 
-    // ---- write side: background writer / hardware / tests ----
-    void set(const std::string& xpath, double value,             int64_t collectedNs);
-    void set(const std::string& xpath, const std::string& value, int64_t collectedNs);
-    void set(const std::string& xpath, bool value,               int64_t collectedNs);
-    void set(const std::string& xpath, int64_t value,            int64_t collectedNs);
-    void set(const std::string& xpath, uint64_t value,           int64_t collectedNs);
-    // Set from an already-built TypedValue — the path the write side (gNMI Set)
-    // takes, since the wire value's type is not known at the call site.
-    void set(const std::string& xpath, const gnmi::TypedValue& value,
-             int64_t collectedNs);
-    void remove(const std::string& xpath);
+    // ---- write side: the single mutating primitive ----
+    // Every writer — gNMI Set, the sensor simulator, config seeding — assembles a
+    // WriteBatch and commits it here. commit() applies all ops under one unique
+    // lock, so a reader's snapshot() either precedes or follows the whole batch,
+    // never a half-applied record. There is intentionally no per-leaf set(): that
+    // would reopen a lock-per-write path that could tear a multi-leaf record.
+    void commit(const WriteBatch& batch);
 
     // ---- read side: const, shared-locked ----
     std::optional<Leaf> get(const std::string& xpath) const;
@@ -74,9 +70,6 @@ public:
     static Diff diff(const Snapshot& prev, const Snapshot& cur);
 
 private:
-    void setValue(const std::string& xpath, gnmi::TypedValue val,
-                  int64_t collectedNs);
-
     mutable std::shared_mutex   mu_;
     std::map<std::string, Leaf> leaves_;
 };

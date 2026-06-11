@@ -84,37 +84,35 @@ Status Set::run(const SetRequest* request, SetResponse* response)
     if (!s.ok()) return s;
   }
 
-  // ---- Phase 2: apply. Validation passed, so these cannot fail.
-  // Deleting a nonexistent in-schema leaf is silently accepted (§3.4.6): del()
-  // is idempotent. We treat replace as update — flat scalar leaves have no
-  // subtree to prune, so there are no omitted siblings to revert.
-  //
-  // NOTE (atomic write coherence — the other half of atomic, not yet done):
-  // each leaf is applied under the store's own per-leaf lock, so a concurrent
-  // Subscribe poll can observe an atomic container half-updated (a "torn"
-  // record) when one Set RPC writes several of its leaves. Emission is already
-  // atomic (Notification.atomic); making the *write* atomic needs a batched
-  // commit that applies a record's leaves under one lock (the ILeafSink/commit
-  // seam, docs/onchange-delivery-and-source-binding.md §3.2). Latent today:
-  // single-leaf Sets cannot tear.
+  // ---- Phase 2: apply. Validation passed, so this cannot fail.
+  // Collect every op into one WriteBatch in spec order (delete -> replace ->
+  // update) and commit it once: all leaves of a multi-leaf Set land under a
+  // single store lock, so a concurrent Subscribe poll never observes an atomic
+  // container half-written (the write-side counterpart of Notification.atomic).
+  // Deleting a nonexistent in-schema leaf is silently accepted (§3.4.6). We
+  // treat replace as update — flat scalar leaves have no subtree to prune, so
+  // there are no omitted siblings to revert. The UpdateResult responses mirror
+  // the request and are independent of apply, which validation has guaranteed.
+  WriteBatch batch;
   for (const auto& delpath : request->delete_()) {
-    registry_.del(prefix + gnmi_to_xpath(delpath));
+    batch.remove(prefix + gnmi_to_xpath(delpath));
     UpdateResult* res = response->add_response();
     *(res->mutable_path()) = delpath;
     res->set_op(gnmi::UpdateResult::DELETE);
   }
   for (const auto& upd : request->replace()) {
-    registry_.set(prefix + gnmi_to_xpath(upd.path()), upd.val(), now);
+    batch.set(prefix + gnmi_to_xpath(upd.path()), upd.val(), now);
     UpdateResult* res = response->add_response();
     res->mutable_path()->CopyFrom(upd.path());
     res->set_op(gnmi::UpdateResult::REPLACE);
   }
   for (const auto& upd : request->update()) {
-    registry_.set(prefix + gnmi_to_xpath(upd.path()), upd.val(), now);
+    batch.set(prefix + gnmi_to_xpath(upd.path()), upd.val(), now);
     UpdateResult* res = response->add_response();
     res->mutable_path()->CopyFrom(upd.path());
     res->set_op(gnmi::UpdateResult::UPDATE);
   }
+  registry_.commit(batch);
 
   return Status::OK;
 }

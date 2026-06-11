@@ -8,8 +8,11 @@
 > reasoning, the doubts, the alternatives considered, and the provisional
 > verdicts — so a future implementer inherits the *why*, not just the *what*.
 >
-> Nothing here changes the current code. Phase 3 ON_CHANGE as shipped is
-> poll-based and correct (see `DESIGN.md` → "Phase 3 — ON_CHANGE").
+> **Update:** the **batch/commit write-coherence seam has since shipped** as
+> `WriteBatch` + `LeafStore::commit` (see §3.3) — that part is no longer
+> hypothetical. Push delivery and the `duplicates`/`writeSeq` accounting remain
+> future work. Phase 3 ON_CHANGE as shipped is poll-based and correct (see
+> `DESIGN.md` → "Phase 3 — ON_CHANGE").
 
 ## Why this document exists
 
@@ -274,29 +277,41 @@ differences become "the provider runs a different driver."
     should be bundled into one Notification);
   - **(ii) In a push design, one notify per commit** instead of N.
 
-### 3.3 Proposed seam (direction, not yet implemented)
+### 3.3 The seam as built — `WriteBatch` + `LeafStore::commit` (IMPLEMENTED)
+
+> **Status: BUILT.** The write-coherence half of atomic shipped as a `WriteBatch`
+> value object committed atomically, *not* the stateful `ILeafSink` sketched
+> below. This section records what landed and why it deviates from the original
+> sketch.
 
 ```cpp
-// Write-side seam: a driver (D-Bus / hardware / simulator / test) knows only
-// this — never gNMI, snapshots, or subscriptions.
-class ILeafSink {
-public:
-    virtual ~ILeafSink() = default;
-    virtual void set(const std::string& xpath, /* typed value */,
-                     int64_t collectedNs) = 0;
-    virtual void remove(const std::string& xpath) = 0;
-    virtual void commit() = 0;   // tick boundary: bundling + (push) notify point
+// data_provider.hpp — store-agnostic write model. A driver (gNMI Set, simulator,
+// config seed) assembles a batch; the store applies it under one lock.
+class WriteBatch {
+    WriteBatch& set(const std::string& xpath, /* typed | TypedValue */,
+                    int64_t collectedNs);   // fluent, chainable
+    WriteBatch& remove(const std::string& xpath);
+    const std::vector<WriteOp>& ops() const;
 };
-// LeafStore implements ILeafSink; a driver is handed an ILeafSink& and fills it.
+// LeafStore::commit(const WriteBatch&) takes ONE unique_lock for the whole batch.
+// IDataProvider::applyBatch(const WriteBatch&) is the provider write side;
+// DataProviderRegistry::commit() partitions a batch by owning prefix.
 ```
 
-"The source may not be D-Bus" is satisfied directly: a driver is just "something
-that fills an `ILeafSink`."
+**Why `WriteBatch` and not the stateful `ILeafSink` (set/remove/buffer/commit):**
+the original sketch had the sink accumulate pending ops between `set()` calls and
+flush on `commit()`. But `LeafStore` has **two concurrent writers** — the
+simulator's `jthread` and the gNMI Set RPC thread — so a single shared mutable
+pending buffer is a data race that would need a per-writer transaction handle to
+make safe. An explicit `WriteBatch` value object (the RocksDB/LevelDB idiom) side-
+steps that entirely: each writer builds its own batch, hands the immutable result
+to `commit()`. No shared write-side state, thread-safety is trivial.
 
-> Open shape questions (to settle before implementing): exact `set()` value
-> typing (mirror the existing typed overloads vs a single `TypedValue`); whether
-> `commit()` is explicit or implied; and whether `commit()` is where the push
-> signal (§1.5) is raised.
+This also resolves the open shape questions: value typing **mirrors the typed
+overloads** (with a `TypedValue` overload for the Set path); `commit()` is
+**explicit** (the batch boundary is the transaction); and `commit()` is the
+single place a future push signal (§1.5) would be raised — every writer, sensor
+tick included, already funnels through it.
 
 ---
 
@@ -350,8 +365,10 @@ Every one of these is a property of **how values enter the store**, i.e. the
    router/queue now would design APIs against imagined needs — the same
    speculation `DESIGN.md` §A avoids for the StoreBackedProvider base. See §6.1
    for the trigger that flips this.
-2. **`ILeafSink` shape** — value typing, explicit vs implicit `commit()`, whether
-   `commit()` raises the push signal.
+2. ~~**`ILeafSink` shape**~~ — **RESOLVED / BUILT** as `WriteBatch` +
+   `LeafStore::commit` (§3.3): typed overloads + a `TypedValue` overload, explicit
+   `commit()`, and `commit()` is the future push-signal point. Every writer (gNMI
+   Set, simulator tick, config seed) now funnels through it under one lock.
 3. **Push form** — if/when: minimal hybrid (CV + version, keep diff), *not* an
    observer/callback registry.
 4. **Multi-store wake** — a single registry-level change signal vs per-store CVs
@@ -422,7 +439,9 @@ real scale / latency, independent of this provider.
 ## 7. Deferred / explicitly out of scope right now
 
 - Push delivery (this whole document is the rationale for a *future* change).
-- The `ILeafSink` / batch-commit seam (design captured here; not built).
+- ~~The `ILeafSink` / batch-commit seam~~ — **BUILT** as `WriteBatch` +
+  `LeafStore::commit` (§3.3). The write side is now coherent (one lock per
+  transaction); push delivery on top of `commit()` remains the deferred part.
 - `LeafStore& store()` accessor — **not** added; writes route through the registry
   (§6.1), reads already do, so no public accessor is needed.
 - `Set` → store injection — **no longer a deferred orphan**: it is the reason

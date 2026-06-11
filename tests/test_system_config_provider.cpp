@@ -54,11 +54,11 @@ TEST(SystemConfigWrite, EveryConfigPathIsWritable) {
     EXPECT_TRUE(p.writable("/system/config/hostname"));
 }
 
-TEST(SystemConfigWrite, ApplyUpdateChangesSnapshot) {
+TEST(SystemConfigWrite, ApplyBatchChangesSnapshot) {
     SystemConfigProvider p;
-    gnmi::TypedValue v;
-    v.set_string_val("edge-psc-7");
-    EXPECT_TRUE(p.applyUpdate("/system/config/hostname", v, 12345));
+    EXPECT_TRUE(p.applyBatch(
+        WriteBatch{}.set("/system/config/hostname",
+                         std::string("edge-psc-7"), 12345)));
 
     Snapshot snap = p.snapshot("/system/config/hostname");
     ASSERT_EQ(snap.size(), 1u);
@@ -67,20 +67,19 @@ TEST(SystemConfigWrite, ApplyUpdateChangesSnapshot) {
     EXPECT_EQ(leaf.collectedNs, 12345);   // Set's transaction timestamp
 }
 
-TEST(SystemConfigWrite, ApplyUpdateCreatesNewLeaf) {
+TEST(SystemConfigWrite, ApplyBatchCreatesNewLeaf) {
     SystemConfigProvider p;
-    gnmi::TypedValue v;
-    v.set_string_val("UTC");
-    EXPECT_TRUE(p.applyUpdate("/system/config/timezone-name", v, 1));
+    EXPECT_TRUE(p.applyBatch(
+        WriteBatch{}.set("/system/config/timezone-name", std::string("UTC"), 1)));
 
     Snapshot snap = p.snapshot("/system/config/timezone-name");
     ASSERT_EQ(snap.size(), 1u);
     EXPECT_EQ(snap.at("/system/config/timezone-name").val.string_val(), "UTC");
 }
 
-TEST(SystemConfigWrite, ApplyDeleteRemovesLeaf) {
+TEST(SystemConfigWrite, ApplyBatchRemovesLeaf) {
     SystemConfigProvider p;
-    EXPECT_TRUE(p.applyDelete("/system/config/hostname"));
+    EXPECT_TRUE(p.applyBatch(WriteBatch{}.remove("/system/config/hostname")));
 
     EXPECT_TRUE(p.snapshot("/system/config/hostname").empty());
     RepeatedPtrField<Update> list;
@@ -88,10 +87,28 @@ TEST(SystemConfigWrite, ApplyDeleteRemovesLeaf) {
     EXPECT_EQ(list.size(), 0);
 }
 
-// Deleting an absent leaf is silently accepted (§3.4.6): del() is idempotent.
-TEST(SystemConfigWrite, ApplyDeleteAbsentLeafSucceeds) {
+// Deleting an absent leaf is silently accepted (§3.4.6): remove() is idempotent.
+TEST(SystemConfigWrite, ApplyBatchDeleteAbsentLeafSucceeds) {
     SystemConfigProvider p;
-    EXPECT_TRUE(p.applyDelete("/system/config/never-set"));
+    EXPECT_TRUE(p.applyBatch(WriteBatch{}.remove("/system/config/never-set")));
+}
+
+// A multi-leaf write to the atomic NTP record lands as one transaction: every
+// changed leaf is visible together, stamped with the shared collection time.
+TEST(SystemConfigWrite, ApplyBatchWritesNtpRecordCoherently) {
+    SystemConfigProvider p;
+    const std::string ntp = "/system/ntp/servers/server[address=10.0.0.1]/config";
+    gnmi::TypedValue ver;   ver.set_uint_val(5);
+    gnmi::TypedValue assoc; assoc.set_string_val("PEER");
+    EXPECT_TRUE(p.applyBatch(WriteBatch{}
+        .set(ntp + "/version", ver, 7000)
+        .set(ntp + "/association-type", assoc, 7000)));
+
+    Snapshot snap = p.snapshot(ntp);
+    EXPECT_EQ(snap.at(ntp + "/version").val.uint_val(), 5u);
+    EXPECT_EQ(snap.at(ntp + "/association-type").val.string_val(), "PEER");
+    EXPECT_EQ(snap.at(ntp + "/version").collectedNs, 7000);
+    EXPECT_EQ(snap.at(ntp + "/association-type").collectedNs, 7000);
 }
 
 // We own a broad /system prefix, so only config-true paths may be written; a

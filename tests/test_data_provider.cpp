@@ -41,26 +41,32 @@ public:
     Snapshot snapshot(const std::string&) const override { return {}; }
 };
 
-// Accepts writes and records the last one, so the registry's write fan-out is
-// observable. FakeProvider/EmptyProvider keep the read-only defaults, serving as
-// the refusal case (routed && !applied).
+// Accepts writes and records the batch it received, so the registry's write
+// fan-out is observable. FakeProvider/EmptyProvider keep the read-only defaults,
+// serving as the refusal case (routed && !applied).
 class WritableProvider : public IDataProvider {
 public:
     void fill(RepeatedPtrField<Update>*, const std::string&) const override {}
     Snapshot snapshot(const std::string&) const override { return {}; }
 
     bool writable(const std::string&) const override { return true; }
-    bool applyUpdate(const std::string& xpath, const gnmi::TypedValue&,
-                     int64_t ts) override {
-        ++updates; lastUpdate = xpath; lastTs = ts; return true;
-    }
-    bool applyDelete(const std::string& xpath) override {
-        ++deletes; lastDelete = xpath; return true;
+    bool applyBatch(const WriteBatch& batch) override {
+        ++commits;
+        for (const auto& op : batch.ops()) {
+            ops.push_back(op);
+            if (op.kind == WriteOp::Kind::Set) {
+                lastSet = op.xpath; lastTs = op.collectedNs;
+            } else {
+                lastRemove = op.xpath;
+            }
+        }
+        return true;
     }
 
-    int         updates = 0, deletes = 0;
-    std::string lastUpdate, lastDelete;
-    int64_t     lastTs = 0;
+    int                  commits = 0;
+    std::vector<WriteOp> ops;
+    std::string          lastSet, lastRemove;
+    int64_t              lastTs = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -287,54 +293,76 @@ TEST(DataProviderRegistryWrite, writableNotRoutedWhenNoPrefixMatches) {
     EXPECT_FALSE(wr.applied);
 }
 
-TEST(DataProviderRegistryWrite, setAppliesToWritableProvider) {
+TEST(DataProviderRegistryWrite, commitAppliesToWritableProvider) {
     DataProviderRegistry reg;
     auto p = std::make_unique<WritableProvider>();
     WritableProvider* raw = p.get();
     reg.addProvider("/cfg", std::move(p));
 
-    gnmi::TypedValue v;
-    v.set_string_val("psc-mock");
-    WriteResult wr = reg.set("/cfg/hostname", v, 99);
+    WriteResult wr = reg.commit(WriteBatch{}.set("/cfg/hostname",
+                                                 std::string("psc-mock"), 99));
 
     EXPECT_TRUE(wr.routed);
     EXPECT_TRUE(wr.applied);
-    EXPECT_EQ(raw->updates, 1);
-    EXPECT_EQ(raw->lastUpdate, "/cfg/hostname");
+    EXPECT_EQ(raw->commits, 1);             // one batch, not one call per leaf
+    EXPECT_EQ(raw->ops.size(), 1u);
+    EXPECT_EQ(raw->lastSet, "/cfg/hostname");
     EXPECT_EQ(raw->lastTs, 99);             // transaction timestamp is forwarded
 }
 
-TEST(DataProviderRegistryWrite, setRefusedByReadOnlyProvider) {
+TEST(DataProviderRegistryWrite, commitRefusedByReadOnlyProvider) {
     DataProviderRegistry reg;
     reg.addProvider("/foo", std::make_unique<FakeProvider>());
 
-    gnmi::TypedValue v;
-    v.set_double_val(1.0);
-    WriteResult wr = reg.set("/foo/x", v, 0);
+    WriteResult wr = reg.commit(WriteBatch{}.set("/foo/x", 1.0, 0));
 
     EXPECT_TRUE(wr.routed);
-    EXPECT_FALSE(wr.applied);   // default applyUpdate refuses
+    EXPECT_FALSE(wr.applied);   // default applyBatch refuses
 }
 
-TEST(DataProviderRegistryWrite, delAppliesToWritableProvider) {
+TEST(DataProviderRegistryWrite, commitAppliesDelete) {
     DataProviderRegistry reg;
     auto p = std::make_unique<WritableProvider>();
     WritableProvider* raw = p.get();
     reg.addProvider("/cfg", std::move(p));
 
-    WriteResult wr = reg.del("/cfg/hostname");
+    WriteResult wr = reg.commit(WriteBatch{}.remove("/cfg/hostname"));
 
     EXPECT_TRUE(wr.routed);
     EXPECT_TRUE(wr.applied);
-    EXPECT_EQ(raw->deletes, 1);
-    EXPECT_EQ(raw->lastDelete, "/cfg/hostname");
+    EXPECT_EQ(raw->lastRemove, "/cfg/hostname");
 }
 
-TEST(DataProviderRegistryWrite, delNotRoutedWhenNoPrefixMatches) {
+TEST(DataProviderRegistryWrite, commitNotRoutedWhenNoPrefixMatches) {
     DataProviderRegistry reg;
     reg.addProvider("/cfg", std::make_unique<WritableProvider>());
 
-    WriteResult wr = reg.del("/other");
+    WriteResult wr = reg.commit(WriteBatch{}.remove("/other"));
     EXPECT_FALSE(wr.routed);
     EXPECT_FALSE(wr.applied);
+}
+
+// A batch spanning two providers must reach each provider with only its own ops
+// (per-provider atomicity): the registry partitions by owning prefix.
+TEST(DataProviderRegistryWrite, commitPartitionsBatchByProvider) {
+    DataProviderRegistry reg;
+    auto a = std::make_unique<WritableProvider>();
+    auto b = std::make_unique<WritableProvider>();
+    WritableProvider* rawA = a.get();
+    WritableProvider* rawB = b.get();
+    reg.addProvider("/cfg", std::move(a));
+    reg.addProvider("/sys", std::move(b));
+
+    WriteResult wr = reg.commit(WriteBatch{}
+        .set("/cfg/hostname", std::string("h"), 1)
+        .set("/sys/x", 2.0, 1)
+        .set("/sys/y", 3.0, 1));
+
+    EXPECT_TRUE(wr.routed);
+    EXPECT_TRUE(wr.applied);
+    EXPECT_EQ(rawA->commits, 1);
+    EXPECT_EQ(rawA->ops.size(), 1u);        // only /cfg/hostname
+    EXPECT_EQ(rawA->lastSet, "/cfg/hostname");
+    EXPECT_EQ(rawB->commits, 1);
+    EXPECT_EQ(rawB->ops.size(), 2u);        // /sys/x and /sys/y
 }

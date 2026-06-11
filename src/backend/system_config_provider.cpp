@@ -36,17 +36,20 @@ bool isConfigPath(const std::string& p) {
 
 SystemConfigProvider::SystemConfigProvider() {
     const int64_t now = get_time_nanosec();
+    WriteBatch seed;
     for (const auto& c : DEFAULTS)
         // Wrap in std::string: a bare const char* would bind to set(bool,...).
-        store_.set(c.path, std::string(c.value), now);
+        seed.set(c.path, std::string(c.value), now);
 
     // Seed one NTP server record — mixed-type leaves under an atomic container.
+    // Seeding the whole record in one commit keeps it coherent from the start.
     const std::string ntp = NTP_CONFIG;
-    store_.set(ntp + "/address",          std::string("10.0.0.1"), now);
-    store_.set(ntp + "/port",             uint64_t{123},           now);
-    store_.set(ntp + "/version",          uint64_t{4},             now);
-    store_.set(ntp + "/iburst",           true,                    now);
-    store_.set(ntp + "/association-type", std::string("SERVER"),   now);
+    seed.set(ntp + "/address",          std::string("10.0.0.1"), now);
+    seed.set(ntp + "/port",             uint64_t{123},           now);
+    seed.set(ntp + "/version",          uint64_t{4},             now);
+    seed.set(ntp + "/iburst",           true,                    now);
+    seed.set(ntp + "/association-type", std::string("SERVER"),   now);
+    store_.commit(seed);
 }
 
 void SystemConfigProvider::fill(RepeatedPtrField<Update>* list,
@@ -58,15 +61,10 @@ bool SystemConfigProvider::writable(const std::string& xpath) const {
     return isConfigPath(stripPathQuotes(xpath));
 }
 
-bool SystemConfigProvider::applyUpdate(const std::string& xpath,
-                                       const gnmi::TypedValue& val,
-                                       int64_t ts) {
-    store_.set(xpath, val, ts);
-    return true;
-}
-
-bool SystemConfigProvider::applyDelete(const std::string& xpath) {
-    store_.remove(xpath);
+bool SystemConfigProvider::applyBatch(const WriteBatch& batch) {
+    // The registry has already routed these ops to us and Set validated each path
+    // as writable; apply the whole transaction under the store's single lock.
+    store_.commit(batch);
     return true;
 }
 

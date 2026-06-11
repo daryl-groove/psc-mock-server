@@ -57,9 +57,7 @@ public:
     // here is what the existing poll+diff loop turns into an ON_CHANGE Update /
     // delete — no new trigger needed.
     bool writable(const std::string& xpath) const override;
-    bool applyUpdate(const std::string& xpath, const gnmi::TypedValue& val,
-                     int64_t ts) override;
-    bool applyDelete(const std::string& xpath) override;
+    bool applyBatch(const WriteBatch& batch) override;
 
     // ---- atomic containers ----
     // NTP server records (/system/ntp/servers/server[address=X]/config) are

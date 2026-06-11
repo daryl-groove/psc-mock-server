@@ -91,13 +91,17 @@ void runSimulator(LeafStore& store, std::vector<Walk> walks,
     std::unique_lock lock(mu);
     do {
         const int64_t now = get_time_nanosec();
+        WriteBatch tick;
         for (auto& w : walks) {
             if (w.step > 0.0 && stepNow(rng)) {
                 w.value += stepUp(rng) ? w.step : -w.step;
                 w.value = std::clamp(w.value, w.lo, w.hi);
             }
-            store.set(w.path, w.value, now);
+            tick.set(w.path, w.value, now);
         }
+        // One commit per tick: all leaves share a collection time and become
+        // visible together, so a reader never straddles two ticks.
+        store.commit(tick);
     } while (!cv.wait_for(lock, stop, UPDATE_INTERVAL,
                           [&] { return stop.stop_requested(); }));
 }
@@ -110,8 +114,10 @@ PscPowerSensorProvider::PscPowerSensorProvider() {
     // Seed synchronously so a Get/Subscribe arriving before the first simulator
     // tick finds data (avoids a cold-start NOT_FOUND race).
     const int64_t now = get_time_nanosec();
+    WriteBatch seed;
     for (const auto& w : walks)
-        store_.set(w.path, w.value, now);
+        seed.set(w.path, w.value, now);
+    store_.commit(seed);
 
     sim_ = std::jthread(
         [this, walks = std::move(walks)](std::stop_token stop) mutable {
