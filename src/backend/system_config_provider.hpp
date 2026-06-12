@@ -8,6 +8,10 @@
  * semantically-correct home for the write path (config is `config true`, unlike
  * read-only sensor `state`).
  *
+ * A StoreBackedProvider: the base owns the store, the declared schema, reads, and
+ * writability. This subclass adds only what diverges — the config leaves it
+ * declares, the write side (applyBatch), atomic NTP containers, and ON_CHANGE.
+ *
  * Two shapes of config coexist here, which is the point:
  *   /system/config/...                          flat scalars (hostname, banners)
  *                                               — per-leaf, NON-atomic.
@@ -28,22 +32,14 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
-#include "data_provider.hpp"
-#include "leaf_store.hpp"
+#include "store_backed_provider.hpp"
 
-class SystemConfigProvider final : public IDataProvider {
+class SystemConfigProvider final : public StoreBackedProvider {
 public:
     SystemConfigProvider();                       // seeds default config leaves
     ~SystemConfigProvider() override = default;
-
-    void fill(RepeatedPtrField<Update>* list,
-              const std::string& xpath) const override;
-
-    Snapshot snapshot(const std::string& xpath) const override {
-        // Leaves already carry their schema type (stamped at creation); just serve.
-        return store_.snapshot(xpath);
-    }
 
     // Config is event-driven, so a TARGET_DEFINED subscription should stream on
     // change rather than sample. This is the first provider to prefer ON_CHANGE.
@@ -52,12 +48,9 @@ public:
     }
 
     // ---- write side ----
-    // Only `config true` leaves are writable. We own a broad /system prefix, so
-    // restrict writes to config containers (a write to a hypothetical read-only
-    // /system/.../state leaf is refused → INVALID_ARGUMENT). Mutating store_ via
-    // Set is what the existing poll+diff loop turns into an ON_CHANGE Update /
-    // delete — no new trigger needed.
-    bool writable(const std::string& xpath) const override;
+    // Set already validated each path as writable (config true). Binding each
+    // leaf's type from the schema and mutating store_ is what the existing
+    // poll+diff loop turns into an ON_CHANGE Update / delete — no new trigger.
     bool applyBatch(const WriteBatch& batch) override;
 
     // ---- atomic containers ----
@@ -66,12 +59,7 @@ public:
     // server's `.../config` container prefix, or nullopt.
     std::optional<std::string> atomicPrefix(const std::string& xpath) const override;
 
-private:
-    // Single source of truth for both writability and a leaf's LeafType: the schema
-    // type of a path, from this provider's declared config subtrees.
-    LeafType schemaType(const std::string& xpath) const;
-    // Stamp each created leaf's type from schemaType, then commit the batch.
-    void applyStamped(const WriteBatch& batch);
-
-    LeafStore store_;
+protected:
+    // The provider's config schema, declared at one site (all LeafType::Config).
+    std::vector<DeclaredLeaf> declareLeaves() const override;
 };

@@ -67,14 +67,19 @@ TEST(SystemConfigWrite, ApplyBatchChangesSnapshot) {
     EXPECT_EQ(leaf.collectedNs, 12345);   // Set's transaction timestamp
 }
 
+// timezone-name is declared (LeafType::Config, writable) but NOT seeded, so it has
+// no value until a Set creates it — the "create a declared-but-unset config leaf"
+// case the per-leaf schema makes valid (the schema outlives any value).
 TEST(SystemConfigWrite, ApplyBatchCreatesNewLeaf) {
     SystemConfigProvider p;
+    EXPECT_TRUE(p.snapshot("/system/config/timezone-name").empty());  // declared, unseeded
     EXPECT_TRUE(p.applyBatch(
         WriteBatch{}.set("/system/config/timezone-name", std::string("UTC"), 1)));
 
     Snapshot snap = p.snapshot("/system/config/timezone-name");
     ASSERT_EQ(snap.size(), 1u);
     EXPECT_EQ(snap.at("/system/config/timezone-name").val.string_val(), "UTC");
+    EXPECT_EQ(snap.at("/system/config/timezone-name").type, LeafType::Config);
 }
 
 TEST(SystemConfigWrite, ApplyBatchRemovesLeaf) {
@@ -117,6 +122,15 @@ TEST(SystemConfigWrite, NonConfigPathIsNotWritable) {
     SystemConfigProvider p;
     EXPECT_TRUE(p.writable("/system/ntp/servers/server[address=10.0.0.1]/config/port"));
     EXPECT_FALSE(p.writable("/system/state/current-datetime"));
+}
+
+// The schema is a per-leaf declaration, not a subtree prefix: a path the provider
+// never declared — even one sitting under /system/config — is not writable, so a
+// Set to it is refused. (timezone-name, by contrast, IS declared, just unseeded.)
+TEST(SystemConfigWrite, UndeclaredConfigLeafIsNotWritable) {
+    SystemConfigProvider p;
+    EXPECT_FALSE(p.writable("/system/config/bogus-undeclared"));
+    EXPECT_TRUE(p.writable("/system/config/timezone-name"));
 }
 
 // The schema is stable, independent of current data: deleting a config leaf and

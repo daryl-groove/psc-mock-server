@@ -83,32 +83,39 @@ struct WriteOp {
     LeafType         type = LeafType::Operational;
 };
 
+// The single scalar -> gnmi::TypedValue authority. Everywhere that wraps a C++
+// scalar as a leaf value (WriteBatch::set below, the providers' declared leaves)
+// routes through here, so the union-field mapping lives in exactly one place.
+inline gnmi::TypedValue typedValue(double v)   { gnmi::TypedValue t; t.set_double_val(v); return t; }
+inline gnmi::TypedValue typedValue(bool v)     { gnmi::TypedValue t; t.set_bool_val(v);   return t; }
+inline gnmi::TypedValue typedValue(int64_t v)  { gnmi::TypedValue t; t.set_int_val(v);    return t; }
+inline gnmi::TypedValue typedValue(uint64_t v) { gnmi::TypedValue t; t.set_uint_val(v);   return t; }
+inline gnmi::TypedValue typedValue(const std::string& v) {
+    gnmi::TypedValue t; t.set_string_val(v); return t;
+}
+// A bare const char* would otherwise bind to typedValue(bool) — route it to string.
+inline gnmi::TypedValue typedValue(const char* v) { return typedValue(std::string(v)); }
+
 class WriteBatch {
 public:
-    // Typed builders mirror the gNMI scalar types (see addLeaf): each constructs
-    // the TypedValue at the call site, where the value's static type is known.
-    // A bare const char* would bind to the bool overload, so string callers must
-    // pass std::string explicitly.
+    // Typed builders mirror the gNMI scalar types: each wraps its value through
+    // typedValue() (the single authority above). A bare const char* still binds to
+    // the bool overload here, so string callers must pass std::string explicitly.
     WriteBatch& set(const std::string& xpath, double value, int64_t collectedNs) {
-        gnmi::TypedValue v; v.set_double_val(value);
-        return set(xpath, v, collectedNs);
+        return set(xpath, typedValue(value), collectedNs);
     }
     WriteBatch& set(const std::string& xpath, const std::string& value,
                     int64_t collectedNs) {
-        gnmi::TypedValue v; v.set_string_val(value);
-        return set(xpath, v, collectedNs);
+        return set(xpath, typedValue(value), collectedNs);
     }
     WriteBatch& set(const std::string& xpath, bool value, int64_t collectedNs) {
-        gnmi::TypedValue v; v.set_bool_val(value);
-        return set(xpath, v, collectedNs);
+        return set(xpath, typedValue(value), collectedNs);
     }
     WriteBatch& set(const std::string& xpath, int64_t value, int64_t collectedNs) {
-        gnmi::TypedValue v; v.set_int_val(value);
-        return set(xpath, v, collectedNs);
+        return set(xpath, typedValue(value), collectedNs);
     }
     WriteBatch& set(const std::string& xpath, uint64_t value, int64_t collectedNs) {
-        gnmi::TypedValue v; v.set_uint_val(value);
-        return set(xpath, v, collectedNs);
+        return set(xpath, typedValue(value), collectedNs);
     }
     // The path the gNMI Set side takes: the wire value's type is not known at the
     // call site, so it is forwarded already built.

@@ -17,70 +17,52 @@ const ConfigLeaf DEFAULTS[] = {
     { "/system/config/motd-banner",  "ORv3 PSC mock"  },
 };
 
+// A config leaf the schema declares but does NOT seed: writable and typed Config,
+// yet absent until a client Sets it (the schema outlives any value). Demonstrates
+// "create a declared-but-unset config leaf"; an UNdeclared path stays non-writable.
+const char* TIMEZONE_NAME = "/system/config/timezone-name";
+
 // An NTP server record is an atomic container: address (key), port, version,
 // iburst, association-type form one logical record delivered together.
 const char* NTP_CONFIG =
     "/system/ntp/servers/server[address=10.0.0.1]/config";
 
-// The provider's config schema, declared here at build time: a path under any of
-// these subtrees is `config true` (writable) and carries LeafType::Config. This is
-// an explicit server declaration — NOT inferred from the literal segment "config"
-// appearing in a path — so path naming stays free. Everything else is State.
-const char* CONFIG_SUBTREES[] = {
-    "/system/config",
-    "/system/ntp",
-};
-
 } // namespace
 
-SystemConfigProvider::SystemConfigProvider() {
+std::vector<StoreBackedProvider::DeclaredLeaf>
+SystemConfigProvider::declareLeaves() const {
     const int64_t now = get_time_nanosec();
-    WriteBatch seed;
+    std::vector<DeclaredLeaf> decls;
+
     for (const auto& c : DEFAULTS)
-        // Wrap in std::string: a bare const char* would bind to set(bool,...).
-        seed.set(c.path, std::string(c.value), now);
+        decls.push_back(DeclaredLeaf{ c.path, LeafType::Config,
+                                      typedValue(c.value), now });
 
-    // Seed one NTP server record — mixed-type leaves under an atomic container.
-    // Seeding the whole record in one commit keeps it coherent from the start.
+    decls.push_back(DeclaredLeaf{ TIMEZONE_NAME, LeafType::Config,
+                                  std::nullopt, now });
+
+    // The NTP record — mixed-value leaves under one atomic container, all Config.
     const std::string ntp = NTP_CONFIG;
-    seed.set(ntp + "/address",          std::string("10.0.0.1"), now);
-    seed.set(ntp + "/port",             uint64_t{123},           now);
-    seed.set(ntp + "/version",          uint64_t{4},             now);
-    seed.set(ntp + "/iburst",           true,                    now);
-    seed.set(ntp + "/association-type", std::string("SERVER"),   now);
-    applyStamped(seed);
+    decls.push_back(DeclaredLeaf{ ntp + "/address", LeafType::Config,
+                                  typedValue("10.0.0.1"), now });
+    decls.push_back(DeclaredLeaf{ ntp + "/port", LeafType::Config,
+                                  typedValue(uint64_t{123}), now });
+    decls.push_back(DeclaredLeaf{ ntp + "/version", LeafType::Config,
+                                  typedValue(uint64_t{4}), now });
+    decls.push_back(DeclaredLeaf{ ntp + "/iburst", LeafType::Config,
+                                  typedValue(true), now });
+    decls.push_back(DeclaredLeaf{ ntp + "/association-type", LeafType::Config,
+                                  typedValue("SERVER"), now });
+    return decls;
 }
 
-void SystemConfigProvider::fill(RepeatedPtrField<Update>* list,
-                                const std::string& xpath) const {
-    store_.collect(xpath, list);
-}
-
-LeafType SystemConfigProvider::schemaType(const std::string& xpath) const {
-    const std::string p = stripPathQuotes(xpath);
-    for (const char* root : CONFIG_SUBTREES)
-        if (isPathPrefix(root, p)) return LeafType::Config;
-    return LeafType::State;   // owned but not config (would be applied config)
-}
-
-bool SystemConfigProvider::writable(const std::string& xpath) const {
-    return schemaType(xpath) == LeafType::Config;   // config true ⟺ writable
-}
-
-void SystemConfigProvider::applyStamped(const WriteBatch& batch) {
-    // The single point where a leaf's LeafType is decided: bind each created leaf's
-    // type from this provider's schema, then commit under the store's one lock.
-    WriteBatch stamped;
-    for (auto op : batch.ops()) {
-        if (op.kind == WriteOp::Kind::Set) op.type = schemaType(op.xpath);
-        stamped.add(op);
-    }
-    store_.commit(stamped);
+SystemConfigProvider::SystemConfigProvider() {
+    initLeaves();
 }
 
 bool SystemConfigProvider::applyBatch(const WriteBatch& batch) {
     // Registry routed these to us and Set validated each path as writable.
-    applyStamped(batch);
+    commitStamped(batch);
     return true;
 }
 

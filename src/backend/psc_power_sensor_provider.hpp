@@ -5,42 +5,33 @@
  *   /components/component[name=PSC-x]/state/temperature/...
  *   /components/component[name=PSC-x]/power-supply/state/...
  *
- * fill() reads from a LeafStore; a background jthread drifts the values on a
- * quantized random walk. Real hardware: replace the simulator with register
- * reads that call store_.set().
+ * A StoreBackedProvider: the base owns the store and serves reads; this subclass
+ * only declares its (all-Operational) sensor leaves and runs a background jthread
+ * that drifts the values on a quantized random walk. Real hardware: replace the
+ * simulator with register reads that commit through the same path.
  *
  * Modeled after impl/gnmi-grpc/src/gnmi_collector.cpp:StatConnector.
  */
 
 #pragma once
 
-#include "data_provider.hpp"
-#include "leaf_store.hpp"
+#include "store_backed_provider.hpp"
 
 #include <thread>
+#include <vector>
 
-class PscPowerSensorProvider final : public IDataProvider {
+class PscPowerSensorProvider final : public StoreBackedProvider {
 public:
     PscPowerSensorProvider();
     ~PscPowerSensorProvider() override = default;  // sim_ jthread auto-stops + joins
 
-    // Reads current mock sensor readings for xpath from the store.
-    void fill(RepeatedPtrField<Update>* list,
-              const std::string& xpath) const override;
+    // All PSC sensor leaves are continuous measured values — SAMPLE (the default)
+    // is correct, so nothing else is overridden.
 
-    // All PSC sensor leaves are continuous measured values — SAMPLE is correct.
-    gnmi::SubscriptionMode preferredMode(const std::string&) const override {
-        return gnmi::SAMPLE;
-    }
-
-    // Read model for Subscribe: current value + collection timestamp per leaf.
-    // Sensor readings are runtime measurements → Operational, which is Leaf's
-    // default type, so no stamping is needed here.
-    Snapshot snapshot(const std::string& xpath) const override {
-        return store_.snapshot(xpath);
-    }
+protected:
+    // Sensor leaves, all Operational, starting at their nominal walk values.
+    std::vector<DeclaredLeaf> declareLeaves() const override;
 
 private:
-    LeafStore    store_;
     std::jthread sim_;   // declared last: started only after store_ is seeded
 };

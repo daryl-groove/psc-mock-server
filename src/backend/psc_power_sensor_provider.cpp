@@ -10,7 +10,8 @@
  * with real hardware register reads when targeting actual hardware.
  *
  * All simulation state (RNG, walk table, sleep primitives) is local to the
- * background thread — the provider itself holds only the store and the jthread.
+ * background thread — the provider itself holds only the store (in the base) and
+ * the jthread.
  */
 
 #include "psc_power_sensor_provider.hpp"
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <random>
 #include <stop_token>
@@ -66,7 +68,7 @@ std::string leafPath(const std::string& unit, const char* suffix) {
 }
 
 // The full leaf set, each walk starting at its nominal value. Single source of
-// truth: used both to seed the store and to drive the simulator.
+// truth: used both to declare/seed the store and to drive the simulator.
 std::vector<Walk> buildWalks() {
     std::vector<Walk> walks;
     for (const auto& unit : PSC_UNITS)
@@ -78,10 +80,11 @@ std::vector<Walk> buildWalks() {
 }
 
 // Background driver. Each tick stamps all leaves with one collection timestamp
-// (keeps bundling honest, §3.5.2.1). mu/cv exist only to back the interruptible
-// wait; they guard no shared state.
-void runSimulator(LeafStore& store, std::vector<Walk> walks,
-                  std::stop_token stop) {
+// (keeps bundling honest, §3.5.2.1) and commits them through `commit`, which
+// stamps each leaf's type from the schema (Operational here). mu/cv exist only to
+// back the interruptible wait; they guard no shared state.
+void runSimulator(const std::function<void(const WriteBatch&)>& commit,
+                  std::vector<Walk> walks, std::stop_token stop) {
     std::mt19937 rng(std::random_device{}());
     std::bernoulli_distribution stepNow(STEP_PROBABILITY);
     std::bernoulli_distribution stepUp(0.5);
@@ -101,31 +104,30 @@ void runSimulator(LeafStore& store, std::vector<Walk> walks,
         }
         // One commit per tick: all leaves share a collection time and become
         // visible together, so a reader never straddles two ticks.
-        store.commit(tick);
+        commit(tick);
     } while (!cv.wait_for(lock, stop, UPDATE_INTERVAL,
                           [&] { return stop.stop_requested(); }));
 }
 
 } // namespace
 
-PscPowerSensorProvider::PscPowerSensorProvider() {
-    std::vector<Walk> walks = buildWalks();
-
-    // Seed synchronously so a Get/Subscribe arriving before the first simulator
-    // tick finds data (avoids a cold-start NOT_FOUND race).
+std::vector<StoreBackedProvider::DeclaredLeaf>
+PscPowerSensorProvider::declareLeaves() const {
     const int64_t now = get_time_nanosec();
-    WriteBatch seed;
-    for (const auto& w : walks)
-        seed.set(w.path, w.value, now);
-    store_.commit(seed);
-
-    sim_ = std::jthread(
-        [this, walks = std::move(walks)](std::stop_token stop) mutable {
-            runSimulator(store_, std::move(walks), stop);
-        });
+    std::vector<DeclaredLeaf> decls;
+    for (const auto& w : buildWalks())
+        decls.push_back(DeclaredLeaf{ w.path, LeafType::Operational,
+                                      typedValue(w.value), now });
+    return decls;
 }
 
-void PscPowerSensorProvider::fill(RepeatedPtrField<Update>* list,
-                                  const std::string& xpath) const {
-    store_.collect(xpath, list);
+PscPowerSensorProvider::PscPowerSensorProvider() {
+    // Seed synchronously so a Get/Subscribe arriving before the first simulator
+    // tick finds data; this also builds schema_ that the sim's commits stamp from.
+    initLeaves();
+
+    sim_ = std::jthread([this](std::stop_token stop) {
+        runSimulator([this](const WriteBatch& b) { commitStamped(b); },
+                     buildWalks(), stop);
+    });
 }
