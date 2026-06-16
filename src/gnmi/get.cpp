@@ -63,6 +63,16 @@ Get::buildGetNotifications(RepeatedPtrField<Notification>* out,
   Status status = validateGnmiPath(path);
   if (!status.ok()) return status;
 
+  // C1/D16: a non-openconfig origin names an unimplemented schema → UNIMPLEMENTED,
+  // before routing. Checked after the structural validation so a malformed path
+  // still wins INVALID_ARGUMENT. origin is then stripped for free (gnmi_to_xpath).
+  if (prefix != nullptr) {
+    status = validateOrigin(prefix->origin());
+    if (!status.ok()) return status;
+  }
+  status = validateOrigin(path.origin());
+  if (!status.ok()) return status;
+
   string fullpath;
   if (prefix != nullptr)
     fullpath += gnmi_to_xpath(*prefix);
@@ -82,13 +92,12 @@ Get::buildGetNotifications(RepeatedPtrField<Notification>* out,
   // Same atomic-aware partition as Subscribe: each atomic container becomes its
   // own atomic Notification (spec §3.5.2.5), the rest a single non-atomic one.
   std::vector<Notification> notes = buildFullNotifications(view);
-  for (auto& n : notes) {
-    // A request prefix applies to the non-atomic notification only; atomic ones
-    // carry their own container prefix.
-    if (prefix != nullptr && !n.atomic())
-      n.mutable_prefix()->CopyFrom(*prefix);
+  // C5/R (§2.2.2.1): echo prefix.target onto every notification (atomic
+  // included) — target only, not the path-prefix (updates carry full paths) nor
+  // origin (C1 strip-only).
+  if (prefix != nullptr) echoTarget(notes, prefix->target());
+  for (auto& n : notes)
     *out->Add() = std::move(n);
-  }
   return Status::OK;
 }
 

@@ -45,6 +45,7 @@ Status validateWrite(const gnmid::Backend& be, const Update& upd, const string& 
 {
   if (!upd.has_path() || !upd.has_val())
     return Status(StatusCode::INVALID_ARGUMENT, "update missing path or value");
+  if (Status s = validateOrigin(upd.path().origin()); !s.ok()) return s;   // C1/D16
   return checkWritable(be, prefix + gnmi_to_xpath(upd.path()));
 }
 
@@ -71,9 +72,14 @@ Status Set::run(const SetRequest* request, SetResponse* response)
     response->mutable_prefix()->CopyFrom(request->prefix());
   }
 
+  // C1/D16: a non-openconfig origin on the prefix names an unimplemented schema.
+  // Checked up front so the transaction aborts before mutating anything.
+  if (Status s = validateOrigin(request->prefix().origin()); !s.ok()) return s;
+
   // ---- Phase 1: validate in spec order (delete, replace, update); mutate nothing.
   for (const auto& delpath : request->delete_()) {
-    Status s = checkWritable(be_, prefix + gnmi_to_xpath(delpath));
+    Status s = validateOrigin(delpath.origin());                            // C1/D16
+    if (s.ok()) s = checkWritable(be_, prefix + gnmi_to_xpath(delpath));
     if (!s.ok()) return s;
   }
   for (const auto& upd : request->replace()) {

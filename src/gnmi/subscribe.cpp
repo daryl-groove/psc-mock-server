@@ -112,11 +112,10 @@ Subscribe::buildSubscribeNotifications(std::vector<Notification>& out,
 
   out = buildFullNotifications(merged);
 
-  // A request prefix applies to the non-atomic notification only; atomic ones
-  // carry their own container prefix.
-  if (request.has_prefix())
-    for (auto& n : out)
-      if (!n.atomic()) n.mutable_prefix()->CopyFrom(request.prefix());
+  // C5/R (§2.2.2.1): echo prefix.target onto every notification (atomic
+  // included) — target only, not the path-prefix (updates carry full paths) nor
+  // origin (C1 strip-only). No-op when target is unset.
+  echoTarget(out, request.prefix().target());
 
   return Status::OK;
 }
@@ -132,15 +131,22 @@ Status Subscribe::handleStream(
   SubscribeResponse response;
   Status status;
 
-  // Checks that sample_interval values are not higher than INT64_MAX nanoseconds.
+  // Per-subscription sample_interval setup validation (§3.5.1.5.2).
   for (int i = 0; i < request.subscribe().subscription_size(); i++) {
     const Subscription& sub = request.subscribe().subscription(i);
     if (sub.sample_interval() > duration<long long, std::nano>::max().count()) {
-      context->TryCancel();
       return Status(StatusCode::INVALID_ARGUMENT,
                     string("sample_interval must be less than ")
                     + to_string(INT64_MAX) + " nanoseconds");
     }
+    // C3 / S-P5-c: the target owns the interval for TARGET_DEFINED, so a
+    // client-pinned sample_interval is rejected (§3.5.1.5.2 L1790-1792).
+    // sample_interval == 0 means "no pin" and stays allowed.
+    // Return-only (no TryCancel): the spec MUST is to close with InvalidArgument,
+    // and TryCancel() forces the client to observe CANCELLED instead (verified).
+    if (sub.mode() == gnmi::TARGET_DEFINED && sub.sample_interval() != 0)
+      return Status(StatusCode::INVALID_ARGUMENT,
+                    "sample_interval must not be set with TARGET_DEFINED");
   }
 
   // Send initial snapshot unless client requested updates_only. sync_response is
@@ -149,7 +155,6 @@ Status Subscribe::handleStream(
     std::vector<Notification> notes;
     status = buildSubscribeNotifications(notes, request.subscribe());
     if (!status.ok()) {
-      context->TryCancel();
       return status;
     }
     writeAll(notes, stream);
@@ -218,26 +223,27 @@ Status Subscribe::handleStream(
       std::vector<Notification> notes;
       status = buildSubscribeNotifications(notes, updateRequest.subscribe());
       if (!status.ok()) {
-        context->TryCancel();
         return status;
       }
       writeAll(notes, stream);
     }
 
     // ---- ON_CHANGE: poll each subscriber's snapshot and diff vs its previous ----
+    // This path bypasses buildSubscribeNotifications, so echo target here too (C5).
     for (auto& oc : onChange) {
       gnmid::Backend::View cur = be_.snapshot(oc.query);
       const auto now = high_resolution_clock::now();
 
+      std::vector<Notification> notes;
       if (heartbeatDue(oc.sub.heartbeat_interval(), oc.lastHeartbeat, now)) {
         // Heartbeat re-emits the full state regardless of change (spec §3.5.1.5.2).
-        std::vector<Notification> notes = buildFullNotifications(cur);
-        writeAll(notes, stream);
+        notes = buildFullNotifications(cur);
         oc.lastHeartbeat = now;
       } else {
-        std::vector<Notification> notes = buildChangeNotifications(oc.prev, cur);
-        writeAll(notes, stream);
+        notes = buildChangeNotifications(oc.prev, cur);
       }
+      echoTarget(notes, request.subscribe().prefix().target());
+      writeAll(notes, stream);
 
       oc.prev = std::move(cur);
     }
@@ -263,7 +269,6 @@ Status Subscribe::handleOnce(ServerContext* context, SubscribeRequest request,
   std::vector<Notification> notes;
   status = buildSubscribeNotifications(notes, request.subscribe());
   if (!status.ok()) {
-    context->TryCancel();
     return status;
   }
 
@@ -293,7 +298,6 @@ Status Subscribe::handlePoll(ServerContext* context, SubscribeRequest request,
     std::vector<Notification> notes;
     status = buildSubscribeNotifications(notes, subscription.subscribe());
     if (!status.ok()) {
-      context->TryCancel();
       return status;
     }
     writeAll(notes, stream);
@@ -310,7 +314,6 @@ Status Subscribe::handlePoll(ServerContext* context, SubscribeRequest request,
           std::vector<Notification> notes;
           status = buildSubscribeNotifications(notes, subscription.subscribe());
           if (!status.ok()) {
-            context->TryCancel();
             return status;
           }
           writeAll(notes, stream);
@@ -350,10 +353,18 @@ Status Subscribe::run(ServerContext* context,
   }
 
   if (!request.has_subscribe()) {
-    context->TryCancel();
     return Status(StatusCode::INVALID_ARGUMENT,
                   "SubscribeRequest needs non-empty SubscriptionList");
   }
+
+  // Validate origin once at setup (D16/C1, Resolver pipeline step 1): a
+  // non-openconfig origin names an unimplemented schema → UNIMPLEMENTED. Done
+  // here, not in buildSubscribeNotifications, which is skipped under
+  // updates_only and otherwise re-run per tick.
+  const SubscriptionList& sl = request.subscribe();
+  if (Status s = validateOrigin(sl.prefix().origin()); !s.ok()) return s;
+  for (const auto& sub : sl.subscription())
+    if (Status s = validateOrigin(sub.path().origin()); !s.ok()) return s;
 
   switch (request.subscribe().mode()) {
     case SubscriptionList_Mode_STREAM:

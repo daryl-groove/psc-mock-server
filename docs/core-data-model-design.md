@@ -936,10 +936,10 @@ features OpenConfig does not yet model (spec §2.7.3). Two options were weighed:
   *malformed* path — (c) strips origin before calling the core. The core
   documents a **single-origin invariant**.
 
-  > ⚠ **This is the intended design, not the current code (backlog C1).** Today
-  > the gNMI boundary embeds `origin` into the xpath string rather than
-  > defaulting/stripping it, so even `origin=openconfig` is wrongly rejected with
-  > `UNIMPLEMENTED`. The boundary helper above is what needs building.
+  > ✅ **Implemented (backlog C1).** The gNMI boundary now does exactly (a)–(c)
+  > via `validateOrigin()` (`utils/utils.h`), shared by get/set/subscribe, with
+  > `gnmi_to_xpath` no longer embedding origin. (Re-attaching origin onto response
+  > paths was deferred — strip-only; see protocol-layer-design.md C1.)
 
 **Decision rationale.** This is a greenfield, telemetry-focused ORv3 PSC mock
 serving a single, well-modelled OpenConfig surface (components / sensors / PSU /

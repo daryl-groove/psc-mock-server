@@ -33,18 +33,20 @@ The core was shaped so the protocol layer is thin. From
 - **`shared_ptr<const TypedValue>` values** (D17) — forwarded into a Notification
   with no protobuf copy.
 - **Path identity is `CanonicalPath`, single-origin** (D16) — the protocol layer
-  owns `origin`: it defaults empty→`openconfig`, strips it before calling the
-  core, and **re-attaches** it when encoding `gnmi::Path` back onto the wire. An
-  origin that is *syntactically valid but not `openconfig`* names a schema the
-  server does not implement, so it is rejected with **`UNIMPLEMENTED`**, not
-  `InvalidArgument` — per the Get/Subscribe behavior tables (§3.3.4 L1152 /
+  owns `origin`: it defaults empty→`openconfig`, validates it, and strips it
+  before calling the core. (Re-attaching it onto response paths is deferred — see
+  the note.) An origin that is *syntactically valid but not `openconfig`* names a
+  schema the server does not implement, so it is rejected with **`UNIMPLEMENTED`**,
+  not `InvalidArgument` — per the Get/Subscribe behavior tables (§3.3.4 L1152 /
   §3.5.2.4 L1900, "syntactically correct but … not implemented → `UNIMPLEMENTED`").
   `InvalidArgument` is reserved for a *malformed* `gnmi::Path`. (Resolves
   design-review finding **N**; see the RPC status-code table below.)
-  > ⚠ **Not yet implemented (backlog C1).** Current code embeds `origin` into the
-  > xpath string (`gnmi_to_xpath`) instead of defaulting/stripping it, so *any*
-  > non-empty origin — including the canonical `openconfig` — misses routing and
-  > is wrongly rejected with `UNIMPLEMENTED`. This describes the intended design.
+  > ✅ **Implemented (backlog C1).** `validateOrigin()` (`utils/utils.h`), shared by
+  > get/set/subscribe (empty/`openconfig`→OK, other→`UNIMPLEMENTED`); `gnmi_to_xpath`
+  > no longer embeds origin, so stripping is free at every call site. **Re-attach on
+  > responses was deferred** (decided strip-only): the spec mandates only `target`
+  > echo (C5), not origin, and empty origin ≡ `openconfig` by client convention — a
+  > D16 extension point for when multi-origin is actually needed.
 
 ---
 
@@ -559,8 +561,8 @@ code — the only addition is the per-leaf mode tag.
 > per-leaf mixing needs the push seam (P1/P2), which is not built. Today
 > `Backend::preferredMode(xpath)` returns one mode for the whole path (any
 > non-Operational leaf ⇒ ON_CHANGE, else SAMPLE) and tags the whole subscription.
-> The S-P5-c reject (a client-pinned `sample_interval` on TARGET_DEFINED) is also
-> **not yet enforced** (backlog C3).
+> The S-P5-c reject (a client-pinned `sample_interval` on TARGET_DEFINED) **is now
+> enforced** with `InvalidArgument` (backlog C3 ✅).
 
 #### Spec-forced (no design choice)
 
@@ -752,8 +754,11 @@ is `prefix ++ update.path`, and the spec does not fix the split — `/a/b/c/d/e`
 equally valid as `prefix=/a/b, path=c/d/e` or `prefix=/a/b/c/d, path=e`. The prefix
 carries **semantic** weight only when `atomic=true`, where it names the boundary of
 the complete-state snapshot (§2.1.1). This server sets `prefix` for atomic groups
-(the group's container) and copies a request-supplied prefix onto the non-atomic
-notification; otherwise updates carry full paths.
+(the group's container); non-atomic notifications carry **full paths** and no
+copied request-prefix — the only thing stamped onto their prefix is `target`
+(below). Real prefix compression (updates *relative* to a copied prefix) is not
+done: it buys nothing for this mock, and the earlier half-done copy double-prefixed
+(updates already carried full paths). (Reconciled in C5.)
 
 **`prefix.target` MUST be echoed (§2.2.2.1 L414-424).** The `target` field is a
 property of the request `prefix`, not of the data: if a client sets `prefix.target`
@@ -763,6 +768,8 @@ if the client did **not** set it, the server **MUST NOT** set it. The Notificati
 Builder therefore carries the request's `target` through onto each emitted
 `Notification.prefix` (independent of, and in addition to, the path-compression /
 atomic-boundary use of `prefix` above). (design-review **R**.)
-> ⚠ **Partially implemented (backlog C5).** Set echoes the request prefix; Get/
-> Subscribe copy it onto the **non-atomic** notification only — atomic
-> notifications carry their container prefix and currently **drop** `target`.
+> ✅ **Implemented (backlog C5).** A shared `echoTarget()` stamps `target` (only)
+> onto **every** response Notification.prefix — atomic included — at each build
+> site (Get, `buildSubscribeNotifications`, the ON_CHANGE loop). Set echoes it on
+> `SetResponse.prefix`. The old non-atomic full-prefix copy was replaced (it
+> re-attached origin against C1 and double-prefixed).

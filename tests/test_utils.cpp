@@ -199,6 +199,17 @@ TEST(GnmiToXpath, KeyAlwaysQuotedInOutput) {
     EXPECT_EQ(gnmi_to_xpath(path), "/components/component[name=\"PSC-0\"]");
 }
 
+TEST(GnmiToXpath, OriginIsNotEmbedded) {
+    // C1/D16: gnmi_to_xpath is a pure structural converter. origin is a
+    // protocol-boundary concern (see validateOrigin), never baked into the
+    // xpath — embedding it made an origin-bearing path miss routing.
+    gnmi::Path path;
+    path.set_origin("openconfig");
+    xpath_to_gnmi_path("/components/component[name=PSC-0]", &path);
+
+    EXPECT_EQ(gnmi_to_xpath(path), "/components/component[name=\"PSC-0\"]");
+}
+
 TEST(GnmiToXpath, RoundTripPreservesKeyValue) {
     const std::string original =
         "/components/component[name=PSC-0]/power-supply/state/output-voltage";
@@ -220,4 +231,25 @@ TEST(GnmiToXpath, RoundTripPreservesKeyValue) {
             EXPECT_EQ(v, path2.elem(i).key().at(k));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// validateOrigin (C1 / D16 single-origin boundary)
+// ---------------------------------------------------------------------------
+
+TEST(ValidateOrigin, EmptyDefaultsToOpenconfig) {
+    // empty origin == the default "openconfig" schema → accepted.
+    EXPECT_TRUE(validateOrigin("").ok());
+}
+
+TEST(ValidateOrigin, OpenconfigAccepted) {
+    // The canonical client (the C1 regression): must NOT be rejected.
+    EXPECT_TRUE(validateOrigin("openconfig").ok());
+}
+
+TEST(ValidateOrigin, OtherOriginUnimplemented) {
+    // A syntactically valid origin naming an unimplemented schema → UNIMPLEMENTED
+    // (not INVALID_ARGUMENT, which is reserved for a malformed path).
+    grpc::Status s = validateOrigin("cli");
+    EXPECT_EQ(s.error_code(), grpc::StatusCode::UNIMPLEMENTED);
 }

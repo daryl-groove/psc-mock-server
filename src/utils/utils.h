@@ -36,9 +36,14 @@ inline int64_t get_time_nanosec()
   return ts.count();
 }
 
-/* gNMI Path → xpath string
+/* gNMI Path → xpath string (structural only — origin is NOT embedded)
  * e.g. {elem:[{name:"components"},{name:"component",key:{name:"PSC-0"}}]}
  *   →  "/components/component[name=\"PSC-0\"]"
+ *
+ * origin is a protocol-boundary concern (D16 single-origin core): it is
+ * validated and stripped by validateOrigin before a path reaches routing, so
+ * this converter must stay origin-agnostic. Baking origin in here made an
+ * origin-bearing path (incl. the canonical "openconfig") miss routing — C1.
  */
 inline std::string gnmi_to_xpath(const gnmi::Path& path)
 {
@@ -47,14 +52,8 @@ inline std::string gnmi_to_xpath(const gnmi::Path& path)
   if (path.elem_size() <= 0)
     return str;
 
-  bool first = true;
   for (auto& node : path.elem()) {
     str += "/";
-    if (first) {
-      first = false;
-      if (!path.origin().empty())
-        str += path.origin() + ":";
-    }
     str += node.name();
     for (auto key : node.key())
       str += "[" + key.first + "=\"" + key.second + "\"]";
@@ -129,6 +128,24 @@ inline bool isPathPrefix(const std::string& prefix, const std::string& path) {
     if (path.size() == prefix.size()) return true;
     const char next = path[prefix.size()];
     return next == '/' || next == '[';
+}
+
+// Validate a gNMI Path.origin at the protocol boundary (D16 single-origin core,
+// backlog C1). The core only knows origin-less paths, so the boundary owns
+// origin policy:
+//   - empty       → the default schema ("openconfig"); accepted, nothing to do.
+//   - "openconfig" → the one implemented schema; accepted.
+//   - any other    → a syntactically valid origin naming a schema we do not
+//                     implement → UNIMPLEMENTED (spec §3.3.4 L1152 / §3.5.2.4
+//                     L1900, finding N). INVALID_ARGUMENT is reserved for a
+//                     malformed Path (validateGnmiPath), checked separately.
+// Origin is stripped for free downstream: gnmi_to_xpath no longer embeds it.
+inline grpc::Status validateOrigin(const std::string& origin) {
+    if (origin.empty() || origin == "openconfig")
+        return grpc::Status::OK;
+    return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                        "unsupported origin (only \"openconfig\" is implemented): "
+                            + origin);
 }
 
 // Returns INVALID_ARGUMENT if the Path has structural issues:

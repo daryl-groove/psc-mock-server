@@ -20,9 +20,12 @@
 using namespace gnmi;
 using namespace std;
 
-// Static model list based on yang/openconfig-platform-psu.yang (v0.2.1)
-// and yang/openconfig-platform.yang
-// Phase 4: populate version from actual YANG file revision metadata.
+// Static model list, keyed to the local yang/ reference files. Versions are
+// YANG revision dates. openconfig-system is served too (the /system config +
+// atomic NTP record, device-modeling-conventions §9) so it is advertised here
+// (backlog C4); its date is the real yang/openconfig-system.yang revision.
+// Phase 4: keep every version synced to its yang revision (the platform entry
+// is an older pinned date pending that sync).
 struct ModelInfo {
     const char* name;
     const char* organization;
@@ -32,6 +35,7 @@ struct ModelInfo {
 static const ModelInfo kSupportedModels[] = {
     { "openconfig-platform",     "OpenConfig working group", "2021-01-18" },
     { "openconfig-platform-psu", "OpenConfig working group", "2018-11-21" },
+    { "openconfig-system",       "OpenConfig working group", "2026-03-31" },
 };
 
 Status GNMIService::Capabilities(ServerContext* context,

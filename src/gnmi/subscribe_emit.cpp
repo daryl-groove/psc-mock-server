@@ -174,6 +174,14 @@ std::vector<Notification> buildChangeNotifications(const gnmid::Backend::View& p
     return out;
 }
 
+void echoTarget(std::vector<Notification>& notes, const std::string& target)
+{
+    if (target.empty()) return;                 // unset → MUST NOT set (§2.2.2.1)
+    for (auto& n : notes)
+        n.mutable_prefix()->set_target(target); // adds to the atomic container
+                                                // prefix too, without disturbing it
+}
+
 bool heartbeatDue(uint64_t intervalNs,
                   std::chrono::high_resolution_clock::time_point last,
                   std::chrono::high_resolution_clock::time_point now)

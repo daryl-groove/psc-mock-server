@@ -44,6 +44,14 @@ std::vector<gnmi::Notification> buildFullNotifications(const gnmid::Backend::Vie
 std::vector<gnmi::Notification> buildChangeNotifications(const gnmid::Backend::View& prev,
                                                         const gnmid::Backend::View& cur);
 
+// Echo the request prefix.target onto every Notification.prefix (C5 / R,
+// §2.2.2.1): target is a property of the request prefix and MUST be reflected on
+// every response Notification (atomic ones included); if the client did not set
+// it (empty), it MUST NOT appear, so this is a no-op then. Only target is
+// stamped — not the path-prefix (updates carry full paths) nor origin (C1
+// strip-only). Applied post-hoc so the builders above stay target-agnostic.
+void echoTarget(std::vector<gnmi::Notification>& notes, const std::string& target);
+
 // True when a heartbeat is due. intervalNs == 0 disables heartbeats.
 bool heartbeatDue(uint64_t intervalNs,
                   std::chrono::high_resolution_clock::time_point last,
