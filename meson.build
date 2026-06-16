@@ -68,6 +68,64 @@ gnmi_proto = custom_target('gnmi_proto',
 )
 
 # ---------------------------------------------------------------------------
+# Compiled proto, shared by the core lib and its tests so the generated .cc are
+# built once rather than per-target. The `sources` headers give every consumer a
+# build-order edge to proto generation (gnmi.pb.h must exist before a TU compiles).
+# ---------------------------------------------------------------------------
+
+proto_lib = static_library('gnmi_pb',
+  [gnmi_proto, gnmi_ext_proto],
+  dependencies : [grpc_dep, proto_dep],
+)
+
+proto_dep_all = declare_dependency(
+  link_with    : proto_lib,
+  sources      : [gnmi_proto[1], gnmi_proto[3], gnmi_ext_proto[1], gnmi_ext_proto[3]],
+  dependencies : [grpc_dep, proto_dep],
+)
+
+# ---------------------------------------------------------------------------
+# gnmid core data layer (src/core) — the new path-keyed leaf store + groups.
+# Replaces the old backend (LeafStore / DataProviderRegistry); the gNMI service
+# is migrated onto it in a following slice.
+# ---------------------------------------------------------------------------
+
+gnmid_core_inc = include_directories('src/core')
+
+gnmid_core_lib = static_library('gnmid_core',
+  [
+    'src/core/canonical_path.cpp',
+    'src/core/notification_group.cpp',
+    'src/core/leaf_registry.cpp',
+  ],
+  dependencies        : [proto_dep_all],
+  include_directories : [gnmid_core_inc],
+)
+
+gnmid_core_dep = declare_dependency(
+  link_with           : gnmid_core_lib,
+  include_directories : [gnmid_core_inc],
+  dependencies        : [proto_dep_all],
+)
+
+# ---------------------------------------------------------------------------
+# Backend — device/schema layer over the core (routing, writability plane,
+# provider wiring). The gNMI service is migrated onto it in a following slice.
+# ---------------------------------------------------------------------------
+
+gnmid_backend_lib = static_library('gnmid_backend',
+  ['src/backend/backend.cpp'],
+  dependencies        : [gnmid_core_dep],
+  include_directories : [include_directories('src')],
+)
+
+gnmid_backend_dep = declare_dependency(
+  link_with           : gnmid_backend_lib,
+  include_directories : [include_directories('src')],
+  dependencies        : [gnmid_core_dep],
+)
+
+# ---------------------------------------------------------------------------
 # Sources
 # ---------------------------------------------------------------------------
 
@@ -79,14 +137,12 @@ sources = [
   'src/gnmi/set.cpp',
   'src/gnmi/subscribe.cpp',
   'src/gnmi/subscribe_emit.cpp',
-  'src/backend/leaf_store.cpp',
   'src/backend/psc_power_sensor_provider.cpp',
   'src/backend/system_config_provider.cpp',
   'src/security/authentication.cpp',
   'src/utils/log.cpp',
-  gnmi_ext_proto,
-  gnmi_proto,
 ]
+# proto, core and Backend (incl. backend.cpp) come through gnmid_backend_dep.
 
 # ---------------------------------------------------------------------------
 # Build target
@@ -99,11 +155,10 @@ executable('psc-mock-server',
     proto_dep,
     boost_dep,
     thread_dep,
+    gnmid_backend_dep,   # Backend + core + compiled proto (headers + symbols)
   ],
   include_directories : [
     include_directories('src'),
-    # Generated proto headers live in the build dir; meson auto-adds that
-    # directory to the include path when custom_target appears in sources.
   ],
   install : false
 )
@@ -114,67 +169,35 @@ executable('psc-mock-server',
 
 gtest_dep = dependency('gtest', main: true)
 
-test_data_provider = executable('test_data_provider',
-  ['tests/test_data_provider.cpp', gnmi_ext_proto, gnmi_proto],
-  dependencies : [proto_dep, grpc_dep, thread_dep, gtest_dep],
-  include_directories : [include_directories('src')],
-)
-
-test_psc_provider = executable('test_psc_provider',
-  ['tests/test_psc_provider.cpp',
-   'src/backend/leaf_store.cpp',
-   'src/backend/psc_power_sensor_provider.cpp',
-   gnmi_ext_proto, gnmi_proto],
-  dependencies : [proto_dep, grpc_dep, thread_dep, boost_dep, gtest_dep],
-  include_directories : [include_directories('src')],
-)
-
-test_leaf_store = executable('test_leaf_store',
-  ['tests/test_leaf_store.cpp',
-   'src/backend/leaf_store.cpp',
-   gnmi_ext_proto, gnmi_proto],
-  dependencies : [proto_dep, grpc_dep, thread_dep, gtest_dep],
-  include_directories : [include_directories('src')],
-)
-
 test_utils = executable('test_utils',
   ['tests/test_utils.cpp', gnmi_ext_proto, gnmi_proto],
   dependencies : [proto_dep, grpc_dep, thread_dep, gtest_dep],
   include_directories : [include_directories('src')],
 )
+test('utils', test_utils)
 
-test_subscribe_emit = executable('test_subscribe_emit',
-  ['tests/test_subscribe_emit.cpp',
-   'src/gnmi/subscribe_emit.cpp',
-   'src/backend/leaf_store.cpp',
-   gnmi_ext_proto, gnmi_proto],
-  dependencies : [proto_dep, grpc_dep, thread_dep, gtest_dep],
+# ---------------------------------------------------------------------------
+# Core (src/core) unit tests
+# ---------------------------------------------------------------------------
+
+foreach t : [
+    'canonical_path',
+    'notification_group',
+    'leaf_registry_registration',
+    'leaf_registry_values',
+    'leaf_registry_structural',
+    'integration_scenario',
+  ]
+  exe = executable('test_core_' + t,
+    ['tests/core/test_' + t + '.cpp'],
+    dependencies : [gnmid_core_dep, gtest_dep, thread_dep],
+  )
+  test('core_' + t, exe)
+endforeach
+
+test_backend = executable('test_backend',
+  ['tests/test_backend.cpp'],
+  dependencies        : [gnmid_backend_dep, gtest_dep, thread_dep],
   include_directories : [include_directories('src')],
 )
-
-test_system_config = executable('test_system_config',
-  ['tests/test_system_config_provider.cpp',
-   'src/backend/leaf_store.cpp',
-   'src/backend/system_config_provider.cpp',
-   gnmi_ext_proto, gnmi_proto],
-  dependencies : [proto_dep, grpc_dep, thread_dep, gtest_dep],
-  include_directories : [include_directories('src')],
-)
-
-test_get = executable('test_get',
-  ['tests/test_get.cpp',
-   'src/gnmi/get.cpp',
-   'src/gnmi/subscribe_emit.cpp',
-   'src/backend/leaf_store.cpp',
-   gnmi_ext_proto, gnmi_proto],
-  dependencies : [proto_dep, grpc_dep, thread_dep, boost_dep, gtest_dep],
-  include_directories : [include_directories('src')],
-)
-
-test('data_provider',   test_data_provider)
-test('get',             test_get)
-test('psc_provider',    test_psc_provider)
-test('leaf_store',      test_leaf_store)
-test('utils',           test_utils)
-test('subscribe_emit',  test_subscribe_emit)
-test('system_config',   test_system_config)
+test('backend', test_backend)

@@ -17,8 +17,10 @@
 #ifndef _GNMI_SERVER_H
 #define _GNMI_SERVER_H
 
+#include <iostream>
+
 #include <gnmi.grpc.pb.h>
-#include "backend/data_provider.hpp"
+#include "backend/backend.hpp"
 
 using namespace grpc;
 using namespace gnmi;
@@ -27,10 +29,9 @@ using google::protobuf::RepeatedPtrField;
 class GNMIService final : public gNMI::Service
 {
   public:
-    // Providers are registered in main.cpp and injected here.
-    // GNMIService is unaware of specific provider types.
-    explicit GNMIService(DataProviderRegistry registry)
-        : registry_(std::move(registry)) {}
+    // The Backend (data + schema layer) is owned by the caller (main) and injected
+    // by reference. GNMIService is unaware of specific provider types.
+    explicit GNMIService(gnmid::Backend& backend) : backend_(backend) {}
 
     ~GNMIService() { std::cout << "Quitting GNMI Server" << std::endl; }
 
@@ -47,7 +48,7 @@ class GNMIService final : public gNMI::Service
         ServerReaderWriter<SubscribeResponse, SubscribeRequest>* stream);
 
   private:
-    DataProviderRegistry registry_;
+    gnmid::Backend& backend_;
 };
 
-#endif //_GNMI_SERVER_H
+#endif  // _GNMI_SERVER_H

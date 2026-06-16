@@ -20,7 +20,7 @@
 #include <vector>
 
 #include <gnmi.grpc.pb.h>
-#include "backend/data_provider.hpp"
+#include "backend/backend.hpp"
 
 using namespace gnmi;
 using grpc::Status;
@@ -31,7 +31,7 @@ namespace impl {
 
 class Get {
   public:
-    explicit Get(DataProviderRegistry& registry) : registry_(registry) {}
+    explicit Get(gnmid::Backend& be) : be_(be) {}
     ~Get() = default;
 
     Status run(const GetRequest* req, GetResponse* response);
@@ -46,9 +46,9 @@ class Get {
                                  GetRequest::DataType type);
 
   private:
-    DataProviderRegistry& registry_;
+    gnmid::Backend& be_;
 };
 
-} // namespace impl
+}  // namespace impl
 
-#endif //_GNMI_GET_H
+#endif  // _GNMI_GET_H

@@ -1,6 +1,11 @@
-#include "system_config_provider.hpp"
+#include "backend/system_config_provider.hpp"
 
 #include <string>
+
+#include "backend/backend.hpp"
+#include "backend/gnmi_value.hpp"
+
+namespace gnmid {
 
 namespace {
 
@@ -12,72 +17,37 @@ struct ConfigLeaf {
 };
 
 const ConfigLeaf DEFAULTS[] = {
-    { "/system/config/hostname",     "psc-mock"       },
-    { "/system/config/login-banner", ""               },
-    { "/system/config/motd-banner",  "ORv3 PSC mock"  },
+    { "/system/config/hostname",     "psc-mock"      },
+    { "/system/config/login-banner", ""              },
+    { "/system/config/motd-banner",  "ORv3 PSC mock" },
 };
 
-// A config leaf the schema declares but does NOT seed: writable and typed Config,
-// yet absent until a client Sets it (the schema outlives any value). Demonstrates
-// "create a declared-but-unset config leaf"; an UNdeclared path stays non-writable.
+// A config leaf the schema declares but does NOT seed: writable + typed Config,
+// yet absent until a client Sets it (the schema outlives any value).
 const char* TIMEZONE_NAME = "/system/config/timezone-name";
 
-// An NTP server record is an atomic container: address (key), port, version,
-// iburst, association-type form one logical record delivered together.
-const char* NTP_CONFIG =
-    "/system/ntp/servers/server[address=10.0.0.1]/config";
+// An NTP server record: address (key), port, version, iburst, association-type
+// form one logical atomic record delivered together.
+const std::string NTP = "/system/ntp/servers/server[address=10.0.0.1]/config";
 
-} // namespace
+}  // namespace
 
-std::vector<StoreBackedProvider::DeclaredLeaf>
-SystemConfigProvider::declareLeaves() const {
-    const int64_t now = get_time_nanosec();
-    std::vector<DeclaredLeaf> decls;
+SystemConfigProvider::SystemConfigProvider(Backend& be) : Provider(be) {
+    using core::LeafType;
 
     for (const auto& c : DEFAULTS)
-        decls.push_back(DeclaredLeaf{ c.path, LeafType::Config,
-                                      typedValue(c.value), now });
+        be_.declareLeaf(c.path, LeafType::Config, typedValue(std::string(c.value)));
 
-    decls.push_back(DeclaredLeaf{ TIMEZONE_NAME, LeafType::Config,
-                                  std::nullopt, now });
+    be_.declareLeaf(TIMEZONE_NAME, LeafType::Config);   // declared, unset
 
-    // The NTP record — mixed-value leaves under one atomic container, all Config.
-    const std::string ntp = NTP_CONFIG;
-    decls.push_back(DeclaredLeaf{ ntp + "/address", LeafType::Config,
-                                  typedValue("10.0.0.1"), now });
-    decls.push_back(DeclaredLeaf{ ntp + "/port", LeafType::Config,
-                                  typedValue(uint64_t{123}), now });
-    decls.push_back(DeclaredLeaf{ ntp + "/version", LeafType::Config,
-                                  typedValue(uint64_t{4}), now });
-    decls.push_back(DeclaredLeaf{ ntp + "/iburst", LeafType::Config,
-                                  typedValue(true), now });
-    decls.push_back(DeclaredLeaf{ ntp + "/association-type", LeafType::Config,
-                                  typedValue("SERVER"), now });
-    return decls;
+    // The NTP record — an atomic group declared BEFORE its leaves so they
+    // auto-assign to it (D3). Mixed-value leaves, all Config.
+    be_.declareGroup("ntp:10.0.0.1", NTP, /*atomic=*/true);
+    be_.declareLeaf(NTP + "/address",          LeafType::Config, typedValue(std::string("10.0.0.1")));
+    be_.declareLeaf(NTP + "/port",             LeafType::Config, typedValue(uint64_t{123}));
+    be_.declareLeaf(NTP + "/version",          LeafType::Config, typedValue(uint64_t{4}));
+    be_.declareLeaf(NTP + "/iburst",           LeafType::Config, typedValue(true));
+    be_.declareLeaf(NTP + "/association-type", LeafType::Config, typedValue(std::string("SERVER")));
 }
 
-SystemConfigProvider::SystemConfigProvider() {
-    initLeaves();
-}
-
-bool SystemConfigProvider::applyBatch(const WriteBatch& batch) {
-    // Registry routed these to us and Set validated each path as writable.
-    commitStamped(batch);
-    return true;
-}
-
-std::optional<std::string>
-SystemConfigProvider::atomicPrefix(const std::string& xpath) const {
-    const std::string p = stripPathQuotes(xpath);
-    static const std::string root = "/system/ntp/servers/server[";
-    if (p.compare(0, root.size(), root) != 0) return std::nullopt;
-
-    // The atomic boundary is the server entry's `.../config` container.
-    static const std::string marker = "/config";
-    if (size_t c = p.find(marker + "/"); c != std::string::npos)
-        return p.substr(0, c + marker.size());          // ".../config/<leaf>"
-    if (p.size() >= marker.size() &&
-        p.compare(p.size() - marker.size(), marker.size(), marker) == 0)
-        return p;                                        // the container itself
-    return std::nullopt;
-}
+}  // namespace gnmid

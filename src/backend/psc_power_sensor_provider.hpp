@@ -1,37 +1,46 @@
 /*
- * PscPowerSensorProvider — IDataProvider implementation for PSC power sensors.
+ * PscPowerSensorProvider — mock PSC power-sensor source.
  *
- * handles paths under:
- *   /components/component[name=PSC-x]/state/temperature/...
- *   /components/component[name=PSC-x]/power-supply/state/...
- *
- * A StoreBackedProvider: the base owns the store and serves reads; this subclass
- * only declares its (all-Operational) sensor leaves and runs a background jthread
- * that drifts the values on a quantized random walk. Real hardware: replace the
- * simulator with register reads that commit through the same path.
- *
- * Modeled after impl/gnmi-grpc/src/gnmi_collector.cpp:StatConnector.
+ * Owns /components/component[name=PSC-x]/... sensor leaves (all Operational). It
+ * declares them into the shared registry (through the Backend) at construction,
+ * then runs a background jthread that drifts the values on a quantized random
+ * walk and pushes them via the Backend's registry — the push-bridge model
+ * (device-modelling-conventions §8.3). Real hardware: replace the simulator with
+ * register reads that push through the same ValueWriter.
  */
 
 #pragma once
 
-#include "store_backed_provider.hpp"
-
+#include <string>
 #include <thread>
 #include <vector>
 
-class PscPowerSensorProvider final : public StoreBackedProvider {
+#include "backend/provider.hpp"
+#include "leaf_id.hpp"
+
+namespace gnmid {
+
+class PscPowerSensorProvider final : public Provider {
 public:
-    PscPowerSensorProvider();
-    ~PscPowerSensorProvider() override = default;  // sim_ jthread auto-stops + joins
+    explicit PscPowerSensorProvider(Backend& be);
+    ~PscPowerSensorProvider() override = default;   // sim_ jthread auto-stops + joins
 
-    // All PSC sensor leaves are continuous measured values — SAMPLE (the default)
-    // is correct, so nothing else is overridden.
-
-protected:
-    // Sensor leaves, all Operational, starting at their nominal walk values.
-    std::vector<DeclaredLeaf> declareLeaves() const override;
+    std::string domainPrefix() const override { return "/components/component"; }
+    void        start() override;                   // launches the simulator
 
 private:
-    std::jthread sim_;   // declared last: started only after store_ is seeded
+    // Per-leaf walk state: the leaf's id (for ValueWriter), current value, grid
+    // STEP (0 = static), and the lo/hi bounds (nominal ± maxDev).
+    struct Walk {
+        core::LeafId id;
+        double       value;
+        double       step;
+        double       lo;
+        double       hi;
+    };
+
+    std::vector<Walk> walks_;
+    std::jthread      sim_;   // started by start(), after leaves are declared
 };
+
+}  // namespace gnmid

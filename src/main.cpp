@@ -23,6 +23,7 @@
 #include <grpcpp/server_builder.h>
 
 #include "gnmi/gnmi.h"
+#include "backend/backend.hpp"
 #include "backend/psc_power_sensor_provider.hpp"
 #include "backend/system_config_provider.hpp"
 #include <security/authentication.h>
@@ -33,16 +34,14 @@ using namespace std;
 void RunServer(const std::string& bind_addr,
                std::shared_ptr<grpc::ServerCredentials> cred)
 {
-  // Build registry and register providers.
-  // To add a new data domain: addProvider() another IDataProvider here.
-  DataProviderRegistry registry;
-  registry.addProvider("/components/component",
-                       std::make_unique<PscPowerSensorProvider>());
-  registry.addProvider("/system",
-                       std::make_unique<SystemConfigProvider>());
+  // Build the Backend (data + schema layer over the core registry) and register
+  // providers. To add a new data domain: addProvider() another Provider here.
+  gnmid::Backend backend;
+  backend.addProvider(std::make_unique<gnmid::PscPowerSensorProvider>(backend));
+  backend.addProvider(std::make_unique<gnmid::SystemConfigProvider>(backend));
 
   ServerBuilder builder;
-  GNMIService gnmi(std::move(registry));
+  GNMIService gnmi(backend);
 
   builder.AddListeningPort(bind_addr, cred);
   builder.RegisterService(&gnmi);

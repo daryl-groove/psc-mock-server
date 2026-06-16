@@ -1,30 +1,19 @@
-/*
- * PscPowerSensorProvider — mock PSC power sensor data generator.
- *
- * Units per yang/openconfig-platform-psu.yang:
- *   volts / amps / watts  (NOT mV/mA/mW)
- *
- * Values drift on a quantized random walk around realistic ORv3 PSC operating
- * points: each tick a leaf either holds its value or steps by one grid unit.
- * Holding is what gives ON_CHANGE something to suppress. Replace the simulator
- * with real hardware register reads when targeting actual hardware.
- *
- * All simulation state (RNG, walk table, sleep primitives) is local to the
- * background thread — the provider itself holds only the store (in the base) and
- * the jthread.
- */
-
-#include "psc_power_sensor_provider.hpp"
+#include "backend/psc_power_sensor_provider.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
-#include <functional>
 #include <mutex>
 #include <random>
 #include <stop_token>
 #include <string>
 #include <vector>
+
+#include "backend/backend.hpp"      // brings gnmi.pb.h before utils.h (which needs gnmi::)
+#include "backend/gnmi_value.hpp"
+#include <utils/utils.h>            // get_time_nanosec
+
+namespace gnmid {
 
 namespace {
 
@@ -40,7 +29,7 @@ struct SensorDef {
     double      maxDev;
 };
 
-// Units and bounds per openconfig-platform-psu.yang.
+// Units and bounds per openconfig-platform-psu.yang (volts/amps/watts).
 const SensorDef SENSORS[] = {
     { "/state/temperature/instant",         45.0, 0.5, 0.05 },  // celsius
     { "/power-supply/state/input-voltage",  54.0, 0.1, 0.02 },  // volts (54V bus)
@@ -54,80 +43,51 @@ const SensorDef SENSORS[] = {
 constexpr double STEP_PROBABILITY = 0.3;   // chance a leaf moves per tick
 constexpr auto   UPDATE_INTERVAL  = std::chrono::seconds(1);
 
-// Per-leaf walk state. lo/hi bound the value to nominal ± maxDev.
-struct Walk {
-    std::string path;
-    double      value;
-    double      step;
-    double      lo;
-    double      hi;
-};
-
 std::string leafPath(const std::string& unit, const char* suffix) {
     return "/components/component[name=" + unit + "]" + suffix;
 }
 
-// The full leaf set, each walk starting at its nominal value. Single source of
-// truth: used both to declare/seed the store and to drive the simulator.
-std::vector<Walk> buildWalks() {
-    std::vector<Walk> walks;
+}  // namespace
+
+PscPowerSensorProvider::PscPowerSensorProvider(Backend& be) : Provider(be) {
+    // Declare + seed every sensor leaf synchronously, so a Get/Subscribe arriving
+    // before the first simulator tick finds data. declareLeaf returns the id the
+    // simulator pushes through.
     for (const auto& unit : PSC_UNITS)
-        for (const auto& s : SENSORS)
-            walks.push_back(Walk{ leafPath(unit, s.suffix), s.nominal, s.step,
-                                  s.nominal * (1.0 - s.maxDev),
-                                  s.nominal * (1.0 + s.maxDev) });
-    return walks;
-}
-
-// Background driver. Each tick stamps all leaves with one collection timestamp
-// (keeps bundling honest, §3.5.2.1) and commits them through `commit`, which
-// stamps each leaf's type from the schema (Operational here). mu/cv exist only to
-// back the interruptible wait; they guard no shared state.
-void runSimulator(const std::function<void(const WriteBatch&)>& commit,
-                  std::vector<Walk> walks, std::stop_token stop) {
-    std::mt19937 rng(std::random_device{}());
-    std::bernoulli_distribution stepNow(STEP_PROBABILITY);
-    std::bernoulli_distribution stepUp(0.5);
-
-    std::mutex mu;
-    std::condition_variable_any cv;
-    std::unique_lock lock(mu);
-    do {
-        const int64_t now = get_time_nanosec();
-        WriteBatch tick;
-        for (auto& w : walks) {
-            if (w.step > 0.0 && stepNow(rng)) {
-                w.value += stepUp(rng) ? w.step : -w.step;
-                w.value = std::clamp(w.value, w.lo, w.hi);
-            }
-            tick.set(w.path, w.value, now);
+        for (const auto& s : SENSORS) {
+            core::LeafId id = be_.declareLeaf(leafPath(unit, s.suffix),
+                                              core::LeafType::Operational,
+                                              typedValue(s.nominal));
+            walks_.push_back(Walk{ id, s.nominal, s.step,
+                                   s.nominal * (1.0 - s.maxDev),
+                                   s.nominal * (1.0 + s.maxDev) });
         }
-        // One commit per tick: all leaves share a collection time and become
-        // visible together, so a reader never straddles two ticks.
-        commit(tick);
-    } while (!cv.wait_for(lock, stop, UPDATE_INTERVAL,
-                          [&] { return stop.stop_requested(); }));
 }
 
-} // namespace
-
-std::vector<StoreBackedProvider::DeclaredLeaf>
-PscPowerSensorProvider::declareLeaves() const {
-    const int64_t now = get_time_nanosec();
-    std::vector<DeclaredLeaf> decls;
-    for (const auto& w : buildWalks())
-        decls.push_back(DeclaredLeaf{ w.path, LeafType::Operational,
-                                      typedValue(w.value), now });
-    return decls;
-}
-
-PscPowerSensorProvider::PscPowerSensorProvider() {
-    // Seed synchronously so a Get/Subscribe arriving before the first simulator
-    // tick finds data; this also builds schema_ that the sim's commits stamp from.
-    initLeaves();
-
+void PscPowerSensorProvider::start() {
     sim_ = std::jthread([this](std::stop_token stop) {
-        runSimulator([this](const WriteBatch& b) { commitStamped(b); },
-                     buildWalks(), stop);
+        std::mt19937 rng(std::random_device{}());
+        std::bernoulli_distribution stepNow(STEP_PROBABILITY);
+        std::bernoulli_distribution stepUp(0.5);
+
+        std::mutex mu;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mu);
+        do {
+            const int64_t now = get_time_nanosec();
+            // One ValueWriter scope per tick: all leaves share a collection time
+            // and become visible together, so a reader never straddles two ticks.
+            core::ValueWriter w = be_.registry().writeValues();
+            for (auto& wk : walks_) {
+                if (wk.step > 0.0 && stepNow(rng)) {
+                    wk.value += stepUp(rng) ? wk.step : -wk.step;
+                    wk.value = std::clamp(wk.value, wk.lo, wk.hi);
+                }
+                w.set(wk.id, typedValue(wk.value), now);
+            }
+        } while (!cv.wait_for(lock, stop, UPDATE_INTERVAL,
+                              [&] { return stop.stop_requested(); }));
     });
 }
+
+}  // namespace gnmid

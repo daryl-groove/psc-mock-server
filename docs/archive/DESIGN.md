@@ -1,3 +1,10 @@
+> **ARCHIVED 2026-06-16 — historical.** This documents the *pre-integration* server
+> (old `LeafStore` / `DataProviderRegistry` / `IDataProvider` backend, since deleted).
+> Its still-valid content was folded into the current docs: overview/architecture/
+> build → `docs/README.md`; exposed PSC paths → `docs/device-modeling-conventions.md`
+> §9; RPC status codes → `docs/protocol-layer-design.md`; deferred items →
+> `docs/backlog.md`. Kept only for history.
+
 # psc-mock-server — Design Document
 
 A gNMI server that acts as a PSC (Power Supply Controller) card in an ORv3 system,

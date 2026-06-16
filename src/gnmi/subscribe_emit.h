@@ -1,8 +1,9 @@
 /*
- * subscribe_emit — pure helpers for turning the provider read model into gNMI
- * Notifications, factored out of subscribe.cpp's handleStream loop so the
- * ON_CHANGE semantics (diff → update/delete, heartbeat, collection timestamp,
- * TARGET_DEFINED resolution) are unit-testable without a gRPC stream or timing.
+ * subscribe_emit — pure helpers for turning the Backend read model (a snapshot
+ * View = leaf values + owning groups) into gNMI Notifications, factored out of
+ * subscribe.cpp's loop so the ON_CHANGE semantics (diff → update/delete,
+ * heartbeat, collection timestamp, TARGET_DEFINED resolution, atomic bundling)
+ * are unit-testable without a gRPC stream or timing.
  */
 
 #ifndef _GNMI_SUBSCRIBE_EMIT_H
@@ -11,47 +12,37 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gnmi.grpc.pb.h>
 
-#include "backend/data_provider.hpp"   // Snapshot, DataProviderRegistry
-#include "backend/leaf_store.hpp"      // LeafStore::Diff
+#include "backend/backend.hpp"
 
 namespace impl {
 
-// Append every snapshot leaf as an Update; return the newest collection time
-// seen (0 if empty). That time becomes Notification.timestamp — it MUST be the
-// collection time, not the emission time (spec §3.5.2.3).
-int64_t emitSnapshot(const Snapshot& snap,
-                     google::protobuf::RepeatedPtrField<gnmi::Update>* list);
+// Change between two leaf snapshots, by changeSeq (D14): a leaf whose changeSeq
+// differs (or is newly present) is `updated`; one present before and gone now is
+// `removed` → a Notification.delete (spec §3.5.2.3).
+struct LeafDiff {
+    std::vector<std::pair<std::string, gnmid::core::LeafValueSnapshot>> updated;
+    std::vector<std::string>                                           removed;
+};
+LeafDiff diffLeaves(const gnmid::core::LeafSnapshot& prev,
+                    const gnmid::core::LeafSnapshot& cur);
 
-// Emit an ON_CHANGE diff into a Notification: changed/added leaves as Updates,
-// removed paths as Notification.delete (spec §3.5.2.3). Returns the newest
-// collection time among the updated leaves (0 if none).
-int64_t emitDiff(const LeafStore::Diff& diff, gnmi::Notification* notification);
+// Partition a full View into Notifications: one atomic Notification per atomic
+// group present (atomic=true, relativised, spec §2.1.1), plus one non-atomic
+// Notification for the rest. Each carries its freshest-leaf timestamp. Used for
+// the initial emit, ONCE, POLL, and the ON_CHANGE heartbeat (full re-send).
+std::vector<gnmi::Notification> buildFullNotifications(const gnmid::Backend::View& view);
 
-// Emit a snapshot as a single ATOMIC notification (spec §2.1.1): sets
-// Notification.prefix to the atomic container, relativises every leaf path
-// against it (so prefix ++ path == the leaf), and sets atomic=true. Returns the
-// newest collection time (0 if empty); the caller stamps the timestamp.
-int64_t emitAtomic(const Snapshot& snap, const std::string& atomicPrefix,
-                   gnmi::Notification* notification);
-
-// Partition a full snapshot into Notifications: one atomic Notification per
-// atomic container present (atomic=true, relativised), plus one non-atomic
-// Notification for the rest. Each carries its own freshest-leaf timestamp. Used
-// for the initial emit, ONCE, POLL, and the ON_CHANGE heartbeat (full re-send).
-std::vector<gnmi::Notification> buildFullNotifications(
-    const Snapshot& snap, const DataProviderRegistry& registry);
-
-// ON_CHANGE per poll: produce only the Notifications that represent a change.
-// Non-atomic leaves emit a diff (updates + deletes); an atomic container that
-// changed at all re-sends its COMPLETE current state (omitted leaves implicitly
-// deleted, spec §2.1.1), and a container that became empty emits a prefix delete.
-std::vector<gnmi::Notification> buildChangeNotifications(
-    const Snapshot& prev, const Snapshot& cur,
-    const DataProviderRegistry& registry);
+// ON_CHANGE per poll: only the Notifications representing a change. Non-atomic
+// leaves emit a diff (updates + deletes); an atomic group that changed at all
+// re-sends its COMPLETE current state (omitted leaves implicitly deleted), and a
+// group that became empty emits a prefix delete.
+std::vector<gnmi::Notification> buildChangeNotifications(const gnmid::Backend::View& prev,
+                                                        const gnmid::Backend::View& cur);
 
 // True when a heartbeat is due. intervalNs == 0 disables heartbeats.
 bool heartbeatDue(uint64_t intervalNs,
@@ -59,10 +50,10 @@ bool heartbeatDue(uint64_t intervalNs,
                   std::chrono::high_resolution_clock::time_point now);
 
 // Resolve a subscription's effective stream mode, expanding TARGET_DEFINED via
-// the owning provider (default SAMPLE). Returns SAMPLE or ON_CHANGE.
+// the Backend (schema-derived, P5). Returns SAMPLE or ON_CHANGE.
 gnmi::SubscriptionMode resolveStreamMode(const gnmi::Subscription& sub,
-                                         const DataProviderRegistry& registry);
+                                         const gnmid::Backend& be);
 
-} // namespace impl
+}  // namespace impl
 
-#endif // _GNMI_SUBSCRIBE_EMIT_H
+#endif  // _GNMI_SUBSCRIBE_EMIT_H

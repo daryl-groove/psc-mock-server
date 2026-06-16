@@ -18,7 +18,7 @@
 #define _GNMI_SET_H
 
 #include <gnmi.grpc.pb.h>
-#include "backend/data_provider.hpp"
+#include "backend/backend.hpp"
 
 using namespace gnmi;
 using grpc::Status;
@@ -28,19 +28,18 @@ namespace impl {
 
 class Set {
   public:
-    // The registry is the write target: validated paths are applied to the
-    // owning provider's store, which the Subscribe poll+diff loop turns into
-    // ON_CHANGE notifications. Writable providers (config true) accept writes;
-    // read-only ones refuse them.
-    explicit Set(DataProviderRegistry& registry) : registry_(registry) {}
+    // The Backend is the write target: validated paths are applied to the shared
+    // registry, which the Subscribe poll+diff loop turns into ON_CHANGE
+    // notifications. Config paths are writable; read-only state is refused.
+    explicit Set(gnmid::Backend& be) : be_(be) {}
     ~Set() = default;
 
     Status run(const SetRequest* request, SetResponse* response);
 
   private:
-    DataProviderRegistry& registry_;
+    gnmid::Backend& be_;
 };
 
-} // namespace impl
+}  // namespace impl
 
-#endif //_GNMI_SET_H
+#endif  // _GNMI_SET_H

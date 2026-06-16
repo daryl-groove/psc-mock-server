@@ -58,7 +58,7 @@ difference."
 
 ### 1.2 What the spec actually mandates
 
-Source: `spec/reference/rpc/gnmi/gnmi-specification.md`.
+Source: `docs/spec/gnmi-specification.md`.
 
 §3.5.1.5.2 (STREAM / ON_CHANGE):
 > data updates are **only sent when the value of the data item changes**. ... the

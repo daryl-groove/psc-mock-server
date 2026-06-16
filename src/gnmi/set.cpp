@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#include <string>
+#include <vector>
+
 #include "set.h"
 #include <utils/utils.h>
 #include <utils/log.h>
@@ -28,26 +31,24 @@ namespace {
 // Per §3.4.7: an update/replace to a path not in the supported schema is
 // NOT_FOUND; a path that exists but is read-only (state, not config true) cannot
 // be modified, which we report as INVALID_ARGUMENT.
-Status checkWritable(const DataProviderRegistry& registry, const string& xpath)
+Status checkWritable(const gnmid::Backend& be, const string& xpath)
 {
-  WriteResult wr = registry.writable(xpath);
-  if (!wr.routed)
+  if (!be.routed(xpath))
     return Status(StatusCode::NOT_FOUND, "path not found: " + xpath);
-  if (!wr.applied)
+  if (!be.writable(xpath))
     return Status(StatusCode::INVALID_ARGUMENT, "path is read-only: " + xpath);
   return Status::OK;
 }
 
 // Structural + writability validation for one update/replace operation.
-Status validateWrite(const DataProviderRegistry& registry, const Update& upd,
-                     const string& prefix)
+Status validateWrite(const gnmid::Backend& be, const Update& upd, const string& prefix)
 {
   if (!upd.has_path() || !upd.has_val())
     return Status(StatusCode::INVALID_ARGUMENT, "update missing path or value");
-  return checkWritable(registry, prefix + gnmi_to_xpath(upd.path()));
+  return checkWritable(be, prefix + gnmi_to_xpath(upd.path()));
 }
 
-} // namespace
+}  // namespace
 
 // Set is a transaction (§3.4.3): validate every operation first and apply none
 // if any fails, so the store is never left half-mutated. With every path proven
@@ -59,8 +60,8 @@ Status Set::run(const SetRequest* request, SetResponse* response)
     return Status(StatusCode::UNIMPLEMENTED, "Extensions not implemented");
   }
 
-  // One transaction timestamp: response stamp and every applied leaf's
-  // collection time share it, so a Set surfaces as one coherent ON_CHANGE tick.
+  // One transaction timestamp: response stamp and every applied leaf's collection
+  // time share it, so a Set surfaces as one coherent ON_CHANGE tick.
   const int64_t now = get_time_nanosec();
   response->set_timestamp(now);
 
@@ -72,49 +73,47 @@ Status Set::run(const SetRequest* request, SetResponse* response)
 
   // ---- Phase 1: validate in spec order (delete, replace, update); mutate nothing.
   for (const auto& delpath : request->delete_()) {
-    Status s = checkWritable(registry_, prefix + gnmi_to_xpath(delpath));
+    Status s = checkWritable(be_, prefix + gnmi_to_xpath(delpath));
     if (!s.ok()) return s;
   }
   for (const auto& upd : request->replace()) {
-    Status s = validateWrite(registry_, upd, prefix);
+    Status s = validateWrite(be_, upd, prefix);
     if (!s.ok()) return s;
   }
   for (const auto& upd : request->update()) {
-    Status s = validateWrite(registry_, upd, prefix);
+    Status s = validateWrite(be_, upd, prefix);
     if (!s.ok()) return s;
   }
 
-  // ---- Phase 2: apply. Validation passed, so this cannot fail.
-  // Collect every op into one WriteBatch in spec order (delete -> replace ->
-  // update) and commit it once: all leaves of a multi-leaf Set land under a
-  // single store lock, so a concurrent Subscribe poll never observes an atomic
-  // container half-written (the write-side counterpart of Notification.atomic).
-  // Deleting a nonexistent in-schema leaf is silently accepted (§3.4.6). We
-  // treat replace as update — flat scalar leaves have no subtree to prune, so
-  // there are no omitted siblings to revert. The UpdateResult responses mirror
-  // the request and are independent of apply, which validation has guaranteed.
-  WriteBatch batch;
+  // ---- Phase 2: apply. Validation passed, so this cannot fail. Collect every op
+  // into one transaction in spec order (delete -> replace -> update) and commit it
+  // once: all value writes land in a single ValueWriter scope, so a concurrent
+  // Subscribe poll never observes an atomic container half-written. Deleting a
+  // nonexistent in-schema leaf is silently accepted (§3.4.6). We treat replace as
+  // update — flat scalar leaves have no subtree to prune. The UpdateResult
+  // responses mirror the request and are independent of apply.
+  std::vector<gnmid::SetOp> ops;
   for (const auto& delpath : request->delete_()) {
-    batch.remove(prefix + gnmi_to_xpath(delpath));
+    ops.push_back({ gnmid::SetOp::Kind::Delete, prefix + gnmi_to_xpath(delpath), {}, 0 });
     UpdateResult* res = response->add_response();
     *(res->mutable_path()) = delpath;
     res->set_op(gnmi::UpdateResult::DELETE);
   }
   for (const auto& upd : request->replace()) {
-    batch.set(prefix + gnmi_to_xpath(upd.path()), upd.val(), now);
+    ops.push_back({ gnmid::SetOp::Kind::Update, prefix + gnmi_to_xpath(upd.path()), upd.val(), now });
     UpdateResult* res = response->add_response();
     res->mutable_path()->CopyFrom(upd.path());
     res->set_op(gnmi::UpdateResult::REPLACE);
   }
   for (const auto& upd : request->update()) {
-    batch.set(prefix + gnmi_to_xpath(upd.path()), upd.val(), now);
+    ops.push_back({ gnmid::SetOp::Kind::Update, prefix + gnmi_to_xpath(upd.path()), upd.val(), now });
     UpdateResult* res = response->add_response();
     res->mutable_path()->CopyFrom(upd.path());
     res->set_op(gnmi::UpdateResult::UPDATE);
   }
-  registry_.commit(batch);
+  be_.commit(ops);
 
   return Status::OK;
 }
 
-} // namespace impl
+}  // namespace impl

@@ -23,7 +23,7 @@ Status GNMIService::Set(ServerContext* context, const SetRequest* request,
                         SetResponse* response)
 {
   (void)context;
-  ::impl::Set rpc(registry_);
+  ::impl::Set rpc(backend_);
   return rpc.run(request, response);
 }
 
@@ -31,13 +31,13 @@ Status GNMIService::Get(ServerContext* context, const GetRequest* request,
                         GetResponse* response)
 {
   (void)context;
-  ::impl::Get rpc(registry_);
+  ::impl::Get rpc(backend_);
   return rpc.run(request, response);
 }
 
 Status GNMIService::Subscribe(ServerContext* context,
                  ServerReaderWriter<SubscribeResponse, SubscribeRequest>* stream)
 {
-  ::impl::Subscribe rpc(registry_);
+  ::impl::Subscribe rpc(backend_);
   return rpc.run(context, stream);
 }

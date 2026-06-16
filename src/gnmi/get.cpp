@@ -23,14 +23,13 @@
 
 using namespace std;
 using google::protobuf::RepeatedPtrField;
+using gnmid::core::LeafType;
 
 namespace impl {
 
 // gNMI DataType filter (spec §3.3.4, GetRequest.type). The spec treats CONFIG/
 // STATE/OPERATIONAL as a disjoint partition annotated per leaf in the schema, so
-// each leaf carries exactly one LeafType — stamped by its provider when produced.
-// Atomic containers are homogeneous (a `.../config` container is wholly Config),
-// so leaf-level filtering can never tear one.
+// each leaf carries exactly one LeafType — its effectiveType in the registry.
 static bool matchesType(LeafType leaf, GetRequest::DataType requested)
 {
   switch (requested) {
@@ -41,12 +40,12 @@ static bool matchesType(LeafType leaf, GetRequest::DataType requested)
   }
 }
 
-static void filterByDataType(Snapshot& snap, GetRequest::DataType type)
+static void filterByDataType(gnmid::Backend::View& view, GetRequest::DataType type)
 {
   if (type == GetRequest::ALL) return;
-  for (auto it = snap.begin(); it != snap.end(); ) {
-    if (matchesType(it->second.type, type)) ++it;
-    else                                     it = snap.erase(it);
+  for (auto it = view.leaves.begin(); it != view.leaves.end(); ) {
+    if (matchesType(it->second.effectiveType, type)) ++it;
+    else                                             it = view.leaves.erase(it);
   }
 }
 
@@ -70,19 +69,19 @@ Get::buildGetNotifications(RepeatedPtrField<Notification>* out,
   fullpath += gnmi_to_xpath(path);
   BOOST_LOG_TRIVIAL(debug) << "GetRequest Path " << fullpath;
 
-  SnapResult res = registry_.snapshot(fullpath);
-  if (!res.routed)                         // §3.3.4 not implemented
+  gnmid::Backend::View view = be_.snapshot(fullpath);
+  if (!view.routed)                        // §3.3.4 not implemented
     return Status(StatusCode::UNIMPLEMENTED, "path not implemented: " + fullpath);
 
   // Drop leaves outside the requested config/state type before the empty check,
   // so a path that exists but holds nothing of the requested type is NOT_FOUND.
-  filterByDataType(res.snap, type);
-  if (res.snap.empty())                    // §3.3.4 exists (yet) but no data
+  filterByDataType(view, type);
+  if (view.leaves.empty())                 // §3.3.4 exists (yet) but no data
     return Status(StatusCode::NOT_FOUND, "path has no data: " + fullpath);
 
   // Same atomic-aware partition as Subscribe: each atomic container becomes its
   // own atomic Notification (spec §3.5.2.5), the rest a single non-atomic one.
-  std::vector<Notification> notes = buildFullNotifications(res.snap, registry_);
+  std::vector<Notification> notes = buildFullNotifications(view);
   for (auto& n : notes) {
     // A request prefix applies to the non-atomic notification only; atomic ones
     // carry their own container prefix.
@@ -153,4 +152,4 @@ Status Get::run(const GetRequest* req, GetResponse* response)
   return Status::OK;
 }
 
-} // namespace impl
+}  // namespace impl

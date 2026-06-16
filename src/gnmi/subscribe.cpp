@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <set>
 #include <thread>
 #include <chrono>
 #include <string>
@@ -25,7 +26,6 @@
 
 #include "subscribe.h"
 #include "subscribe_emit.h"
-#include "backend/leaf_store.hpp"
 #include <utils/utils.h>
 #include <utils/log.h>
 
@@ -37,8 +37,8 @@ namespace impl {
 
 namespace {
 
-// Write each Notification as its own SubscribeResponse. Atomic containers split
-// a query across several Notifications (spec §2.1.1), so emit sites loop here.
+// Write each Notification as its own SubscribeResponse. Atomic containers split a
+// query across several Notifications (spec §2.1.1), so emit sites loop here.
 void writeAll(std::vector<Notification>& notes,
               ServerReaderWriter<SubscribeResponse, SubscribeRequest>* stream)
 {
@@ -50,15 +50,24 @@ void writeAll(std::vector<Notification>& notes,
   }
 }
 
-} // namespace
+// Merge another snapshot View into `into`: union the leaves, append groups not
+// already present (deduped by prefix), OR-reduce routed.
+void mergeView(gnmid::Backend::View& into, gnmid::Backend::View&& add,
+               std::set<std::string>& seenGroups)
+{
+  into.routed = into.routed || add.routed;
+  for (auto& [path, leaf] : add.leaves) into.leaves.emplace(path, leaf);
+  for (auto& g : add.groups)
+    if (seenGroups.insert(g.prefix).second) into.groups.push_back(std::move(g));
+}
+
+}  // namespace
 
 /**
  * buildSubscribeNotifications - Build the Notification(s) for a SubscriptionList.
- * gnmi specification highly recommends bundling multiple <xpath, value> into one
- * Notification. Atomic containers are the exception: each is delivered as its own
- * atomic Notification (spec §2.1.1), so this may produce several.
- * @param out  receives one or more Notifications, in emit order.
- * @param request the SubscriptionList from SubscribeRequest to answer to.
+ * Bundles multiple <xpath, value> into one Notification; atomic containers are
+ * the exception, each delivered as its own atomic Notification (spec §2.1.1), so
+ * this may produce several.
  */
 Status
 Subscribe::buildSubscribeNotifications(std::vector<Notification>& out,
@@ -73,7 +82,6 @@ Subscribe::buildSubscribeNotifications(std::vector<Notification>& out,
     case gnmi::PROTO:
       BOOST_LOG_TRIVIAL(error) << "PROTO encoding will soon be supported";
       return Status(StatusCode::UNIMPLEMENTED, Encoding_Name(request.encoding()));
-      break;
 
     default:
       BOOST_LOG_TRIVIAL(warning) << "Unsupported Encoding "
@@ -81,33 +89,31 @@ Subscribe::buildSubscribeNotifications(std::vector<Notification>& out,
       return Status(StatusCode::UNIMPLEMENTED, Encoding_Name(request.encoding()));
   }
 
-  // use_aliases was reserved/removed in proto 0.10.0; no action needed.
-  /* updates_only is handled by the caller (handleStream); no action here */
-
   /* Merge the current snapshot of every subscribed path, then partition it into
    * atomic + non-atomic Notifications. Timestamps are collection-accurate, not
-   * "now" (spec §3.5.2.3); Phase 4 adds JSON_IETF subtree wrapping here. */
-  Snapshot merged;
+   * "now" (spec §3.5.2.3). */
+  gnmid::Backend::View merged;
+  std::set<std::string> seenGroups;
   for (int i = 0; i < request.subscription_size(); i++) {
-    Subscription sub = request.subscription(i);
+    const Subscription& sub = request.subscription(i);
 
     Status status = validateGnmiPath(sub.path());
     if (!status.ok()) return status;
 
     const string xpath = gnmi_to_xpath(sub.path());
-    SnapResult res = registry_.snapshot(xpath);
-    if (!res.routed)                       // §3.5.2.4 not implemented
+    gnmid::Backend::View v = be_.snapshot(xpath);
+    if (!v.routed)                         // §3.5.2.4 not implemented
       return Status(StatusCode::UNIMPLEMENTED, "path not implemented: " + xpath);
-    if (res.snap.empty())                  // §3.5.1.3 exists (yet): silent, do NOT close
+    if (v.leaves.empty())                  // §3.5.1.3 exists (yet): silent, do NOT close
       BOOST_LOG_TRIVIAL(warning) << "path exists but has no data (yet): " << xpath;
 
-    merged.merge(res.snap);
+    mergeView(merged, std::move(v), seenGroups);
   }
 
-  out = buildFullNotifications(merged, registry_);
+  out = buildFullNotifications(merged);
 
   // A request prefix applies to the non-atomic notification only; atomic ones
-  // carry their own container prefix (mixing the two is out of scope — see §2.1.1).
+  // carry their own container prefix.
   if (request.has_prefix())
     for (auto& n : out)
       if (!n.atomic()) n.mutable_prefix()->CopyFrom(request.prefix());
@@ -126,10 +132,9 @@ Status Subscribe::handleStream(
   SubscribeResponse response;
   Status status;
 
-  // Checks that sample_interval values are not higher than INT64_MAX
-  // i.e. 9223372036854775807 nanoseconds
+  // Checks that sample_interval values are not higher than INT64_MAX nanoseconds.
   for (int i = 0; i < request.subscribe().subscription_size(); i++) {
-    Subscription sub = request.subscribe().subscription(i);
+    const Subscription& sub = request.subscribe().subscription(i);
     if (sub.sample_interval() > duration<long long, std::nano>::max().count()) {
       context->TryCancel();
       return Status(StatusCode::INVALID_ARGUMENT,
@@ -138,8 +143,8 @@ Status Subscribe::handleStream(
     }
   }
 
-  // Send initial snapshot unless client requested updates_only.
-  // sync_response is always sent to mark initial synchronisation complete.
+  // Send initial snapshot unless client requested updates_only. sync_response is
+  // always sent to mark initial synchronisation complete.
   if (!request.subscribe().updates_only()) {
     std::vector<Notification> notes;
     status = buildSubscribeNotifications(notes, request.subscribe());
@@ -155,36 +160,32 @@ Status Subscribe::handleStream(
   response.Clear();
 
   // Per-subscriber streaming state, split by mode. A single SubscriptionList may
-  // legally mix SAMPLE and ON_CHANGE entries, so both buckets coexist and the
-  // one loop below services each on its own terms.
-  //   SAMPLE    — emit on a timer (sample_interval)
-  //   ON_CHANGE — emit when a polled snapshot differs from the previous one
-  // chronomap stays a vector (iterated, not keyed).
+  // legally mix SAMPLE and ON_CHANGE entries, so both buckets coexist and the one
+  // loop below services each on its own terms.
   vector<pair<Subscription, time_point<high_resolution_clock>>> chronomap;
 
   struct OnChangeSub {
     Subscription                      sub;
     string                            query;
-    Snapshot                          prev;           // last state seen by this subscriber
+    gnmid::Backend::View              prev;          // last state seen by this subscriber
     time_point<high_resolution_clock> lastHeartbeat;
   };
   vector<OnChangeSub> onChange;
 
-  for (int i=0; i<request.subscribe().subscription_size(); i++) {
-    Subscription sub = request.subscribe().subscription(i);
+  for (int i = 0; i < request.subscribe().subscription_size(); i++) {
+    const Subscription& sub = request.subscribe().subscription(i);
     const auto now = high_resolution_clock::now();
 
-    // Resolve TARGET_DEFINED per leaf via the owning provider (default SAMPLE).
-    switch (resolveStreamMode(sub, registry_)) {
+    // Resolve TARGET_DEFINED per leaf via the Backend (schema-derived, P5).
+    switch (resolveStreamMode(sub, be_)) {
       case SAMPLE:
         chronomap.emplace_back(sub, now);
         break;
       case ON_CHANGE: {
-        // Baseline snapshot is taken regardless of updates_only — the latter only
-        // suppresses the *initial emit* (handled above), never the baseline, so
-        // the first diff reports nothing already sent (spec §3.5.1.5.2).
+        // Baseline snapshot regardless of updates_only — the latter only
+        // suppresses the *initial emit* (handled above), never the baseline.
         const string query = gnmi_to_xpath(sub.path());
-        onChange.push_back({sub, query, registry_.snapshot(query).snap, now});
+        onChange.push_back({ sub, query, be_.snapshot(query), now });
         break;
       }
       default:
@@ -193,12 +194,10 @@ Status Subscribe::handleStream(
     }
   }
 
-  /* Single loop, capped at ~5 iterations/second, serving both buckets:
-   * SAMPLE by timer, ON_CHANGE by snapshot diff. The store has no change-notify,
-   * so ON_CHANGE detection polls each iteration (push/notify is a later optim).
-   * Note: one Path per Subscription, but repeated Subscriptions in a list, each
-   * with its own sample_interval / heartbeat_interval. */
-  while(!context->IsCancelled()) {
+  /* Single loop, capped at ~5 iterations/second, serving both buckets: SAMPLE by
+   * timer, ON_CHANGE by snapshot diff. The core has no change-notify yet, so
+   * ON_CHANGE detection polls each iteration (push is a later optim — P1). */
+  while (!context->IsCancelled()) {
     auto start = high_resolution_clock::now();
 
     // ---- SAMPLE: batch all due subscriptions into one Notification ----
@@ -207,9 +206,8 @@ Status Subscribe::handleStream(
     updateList->clear_subscription();
 
     for (auto& pair : chronomap) {
-      duration<long long, std::nano> duration =
-        high_resolution_clock::now()-pair.second;
-      if (duration > nanoseconds{pair.first.sample_interval()}) {
+      duration<long long, std::nano> elapsed = high_resolution_clock::now() - pair.second;
+      if (elapsed > nanoseconds{pair.first.sample_interval()}) {
         pair.second = high_resolution_clock::now();
         Subscription* sub = updateList->add_subscription();
         sub->CopyFrom(pair.first);
@@ -219,7 +217,7 @@ Status Subscribe::handleStream(
     if (updateList->subscription_size() > 0) {
       std::vector<Notification> notes;
       status = buildSubscribeNotifications(notes, updateRequest.subscribe());
-      if(!status.ok()) {
+      if (!status.ok()) {
         context->TryCancel();
         return status;
       }
@@ -228,26 +226,23 @@ Status Subscribe::handleStream(
 
     // ---- ON_CHANGE: poll each subscriber's snapshot and diff vs its previous ----
     for (auto& oc : onChange) {
-      Snapshot cur = registry_.snapshot(oc.query).snap;
+      gnmid::Backend::View cur = be_.snapshot(oc.query);
       const auto now = high_resolution_clock::now();
 
       if (heartbeatDue(oc.sub.heartbeat_interval(), oc.lastHeartbeat, now)) {
-        // Heartbeat re-emits the full state regardless of change (spec §3.5.1.5.2),
-        // atomic containers re-sent atomically.
-        std::vector<Notification> notes = buildFullNotifications(cur, registry_);
+        // Heartbeat re-emits the full state regardless of change (spec §3.5.1.5.2).
+        std::vector<Notification> notes = buildFullNotifications(cur);
         writeAll(notes, stream);
         oc.lastHeartbeat = now;
       } else {
-        // Non-atomic leaves diff; an atomic container that changed re-sends in full.
-        std::vector<Notification> notes =
-            buildChangeNotifications(oc.prev, cur, registry_);
+        std::vector<Notification> notes = buildChangeNotifications(oc.prev, cur);
         writeAll(notes, stream);
       }
 
       oc.prev = std::move(cur);
     }
 
-    // Caps the loop at 5 iterations per second
+    // Caps the loop at 5 iterations per second.
     auto loopTime = high_resolution_clock::now() - start;
     this_thread::sleep_for(milliseconds(200) - loopTime);
   }
@@ -256,15 +251,14 @@ Status Subscribe::handleStream(
 }
 
 /**
- * Handles SubscribeRequest messages with ONCE subscription mode by updating
- * all the Subscriptions once, sending a SYNC message, then closing the RPC.
+ * Handles SubscribeRequest messages with ONCE subscription mode by updating all
+ * the Subscriptions once, sending a SYNC message, then closing the RPC.
  */
 Status Subscribe::handleOnce(ServerContext* context, SubscribeRequest request,
     ServerReaderWriter<SubscribeResponse, SubscribeRequest>* stream)
 {
   Status status;
 
-  // Sends a Notification message that updates all Subcriptions once
   SubscribeResponse response;
   std::vector<Notification> notes;
   status = buildSubscribeNotifications(notes, request.subscribe());
@@ -275,8 +269,7 @@ Status Subscribe::handleOnce(ServerContext* context, SubscribeRequest request,
 
   writeAll(notes, stream);
 
-  // Sends a message that indicates that initial synchronization
-  // has completed, i.e. each Subscription has been updated once
+  // Indicate that initial synchronization has completed.
   response.set_sync_response(true);
   stream->Write(response);
   response.Clear();
@@ -285,8 +278,8 @@ Status Subscribe::handleOnce(ServerContext* context, SubscribeRequest request,
 }
 
 /**
- * Handles SubscribeRequest messages with POLL subscription mode by updating
- * all the Subscriptions each time a Poll request is received.
+ * Handles SubscribeRequest messages with POLL subscription mode by updating all
+ * the Subscriptions each time a Poll request is received.
  */
 Status Subscribe::handlePoll(ServerContext* context, SubscribeRequest request,
     ServerReaderWriter<SubscribeResponse, SubscribeRequest>* stream)
@@ -295,8 +288,6 @@ Status Subscribe::handlePoll(ServerContext* context, SubscribeRequest request,
   Status status;
 
   // Send initial snapshot + sync_response on subscription establishment.
-  // Aligns with Go reference impl (spec/gnmi/subscribe/subscribe.go:435):
-  // client gets consistent state immediately without needing a first Poll trigger.
   {
     SubscribeResponse response;
     std::vector<Notification> notes;
@@ -315,7 +306,6 @@ Status Subscribe::handlePoll(ServerContext* context, SubscribeRequest request,
     switch (request.request_case()) {
       case request.kPoll:
         {
-          // Sends a Notification message that updates all Subcriptions once
           SubscribeResponse response;
           std::vector<Notification> notes;
           status = buildSubscribeNotifications(notes, subscription.subscribe());
@@ -330,7 +320,6 @@ Status Subscribe::handlePoll(ServerContext* context, SubscribeRequest request,
           response.Clear();
           break;
         }
-      // kAliases removed in proto 0.10.0 (field reserved)
       case request.kSubscribe:
         return Status(StatusCode::INVALID_ARGUMENT,
                       "A SubscriptionList has already been received for this RPC");
@@ -379,4 +368,4 @@ Status Subscribe::run(ServerContext* context,
   }
 }
 
-}
+}  // namespace impl

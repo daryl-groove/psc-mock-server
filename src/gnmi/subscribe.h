@@ -20,7 +20,7 @@
 #include <vector>
 
 #include <gnmi.grpc.pb.h>
-#include "backend/data_provider.hpp"
+#include "backend/backend.hpp"
 
 using namespace gnmi;
 using google::protobuf::RepeatedPtrField;
@@ -33,7 +33,7 @@ namespace impl {
 
 class Subscribe {
   public:
-    explicit Subscribe(DataProviderRegistry& registry) : registry_(registry) {}
+    explicit Subscribe(gnmid::Backend& be) : be_(be) {}
     ~Subscribe() = default;
 
     Status run(ServerContext* context,
@@ -53,9 +53,9 @@ class Subscribe {
               ServerReaderWriter<SubscribeResponse, SubscribeRequest>* stream);
 
   private:
-    DataProviderRegistry& registry_;
+    gnmid::Backend& be_;
 };
 
-} // namespace impl
+}  // namespace impl
 
-#endif //_GNMI_SUBSCRIBE_H
+#endif  // _GNMI_SUBSCRIBE_H
