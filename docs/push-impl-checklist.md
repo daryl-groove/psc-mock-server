@@ -48,8 +48,11 @@ client is wrongly rejected). See `backlog.md` C1–C5.
       (which also re-attached origin against C1 and double-prefixed). Set already
       echoes target on `SetResponse.prefix`. Test: `tests/e2e/test_target_echo.py`
       (Get exercises atomic + non-atomic; ONCE; MUST-NOT-set when unset).
-- [ ] **#2 C++ emit unit test** — lock current `subscribe_emit.cpp` behaviour
-      (atomic partition + `changeSeq` diff) as a regression net for the push rework.
+- [x] **#2 C++ emit unit test** — `tests/test_subscribe_emit.cpp` (11 cases, meson
+      target `subscribe_emit`) constructs `Backend::View`s directly and pins the
+      atomic partition + `changeSeq` diff (incl. suppress-on-equal-seq) + atomic
+      whole-record re-send + delete-container + timestamp-collapse + `echoTarget`
+      behaviour deterministically — the regression net for the push rework.
 - [ ] **e2e isolation** — each test self-starts a fresh server or restores state on
       teardown (today they share mutable NTP state and fail when run back-to-back).
 - **Gate:** 8 C++ suites + all e2e green; emit behaviour pinned by the new C++ test.

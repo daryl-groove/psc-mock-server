@@ -201,3 +201,13 @@ test_backend = executable('test_backend',
   include_directories : [include_directories('src')],
 )
 test('backend', test_backend)
+
+# Subscribe emit logic (atomic partition + changeSeq diff + target echo). Compiles
+# subscribe_emit.cpp directly against the Backend/core/proto deps — a fast unit test
+# for the View -> Notification(s) contract, without a gRPC stream or timing.
+test_subscribe_emit = executable('test_subscribe_emit',
+  ['tests/test_subscribe_emit.cpp', 'src/gnmi/subscribe_emit.cpp'],
+  dependencies        : [gnmid_backend_dep, gtest_dep, thread_dep],
+  include_directories : [include_directories('src')],
+)
+test('subscribe_emit', test_subscribe_emit)
