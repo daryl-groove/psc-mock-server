@@ -43,11 +43,14 @@ namespace {
 // sample_interval 0 means "lowest supported" and keeps the loop's 200ms floor.)
 constexpr uint64_t kTargetDefinedSampleIntervalNs = 1'000'000'000;  // 1s
 
-// Write each Notification as its own SubscribeResponse. Atomic containers split a
-// query across several Notifications (spec §2.1.1), so emit sites loop here.
-void writeAll(std::vector<Notification>& notes,
+// Stamp the request target onto every notification (C5/R2: the single emit sink
+// owns the echo, so no current or future emit path can forget it), then write each
+// as its own SubscribeResponse. Atomic containers split a query across several
+// Notifications (spec §2.1.1), so emit sites loop here.
+void writeAll(std::vector<Notification>& notes, const std::string& target,
               ServerReaderWriter<SubscribeResponse, SubscribeRequest>* stream)
 {
+  echoTarget(notes, target);
   SubscribeResponse response;
   for (auto& n : notes) {
     *response.mutable_update() = std::move(n);
@@ -117,12 +120,8 @@ Subscribe::buildSubscribeNotifications(std::vector<Notification>& out,
   }
 
   out = buildFullNotifications(merged);
-
-  // C5/R (§2.2.2.1): echo prefix.target onto every notification (atomic
-  // included) — target only, not the path-prefix (updates carry full paths) nor
-  // origin (C1 strip-only). No-op when target is unset.
-  echoTarget(out, request.prefix().target());
-
+  // C5/R2 (§2.2.2.1): prefix.target is echoed at the writeAll sink (a single emit
+  // chokepoint), not here, so every emit path gets it uniformly.
   return Status::OK;
 }
 
@@ -136,6 +135,8 @@ Status Subscribe::handleStream(
 {
   SubscribeResponse response;
   Status status;
+  // Request prefix.target — echoed onto every notification at the writeAll sink.
+  const std::string& target = request.subscribe().prefix().target();
 
   // Per-subscription sample_interval setup validation (§3.5.1.5.2).
   for (int i = 0; i < request.subscribe().subscription_size(); i++) {
@@ -160,10 +161,8 @@ Status Subscribe::handleStream(
   if (!request.subscribe().updates_only()) {
     std::vector<Notification> notes;
     status = buildSubscribeNotifications(notes, request.subscribe());
-    if (!status.ok()) {
-      return status;
-    }
-    writeAll(notes, stream);
+    if (!status.ok()) return status;
+    writeAll(notes, target, stream);
   }
 
   response.set_sync_response(true);
@@ -235,14 +234,11 @@ Status Subscribe::handleStream(
     if (updateList->subscription_size() > 0) {
       std::vector<Notification> notes;
       status = buildSubscribeNotifications(notes, updateRequest.subscribe());
-      if (!status.ok()) {
-        return status;
-      }
-      writeAll(notes, stream);
+      if (!status.ok()) return status;
+      writeAll(notes, target, stream);
     }
 
     // ---- ON_CHANGE: poll each subscriber's snapshot and diff vs its previous ----
-    // This path bypasses buildSubscribeNotifications, so echo target here too (C5).
     for (auto& oc : onChange) {
       gnmid::Backend::View cur = be_.snapshot(oc.query);
       const auto now = high_resolution_clock::now();
@@ -255,8 +251,7 @@ Status Subscribe::handleStream(
       } else {
         notes = buildChangeNotifications(oc.prev, cur);
       }
-      echoTarget(notes, request.subscribe().prefix().target());
-      writeAll(notes, stream);
+      writeAll(notes, target, stream);
 
       oc.prev = std::move(cur);
     }
@@ -281,11 +276,9 @@ Status Subscribe::handleOnce(ServerContext* context, SubscribeRequest request,
   SubscribeResponse response;
   std::vector<Notification> notes;
   status = buildSubscribeNotifications(notes, request.subscribe());
-  if (!status.ok()) {
-    return status;
-  }
+  if (!status.ok()) return status;
 
-  writeAll(notes, stream);
+  writeAll(notes, request.subscribe().prefix().target(), stream);
 
   // Indicate that initial synchronization has completed.
   response.set_sync_response(true);
@@ -310,10 +303,8 @@ Status Subscribe::handlePoll(ServerContext* context, SubscribeRequest request,
     SubscribeResponse response;
     std::vector<Notification> notes;
     status = buildSubscribeNotifications(notes, subscription.subscribe());
-    if (!status.ok()) {
-      return status;
-    }
-    writeAll(notes, stream);
+    if (!status.ok()) return status;
+    writeAll(notes, subscription.subscribe().prefix().target(), stream);
     response.set_sync_response(true);
     stream->Write(response);
     response.Clear();
@@ -326,10 +317,8 @@ Status Subscribe::handlePoll(ServerContext* context, SubscribeRequest request,
           SubscribeResponse response;
           std::vector<Notification> notes;
           status = buildSubscribeNotifications(notes, subscription.subscribe());
-          if (!status.ok()) {
-            return status;
-          }
-          writeAll(notes, stream);
+          if (!status.ok()) return status;
+          writeAll(notes, subscription.subscribe().prefix().target(), stream);
 
           response.set_sync_response(true);
           stream->Write(response);

@@ -40,13 +40,21 @@ Status checkWritable(const gnmid::Backend& be, const string& xpath)
   return Status::OK;
 }
 
-// Structural + writability validation for one update/replace operation.
+// Origin (C1/D16) + writability (§3.4.7) validation for one operation's path —
+// shared by delete and by validateWrite (update/replace), so all three operation
+// kinds validate origin identically.
+Status validatePath(const gnmid::Backend& be, const gnmi::Path& path, const string& prefix)
+{
+  if (Status s = validateOrigin(path.origin()); !s.ok()) return s;
+  return checkWritable(be, prefix + gnmi_to_xpath(path));
+}
+
+// Structural + path validation for one update/replace operation.
 Status validateWrite(const gnmid::Backend& be, const Update& upd, const string& prefix)
 {
   if (!upd.has_path() || !upd.has_val())
     return Status(StatusCode::INVALID_ARGUMENT, "update missing path or value");
-  if (Status s = validateOrigin(upd.path().origin()); !s.ok()) return s;   // C1/D16
-  return checkWritable(be, prefix + gnmi_to_xpath(upd.path()));
+  return validatePath(be, upd.path(), prefix);
 }
 
 }  // namespace
@@ -78,9 +86,7 @@ Status Set::run(const SetRequest* request, SetResponse* response)
 
   // ---- Phase 1: validate in spec order (delete, replace, update); mutate nothing.
   for (const auto& delpath : request->delete_()) {
-    Status s = validateOrigin(delpath.origin());                            // C1/D16
-    if (s.ok()) s = checkWritable(be_, prefix + gnmi_to_xpath(delpath));
-    if (!s.ok()) return s;
+    if (Status s = validatePath(be_, delpath, prefix); !s.ok()) return s;
   }
   for (const auto& upd : request->replace()) {
     Status s = validateWrite(be_, upd, prefix);

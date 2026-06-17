@@ -67,33 +67,29 @@ when to act. Numbered R* to not clash with the tables above.
   `test_target_defined.py` positive case now asserts the steady-state gap > 0.5s
   (the old flood would fail it).
 
-**Do with the push rework (P1/P2 reshapes these emit/routing paths anyway):**
-- **R2 — `echoTarget` is at 3 build sites, not the single `writeAll` sink.** Every
-  Subscribe write funnels through `writeAll`, but target is stamped upstream in
-  `buildSubscribeNotifications` + the ON_CHANGE loop. The ON_CHANGE site is proof of
-  the risk — it bypasses the builder and had to hand-add its own `echoTarget`. A
-  future emit path that forgets it silently drops `prefix.target` (§2.2.2.1 MUST).
-  Fix: stamp inside `writeAll` (pass the target in). Get has no `writeAll`, so keep
-  its call.
-- **R3 — `validateOrigin` is wired at ~8 sites while the strip is centralized in
-  `gnmi_to_xpath`.** Coverage is complete today, but a future path that calls
-  `gnmi_to_xpath` gets origin stripped *without* validation → an unimplemented origin
-  (`cli`) served as openconfig. Consider a single request-boundary seam. (Caveat:
-  `gnmi_to_xpath` returns a string, can't itself return a Status — needs thought.)
+**Done this session (commit `refactor(gnmi): code-review cleanups`):**
+- **R2 ✅ DONE — `echoTarget` moved into the single `writeAll` sink.** Was stamped at
+  3 build sites (`buildSubscribeNotifications` + the ON_CHANGE loop); now `writeAll`
+  takes the target and echoes once, so every Subscribe emit path gets it uniformly and
+  a future path can't forget it. Get keeps its own call (it has no `writeAll`). Pinned
+  by `test_subscribe_emit.cpp` (EchoTarget) + `test_target_echo.py`.
+- **R4 ✅ DONE** — collapsed the 5 `if (!status.ok()) { return status; }` braces to
+  one-liners in [subscribe.cpp](../src/gnmi/subscribe.cpp).
+- **R5 ✅ DONE** — Get's prefix-origin check hoisted to `run()` (once); the per-path
+  re-validation and the double `if (prefix != nullptr)` are gone ([get.cpp](../src/gnmi/get.cpp)).
+- **R6 ✅ DONE** — delete/update/replace now all validate through a shared
+  `validatePath` ([set.cpp](../src/gnmi/set.cpp)); no more asymmetric inline.
+- **R7 ✅ DONE (subsumed by R2)** — target is sourced once per handler and passed to
+  `writeAll`, so the two-expression drift is gone.
 
-**Batch — ride the next edit that touches these files:**
-- **R4 — leftover `if (!status.ok()) { return status; }` braced single-statement
-  blocks** (5 sites in [subscribe.cpp](../src/gnmi/subscribe.cpp)) after the C6 `TryCancel` removal; collapse to
-  one-liners (the braces only held the deleted call).
-- **R5 — Get re-validates the prefix origin once per request path** (the loop calls
-  `buildGetNotifications` per path) and opens a second `if (prefix != nullptr)` a few
-  lines above the existing one ([get.cpp](../src/gnmi/get.cpp) L69); hoist to `run()` once.
-- **R6 — Set's delete loop hand-inlines `validateOrigin`+`checkWritable`** while
-  replace/update go through `validateWrite` ([set.cpp](../src/gnmi/set.cpp) L80); asymmetric, two
-  validation styles in one RPC.
-- **R7 — ON_CHANGE `echoTarget` reads target via `request.subscribe().prefix().target()`**
-  while the builder path reads `request.prefix().target()` ([subscribe.cpp](../src/gnmi/subscribe.cpp) L245); same
-  value, two expressions → drift risk. Resolve once. (Subsumed if R2 is done.)
+**Deferred to the push rework:**
+- **R3 — single origin-validation seam.** `validateOrigin` is wired at the get/set/
+  subscribe boundaries while the strip is centralized in `gnmi_to_xpath`; coverage is
+  complete today, but a future path calling `gnmi_to_xpath` would strip origin without
+  validating. A structural single seam is awkward (`gnmi_to_xpath` returns a string,
+  can't carry a Status), and its proper home is the **push Resolver (pipeline step 1)**.
+  Documented for now as an INVARIANT comment on `gnmi_to_xpath` ([utils.h](../src/utils/utils.h)); build the
+  real seam with the Resolver.
 
 **Separate refactor — low priority:**
 - **R8 — the 3 new e2e files duplicate** path-builders, the `yield request; while

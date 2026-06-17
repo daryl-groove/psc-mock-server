@@ -63,13 +63,9 @@ Get::buildGetNotifications(RepeatedPtrField<Notification>* out,
   Status status = validateGnmiPath(path);
   if (!status.ok()) return status;
 
-  // C1/D16: a non-openconfig origin names an unimplemented schema → UNIMPLEMENTED,
-  // before routing. Checked after the structural validation so a malformed path
-  // still wins INVALID_ARGUMENT. origin is then stripped for free (gnmi_to_xpath).
-  if (prefix != nullptr) {
-    status = validateOrigin(prefix->origin());
-    if (!status.ok()) return status;
-  }
+  // C1/D16: a non-openconfig origin on the path → UNIMPLEMENTED, after the
+  // structural check so a malformed path still wins INVALID_ARGUMENT. The request
+  // prefix's origin is validated once in run(). origin is then stripped for free.
   status = validateOrigin(path.origin());
   if (!status.ok()) return status;
 
@@ -141,6 +137,11 @@ Status Get::run(const GetRequest* req, GetResponse* response)
   BOOST_LOG_TRIVIAL(debug) << "GetRequest DataType "
                            << GetRequest::DataType_Name(req->type())
                            << " Encoding " << Encoding_Name(req->encoding());
+
+  // C1/D16: validate the request prefix's origin once (per-path origin is checked
+  // in buildGetNotifications). A non-openconfig origin → UNIMPLEMENTED.
+  if (req->has_prefix())
+    if (Status s = validateOrigin(req->prefix().origin()); !s.ok()) return s;
 
   auto* notificationList = response->mutable_notification();
   for (auto path : req->path()) {

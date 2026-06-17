@@ -44,6 +44,12 @@ inline int64_t get_time_nanosec()
  * validated and stripped by validateOrigin before a path reaches routing, so
  * this converter must stay origin-agnostic. Baking origin in here made an
  * origin-bearing path (incl. the canonical "openconfig") miss routing — C1.
+ *
+ * INVARIANT (backlog R3): every RPC path that reaches Backend routing MUST first
+ * pass through validateOrigin() — this converter silently drops origin and does
+ * not enforce it. There is no single choke point yet (get/set/subscribe each
+ * validate at their boundary); the push Resolver (protocol-layer-design.md
+ * pipeline step 1) is the intended single home.
  */
 inline std::string gnmi_to_xpath(const gnmi::Path& path)
 {
