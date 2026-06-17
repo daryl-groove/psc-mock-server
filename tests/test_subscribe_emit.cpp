@@ -38,7 +38,7 @@ LeafValueSnapshot leaf(double v, int64_t collectedNs, uint64_t changeSeq,
 }
 
 GroupView atomicGroup(const std::string& prefix, std::vector<std::string> members) {
-    return { /*name*/ prefix, prefix, /*atomic*/ true, std::nullopt, std::move(members) };
+    return { prefix, /*atomic*/ true, std::nullopt, std::move(members) };
 }
 
 // Relative leaf paths of a notification's updates, as xpath strings (sorted).

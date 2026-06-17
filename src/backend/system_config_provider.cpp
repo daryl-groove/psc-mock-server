@@ -42,7 +42,7 @@ SystemConfigProvider::SystemConfigProvider(Backend& be) : Provider(be) {
 
     // The NTP record — an atomic group declared BEFORE its leaves so they
     // auto-assign to it (D3). Mixed-value leaves, all Config.
-    be_.declareGroup("ntp:10.0.0.1", NTP, /*atomic=*/true);
+    be_.declareGroup(NTP, /*atomic=*/true);
     be_.declareLeaf(NTP + "/address",          LeafType::Config, typedValue(std::string("10.0.0.1")));
     be_.declareLeaf(NTP + "/port",             LeafType::Config, typedValue(uint64_t{123}));
     be_.declareLeaf(NTP + "/version",          LeafType::Config, typedValue(uint64_t{4}));

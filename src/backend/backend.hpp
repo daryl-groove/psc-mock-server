@@ -60,7 +60,9 @@ public:
     void addProvider(std::unique_ptr<Provider> p);
 
     // --- provider-facing registration (called from a Provider constructor) ---
-    void         declareGroup(const std::string& name, const std::string& prefix, bool atomic);
+    // A group is identified by its prefix (D4); declare it before its leaves so they
+    // auto-assign (D3).
+    void         declareGroup(const std::string& prefix, bool atomic);
     core::LeafId declareLeaf(const std::string& xpath, core::LeafType type,
                              std::optional<gnmi::TypedValue> value = std::nullopt);
 

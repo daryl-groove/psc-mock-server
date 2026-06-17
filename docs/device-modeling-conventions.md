@@ -270,15 +270,16 @@ providers; the core needs no change for it.
 Small, additive shape tweaks that make the authoring layer cleaner. Best shaped *with*
 their consumer; **A** is consumer-agnostic and could be done early.
 
-- **A. `attachSubtree` returns a path→`LeafId` map** (not a positional
-  `vector<LeafId>`). The binding layer needs *which id ↔ which path*; a positional
-  vector couples callers to spec order.
+- **A. ✅ DONE — `attachSubtree` returns a path→`LeafId` map** (`std::map<std::string,
+  LeafId>`), not a positional `vector<LeafId>`. The binding layer needs *which id ↔ which
+  path*; a positional vector coupled callers to spec order.
 - **B. A safe path-*construction* helper** in `canonical_path` (escape key values when
   assembling `[name=…]`) — the inverse of the parse-side escaping we already have, so
   providers don't hand-escape.
-- **C. Group identification by prefix** (default `name = prefix`, or `getGroup(prefix)`)
-  — a tree builder thinks in prefixes, not synthesised names. (Keep `name`; just default
-  it.)
+- **C. ✅ DONE — Group identification by prefix.** The core now identifies a group *solely*
+  by its prefix: `registerGroup(prefix, …)` / `getGroup(prefix)` / `unregisterGroup(prefix)`,
+  no `name` at all (went further than the original "keep name, just default it" — `name` was
+  end-to-end dead weight). See `core-data-model-design.md` D4.
 - **D. (optional, low)** an immediate-children (`ls`-style) navigation query — only if
   the authoring layer needs to *browse* existing state; builders mostly *write*.
 

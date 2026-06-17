@@ -57,8 +57,8 @@ void Backend::addProvider(std::unique_ptr<Provider> p) {
     providers_.push_back(std::move(p));
 }
 
-void Backend::declareGroup(const std::string& name, const std::string& prefix, bool atomic) {
-    registry_.registerGroup(name, prefix, atomic);
+void Backend::declareGroup(const std::string& prefix, bool atomic) {
+    registry_.registerGroup(prefix, atomic);
 }
 
 core::LeafId Backend::declareLeaf(const std::string& xpath, core::LeafType type,

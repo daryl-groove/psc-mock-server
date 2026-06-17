@@ -27,7 +27,7 @@ const std::string NTP = "/system/ntp/servers/server[address=10.0.0.1]/config";
 class SystemStub : public Provider {
 public:
     explicit SystemStub(Backend& be) : Provider(be) {
-        be_.declareGroup("ntp", NTP, /*atomic=*/true);
+        be_.declareGroup(NTP, /*atomic=*/true);
         be_.declareLeaf("/system/config/hostname", LeafType::Config, typedValue(std::string("psc-mock")));
         be_.declareLeaf("/system/config/timezone-name", LeafType::Config);          // declared, unset
         be_.declareLeaf(NTP + "/address", LeafType::Config, typedValue(std::string("10.0.0.1")));

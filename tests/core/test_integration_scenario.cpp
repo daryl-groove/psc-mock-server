@@ -44,7 +44,7 @@ Subscription buildSubscription(const LeafRegistry& reg, const std::vector<std::s
         SubscriptionView view = reg.collectForSubscription(q);
         for (const auto& [path, _] : view.leaves) sub.subscribed.insert(path);
         for (const auto& g : view.groups) {
-            if (seenGroups.insert(g.name).second) sub.groups.push_back(g);
+            if (seenGroups.insert(g.prefix).second) sub.groups.push_back(g);
         }
     }
     // Monitored set = subscribed leaves + ALL members of any atomic group, so an
@@ -109,11 +109,11 @@ std::vector<std::string> changedUnder(const LeafSnapshot& before, const LeafSnap
     return changed;
 }
 
-std::vector<std::string> sortedGroupNames(const Subscription& sub) {
-    std::vector<std::string> names;
-    for (const GroupView& g : sub.groups) names.push_back(g.name);
-    std::sort(names.begin(), names.end());
-    return names;
+std::vector<std::string> sortedGroupPrefixes(const Subscription& sub) {
+    std::vector<std::string> prefixes;
+    for (const GroupView& g : sub.groups) prefixes.push_back(g.prefix);
+    std::sort(prefixes.begin(), prefixes.end());
+    return prefixes;
 }
 
 // A registry pre-populated with the Scenario 1/2 group + leaf topology.
@@ -123,9 +123,9 @@ protected:
     std::map<std::string, LeafId> ids;
 
     void SetUp() override {
-        reg.registerGroup("groupA", "/a/b/c1/d1", /*atomic=*/true);
-        reg.registerGroup("groupB", "/a/b/c1/d2", /*atomic=*/false);
-        reg.registerGroup("groupC", "/a/b/c2/f", /*atomic=*/true);
+        reg.registerGroup("/a/b/c1/d1", /*atomic=*/true);
+        reg.registerGroup("/a/b/c1/d2", /*atomic=*/false);
+        reg.registerGroup("/a/b/c2/f", /*atomic=*/true);
 
         int64_t seed = 0;
         for (const char* p : {"/a/b/c1/d1/e1", "/a/b/c1/d1/e2", "/a/b/c1/d2/e1", "/a/b/c1/d2/e2",
@@ -158,7 +158,8 @@ TEST_F(ScenarioFixture, ContainerSubscriptionExpandsToAllLeaves) {
 TEST_F(ScenarioFixture, MonitoredSetExpandsAtomicGroup) {
     Subscription sub = buildSubscription(reg, {"/a/b/c1", "/a/b/c2/f/g1"});
 
-    EXPECT_EQ(sortedGroupNames(sub), (std::vector<std::string>{"groupA", "groupB", "groupC"}));
+    EXPECT_EQ(sortedGroupPrefixes(sub),
+              (std::vector<std::string>{"/a/b/c1/d1", "/a/b/c1/d2", "/a/b/c2/f"}));
     EXPECT_EQ(sub.subscribed.count("/a/b/c2/f/g2"), 0u);  // not subscribed
     EXPECT_EQ(sub.monitored.count("/a/b/c2/f/g2"), 1u);   // but monitored (atomic groupC)
     EXPECT_EQ(sub.monitored.size(), sub.subscribed.size() + 1);
@@ -226,11 +227,11 @@ TEST_F(ScenarioFixture, AtomicGroupOneScopeProducesCollapsedTimestamp) {
 TEST_F(ScenarioFixture, HotPlugAttachThenDetachBranch) {
     const std::string psu = "/components/psu[name=PSU3]";
     SubtreeSpec spec;
-    spec.groups.push_back({"psu3", psu, /*atomic=*/true, std::nullopt});
+    spec.groups.push_back({psu, /*atomic=*/true, std::nullopt});
     spec.leaves.push_back({psu + "/temp", std::nullopt, std::nullopt});
     spec.leaves.push_back({psu + "/volt", std::nullopt, std::nullopt});
 
-    std::vector<LeafId> attached = reg.attachSubtree(spec);
+    auto attached = reg.attachSubtree(spec);
     Subscription sub = buildSubscription(reg, {"/components"});
     EXPECT_EQ(sub.subscribed.size(), 2u);
     EXPECT_EQ(sub.monitored.count(psu + "/temp"), 1u);
@@ -239,12 +240,12 @@ TEST_F(ScenarioFixture, HotPlugAttachThenDetachBranch) {
     EXPECT_TRUE(reg.collectLeaves("/components").empty());
 
     auto w = reg.writeValues();
-    EXPECT_FALSE(w.set(attached.front(), intValue(1), 1));  // stale id -> clean miss
+    EXPECT_FALSE(w.set(attached.at(psu + "/temp"), intValue(1), 1));  // stale id -> clean miss
 }
 
 // Scenario 7 — one node, many spellings, one monitored leaf.
 TEST_F(ScenarioFixture, CanonicalEquivalenceAcrossSpellings) {
-    reg.registerGroup("psu0", "/components/component[name=psu0]", /*atomic=*/true);
+    reg.registerGroup("/components/component[name=psu0]", /*atomic=*/true);
     reg.registerLeaf("/components/component[class=POWER_SUPPLY][name=psu0]/state/temperature");
 
     // Reordered keys + trailing slash subtree query must hit the same node.

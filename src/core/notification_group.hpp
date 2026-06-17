@@ -1,7 +1,7 @@
 #pragma once
 
+#include <memory>
 #include <optional>
-#include <string>
 #include <unordered_set>
 
 #include "canonical_path.hpp"
@@ -12,18 +12,17 @@ namespace gnmid::core {
 
 // A notification bundle — the set of leaves reported together in one gNMI
 // Notification (D11). Encapsulated, registry-owned, non-copyable and non-movable;
-// members_ are non-owning back-pointers into the registry's leaf map.
+// members_ are non-owning back-pointers into the registry's leaf map. A group is
+// identified solely by its prefix (D4): there is no separate name.
 class NotificationGroup {
 public:
-    NotificationGroup(RegistryAccess, std::string name, CanonicalPath prefix, bool atomic,
+    NotificationGroup(RegistryAccess, std::shared_ptr<const CanonicalPath> prefix, bool atomic,
                       std::optional<LeafType> preferredType)
-        : name_(std::move(name)),
-          prefix_(std::move(prefix)),
-          atomic_(atomic),
-          preferredType_(preferredType) {}
+        : prefix_(std::move(prefix)), atomic_(atomic), preferredType_(preferredType) {}
 
-    const std::string&      name() const noexcept { return name_; }
-    const CanonicalPath&    prefix() const noexcept { return prefix_; }
+    // prefix_ is the SAME shared handle used as the registry's groups_ map key (L=B / D16),
+    // mirroring LeafEntry::path_ — materialised once, shared zero-copy.
+    const CanonicalPath&    prefix() const noexcept { return *prefix_; }
     bool                    atomic() const noexcept { return atomic_; }
     std::optional<LeafType> preferredType() const noexcept { return preferredType_; }
     const std::unordered_set<LeafEntry*>& members() const noexcept { return members_; }
@@ -42,11 +41,10 @@ private:
     bool linkLeaf(LeafEntry* e);
     void unlinkLeaf(LeafEntry* e);
 
-    std::string                    name_;
-    CanonicalPath                  prefix_;  // guaranteed-normalized (D16)
-    bool                           atomic_ = false;
-    std::optional<LeafType>        preferredType_;
-    std::unordered_set<LeafEntry*> members_;
+    std::shared_ptr<const CanonicalPath> prefix_;  // SAME handle as the groups_ map key (L=B / D16)
+    bool                                 atomic_ = false;
+    std::optional<LeafType>              preferredType_;
+    std::unordered_set<LeafEntry*>       members_;
 };
 
 // Defined here because resolving group->preferredType() requires NotificationGroup

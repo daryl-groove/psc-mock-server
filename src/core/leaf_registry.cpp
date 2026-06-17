@@ -1,6 +1,7 @@
 #include "leaf_registry.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_set>
@@ -10,10 +11,37 @@
 
 namespace gnmid::core {
 
-void LeafRegistry::registerGroup(const std::string& name, const std::string& prefix, bool atomic,
+namespace {
+
+// Visits, in sorted order, every entry of `m` whose key is element-aligned under `prefix`
+// (the §2.4.2 subtree boundary). Keys sharing `prefix` as a STRING prefix form one
+// contiguous block from lower_bound; the starts_with check ends it, and isUnderPrefix
+// filters out non-element-aligned siblings (e.g. /a/bc under /a/b — not a subtree member).
+// `fn(it)` processes a matching entry and returns the iterator to continue from:
+// std::next(it) for a read pass, or m.erase(it) for a removing pass. Because fn MUST
+// return an iterator, a read pass cannot forget to advance (it would not compile).
+// Works for both leaves_ and groups_ — they share the shared_ptr<const CanonicalPath> key.
+template <class Map, class Fn>
+void forEachUnderPrefix(Map& m, const CanonicalPath& prefix, Fn&& fn) {
+    for (auto it = m.lower_bound(prefix); it != m.end();) {
+        const CanonicalPath& key = *it->first;
+        if (!key.str().starts_with(prefix.str())) {
+            break;
+        }
+        if (isUnderPrefix(prefix, key)) {
+            it = fn(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+}  // namespace
+
+void LeafRegistry::registerGroup(const std::string& prefix, bool atomic,
                                  std::optional<LeafType> preferredType) {
     std::unique_lock lock(mutex_);
-    registerGroupLocked(name, prefix, atomic, preferredType);
+    registerGroupLocked(prefix, atomic, preferredType);
 }
 
 LeafId LeafRegistry::registerLeaf(const std::string& path, std::optional<LeafType> type,
@@ -22,16 +50,13 @@ LeafId LeafRegistry::registerLeaf(const std::string& path, std::optional<LeafTyp
     return registerLeafLocked(path, type, std::move(initialValue));
 }
 
-void LeafRegistry::registerGroupLocked(const std::string& name, const std::string& prefix,
-                                       bool atomic, std::optional<LeafType> preferredType) {
+void LeafRegistry::registerGroupLocked(const std::string& prefix, bool atomic,
+                                       std::optional<LeafType> preferredType) {
     CanonicalPath canonPrefix = canonicalize(prefix);
 
-    if (groups_.count(name)) {
-        throw std::invalid_argument("registerGroup: duplicate group name '" + name + "'");
-    }
-
     // D5: no two group prefixes may nest (one being a path-ancestor-or-equal of the
-    // other). The message states WHY, so a caller hitting it understands the rule
+    // other) — the equal case also rejects a duplicate group (D4: the prefix is the group's
+    // sole identity). The message states WHY, so a caller hitting it understands the rule
     // without digging into the design doc.
     if (const CanonicalPath* clash = overlappingPrefix(canonPrefix)) {
         throw std::invalid_argument(
@@ -39,16 +64,18 @@ void LeafRegistry::registerGroupLocked(const std::string& name, const std::strin
             clash->str() +
             "' — group prefixes must not nest (one a path-ancestor of the other): an atomic "
             "notification for the outer prefix declares the COMPLETE state of its subtree, so "
-            "the inner group's leaves would be implicitly deleted client-side (gNMI §2.1.1), "
-            "and auto-assign would be ambiguous. Sibling prefixes (e.g. /a/b and /a/bc) are "
-            "fine; only ancestor/descendant overlap is rejected. (wouldConflict() lets you "
-            "check ahead of time.)");
+            "the inner group's leaves would be implicitly deleted client-side (gNMI §2.1.1). "
+            "Only atomic nesting is spec-forced; we reject ALL nesting as a deliberate "
+            "simplification (non-atomic nesting is unambiguous via the D3 longest-ancestor "
+            "rule, but unsupported). Sibling prefixes (e.g. /a/b and /a/bc) are fine; only "
+            "ancestor/descendant overlap is rejected. (wouldConflict() lets you check ahead "
+            "of time.)");
     }
 
-    auto [it, inserted] = groups_.try_emplace(name, RegistryAccess{}, name, std::move(canonPrefix),
-                                              atomic, preferredType);
-    NotificationGroup& group = it->second;
-    groupsByPrefix_.emplace(group.prefix(), &group);
+    // Materialise the prefix ONCE; the same handle becomes the map key and the group's
+    // prefix_ (L=B), mirroring registerLeafLocked.
+    auto prefixHandle = std::make_shared<const CanonicalPath>(std::move(canonPrefix));
+    groups_.try_emplace(prefixHandle, RegistryAccess{}, prefixHandle, atomic, preferredType);
 }
 
 LeafId LeafRegistry::registerLeafLocked(const std::string& path, std::optional<LeafType> type,
@@ -80,20 +107,21 @@ LeafId LeafRegistry::registerLeafLocked(const std::string& path, std::optional<L
 }
 
 NotificationGroup* LeafRegistry::findOwningGroup(const CanonicalPath& path) {
-    // Longest-first so the most specific group wins; D5 makes the choice unique.
+    // Longest-first so the most specific group wins; D5 makes the choice unique. Probes
+    // groups_ by a string_view ancestor slice (DerefLess transparent) — no key materialised.
     for (std::string_view ancestor : ancestorPrefixes(path)) {
-        auto it = groupsByPrefix_.find(ancestor);
-        if (it != groupsByPrefix_.end()) {
-            return it->second;
+        auto it = groups_.find(ancestor);
+        if (it != groups_.end()) {
+            return &it->second;
         }
     }
     return nullptr;
 }
 
 const CanonicalPath* LeafRegistry::overlappingPrefix(const CanonicalPath& prefix) const {
-    for (const auto& [existing, _] : groupsByPrefix_) {
-        if (isUnderPrefix(prefix, existing) || isUnderPrefix(existing, prefix)) {
-            return &existing;
+    for (const auto& [existing, _] : groups_) {
+        if (isUnderPrefix(prefix, *existing) || isUnderPrefix(*existing, prefix)) {
+            return existing.get();
         }
     }
     return nullptr;
@@ -107,8 +135,7 @@ LeafValueSnapshot LeafRegistry::snapshotOf(const LeafEntry& leaf) const {
 }
 
 GroupView LeafRegistry::viewOf(const NotificationGroup& group) const {
-    GroupView view{.name          = group.name(),
-                   .prefix        = group.prefix().str(),
+    GroupView view{.prefix        = group.prefix().str(),
                    .atomic        = group.atomic(),
                    .preferredType = group.preferredType(),
                    .memberPaths   = {}};
@@ -146,10 +173,12 @@ std::optional<LeafValueSnapshot> LeafRegistry::getLeaf(const LeafId& id) const {
     return snapshotOf(it->second);
 }
 
-std::optional<GroupView> LeafRegistry::getGroup(const std::string& name) const {
+std::optional<GroupView> LeafRegistry::getGroup(const std::string& prefix) const {
+    const CanonicalPath canonPrefix = canonicalize(prefix);
+
     std::shared_lock lock(mutex_);
 
-    auto it = groups_.find(name);
+    auto it = groups_.find(canonPrefix);
     if (it == groups_.end()) {
         return std::nullopt;
     }
@@ -160,9 +189,9 @@ std::vector<std::string> LeafRegistry::registeredPrefixes() const {
     std::shared_lock lock(mutex_);
 
     std::vector<std::string> prefixes;
-    prefixes.reserve(groupsByPrefix_.size());
-    for (const auto& [prefix, _] : groupsByPrefix_) {  // map is ordered, so already sorted
-        prefixes.push_back(prefix.str());
+    prefixes.reserve(groups_.size());
+    for (const auto& [prefix, _] : groups_) {  // map is ordered, so already sorted
+        prefixes.push_back(prefix->str());
     }
     return prefixes;
 }
@@ -183,19 +212,12 @@ LeafSnapshot LeafRegistry::collectLeaves(const std::string& prefix) const {
 
     std::shared_lock lock(mutex_);
 
-    // Keys sharing canonPrefix as a STRING prefix form a contiguous block from
-    // lower_bound; isUnderPrefix then keeps only true subtree members (excludes
-    // /a/bc under /a/b — spec §2.4.2 node + children, not string prefix).
+    // §2.4.2 subtree members under canonPrefix (see forEachUnderPrefix for the boundary).
     LeafSnapshot snapshot;
-    for (auto it = leaves_.lower_bound(canonPrefix); it != leaves_.end(); ++it) {
-        const CanonicalPath& path = *it->first;
-        if (!path.str().starts_with(canonPrefix.str())) {
-            break;
-        }
-        if (isUnderPrefix(canonPrefix, path)) {
-            snapshot.emplace(path.str(), snapshotOf(it->second));
-        }
-    }
+    forEachUnderPrefix(leaves_, canonPrefix, [&](auto it) {
+        snapshot.emplace(it->first->str(), snapshotOf(it->second));
+        return std::next(it);
+    });
     return snapshot;
 }
 
@@ -206,34 +228,28 @@ SubscriptionView LeafRegistry::collectForSubscription(const std::string& query) 
 
     SubscriptionView view;
     std::unordered_set<const NotificationGroup*> seen;
-    for (auto it = leaves_.lower_bound(canonQuery); it != leaves_.end(); ++it) {
-        const CanonicalPath& path = *it->first;
-        if (!path.str().starts_with(canonQuery.str())) {
-            break;
-        }
-        if (!isUnderPrefix(canonQuery, path)) {
-            continue;
-        }
+    forEachUnderPrefix(leaves_, canonQuery, [&](auto it) {
         const LeafEntry& leaf = it->second;
-        view.leaves.emplace(path.str(), snapshotOf(leaf));
+        view.leaves.emplace(it->first->str(), snapshotOf(leaf));
         if (const NotificationGroup* g = leaf.group(); g && seen.insert(g).second) {
             view.groups.push_back(viewOf(*g));
         }
-    }
+        return std::next(it);
+    });
     return view;
 }
 
-std::vector<LeafId> LeafRegistry::attachSubtree(const SubtreeSpec& spec) {
+std::map<std::string, LeafId> LeafRegistry::attachSubtree(const SubtreeSpec& spec) {
     std::unique_lock lock(mutex_);
 
     // Groups before leaves, so the leaves auto-assign within the same branch (D3).
     for (const auto& g : spec.groups) {
-        registerGroupLocked(g.name, g.prefix, g.atomic, g.preferredType);
+        registerGroupLocked(g.prefix, g.atomic, g.preferredType);
     }
-    std::vector<LeafId> ids;
-    ids.reserve(spec.leaves.size());
+    std::map<std::string, LeafId> ids;
     for (const auto& l : spec.leaves) {
-        ids.push_back(registerLeafLocked(l.path, l.type, l.initialValue));
+        LeafId id = registerLeafLocked(l.path, l.type, l.initialValue);
+        ids.emplace(canonicalize(l.path).str(), id);  // addressable by canonical path, not spec order
     }
     return ids;
 }
@@ -244,38 +260,17 @@ void LeafRegistry::detachSubtree(const std::string& prefix) {
     std::unique_lock lock(mutex_);
 
     // Remove every leaf under the branch, unlinking from its group first (D1).
-    for (auto it = leaves_.lower_bound(canonPrefix); it != leaves_.end();) {
-        const CanonicalPath& path = *it->first;
-        if (!path.str().starts_with(canonPrefix.str())) {
-            break;
+    forEachUnderPrefix(leaves_, canonPrefix, [&](auto it) {
+        LeafEntry& leaf = it->second;
+        if (leaf.group_ != nullptr) {
+            leaf.group_->unlinkLeaf(&leaf);
         }
-        if (isUnderPrefix(canonPrefix, path)) {
-            LeafEntry& leaf = it->second;
-            if (leaf.group_ != nullptr) {
-                leaf.group_->unlinkLeaf(&leaf);
-            }
-            it = leaves_.erase(it);
-        } else {
-            ++it;
-        }
-    }
+        return leaves_.erase(it);
+    });
 
-    // Remove every group whose prefix is under the branch (its members are already
-    // gone). A group with a broader prefix outside the branch survives, minus the
-    // leaves just unlinked.
-    for (auto it = groupsByPrefix_.lower_bound(canonPrefix); it != groupsByPrefix_.end();) {
-        const CanonicalPath& groupPrefix = it->first;
-        if (!groupPrefix.str().starts_with(canonPrefix.str())) {
-            break;
-        }
-        if (isUnderPrefix(canonPrefix, groupPrefix)) {
-            const std::string name = it->second->name();
-            it = groupsByPrefix_.erase(it);
-            groups_.erase(name);
-        } else {
-            ++it;
-        }
-    }
+    // Remove every group whose prefix is under the branch (its members are already gone).
+    // A group with a broader prefix outside the branch survives, minus the leaves just unlinked.
+    forEachUnderPrefix(groups_, canonPrefix, [&](auto it) { return groups_.erase(it); });
 }
 
 void LeafRegistry::unregisterLeaf(const std::string& path) {
@@ -294,10 +289,12 @@ void LeafRegistry::unregisterLeaf(const std::string& path) {
     leaves_.erase(it);
 }
 
-void LeafRegistry::unregisterGroup(const std::string& name) {
+void LeafRegistry::unregisterGroup(const std::string& prefix) {
+    const CanonicalPath canonPrefix = canonicalize(prefix);
+
     std::unique_lock lock(mutex_);
 
-    auto it = groups_.find(name);
+    auto it = groups_.find(canonPrefix);
     if (it == groups_.end()) {
         return;
     }
@@ -307,7 +304,6 @@ void LeafRegistry::unregisterGroup(const std::string& name) {
     for (LeafEntry* member : group.members()) {
         member->group_ = nullptr;
     }
-    groupsByPrefix_.erase(group.prefix());
     groups_.erase(it);
 }
 

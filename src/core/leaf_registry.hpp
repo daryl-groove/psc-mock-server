@@ -36,8 +36,7 @@ using LeafSnapshot = std::map<std::string, LeafValueSnapshot>;
 // A group as the protocol layer needs it: identity, atomic flag, and the FULL
 // member list (sorted, value-copied) for atomic monitored-set expansion (D13).
 struct GroupView {
-    std::string              name;
-    std::string              prefix;
+    std::string              prefix;  // canonical; the group's identity (D4)
     bool                     atomic = false;
     std::optional<LeafType>  preferredType;
     std::vector<std::string> memberPaths;  // sorted canonical strings
@@ -56,7 +55,6 @@ struct SubscriptionView {
 // adds the whole thing under one exclusive lock; detachSubtree removes it by prefix.
 struct SubtreeSpec {
     struct GroupSpec {
-        std::string             name;
         std::string             prefix;
         bool                    atomic = false;
         std::optional<LeafType> preferredType;
@@ -116,8 +114,9 @@ public:
     // --- Structural mutation (exclusive lock; throws std::invalid_argument on
     //     misconfiguration — duplicate name/path, overlapping prefix) ---
 
-    // Registers a group, enforcing the D5 non-overlapping-prefix constraint.
-    void registerGroup(const std::string& name, const std::string& prefix, bool atomic,
+    // Registers a group (identified by its prefix, D4), enforcing the D5
+    // non-overlapping-prefix constraint.
+    void registerGroup(const std::string& prefix, bool atomic,
                        std::optional<LeafType> preferredType = std::nullopt);
 
     // Registers a leaf, canonicalizes its path, auto-assigns it to the matching
@@ -126,9 +125,10 @@ public:
                         std::optional<gnmi::TypedValue> initialValue = std::nullopt);
 
     // Adds a whole device branch under one exclusive lock (D12) — a concurrent
-    // reader sees none of it or all of it, never a partial branch. Returns the
-    // leaves' handles. A malformed spec (duplicate/overlap) throws.
-    std::vector<LeafId> attachSubtree(const SubtreeSpec& spec);
+    // reader sees none of it or all of it, never a partial branch. Returns a
+    // canonical-path → LeafId map for the branch's leaves, so a caller addresses each
+    // handle by path rather than by spec order. A malformed spec (dup/overlap) throws.
+    std::map<std::string, LeafId> attachSubtree(const SubtreeSpec& spec);
 
     // Removes a whole branch atomically (D12): every leaf under prefix (unlinked
     // from its group first, D1 erase order) and every group whose prefix is under
@@ -139,14 +139,14 @@ public:
     // absent.
     void unregisterLeaf(const std::string& path);
 
-    // Removes one group; its members survive as ungrouped independent units (D9).
-    void unregisterGroup(const std::string& name);
+    // Removes one group (by prefix); its members survive as ungrouped independent units (D9).
+    void unregisterGroup(const std::string& prefix);
 
     // --- Reads (shared lock; value copies, no pointer escapes) ---
 
     std::optional<LeafValueSnapshot> getLeaf(const std::string& path) const;
     std::optional<LeafValueSnapshot> getLeaf(const LeafId& id) const;
-    std::optional<GroupView>         getGroup(const std::string& name) const;
+    std::optional<GroupView>         getGroup(const std::string& prefix) const;
 
     // --- Advisory pre-checks for the D5 prefix constraint (shared lock, read-only) ---
     //
@@ -186,13 +186,15 @@ private:
 
     // Register one group/leaf assuming the exclusive lock is already held — the
     // shared core of register*/attachSubtree, so a whole branch is one lock (D12).
-    void   registerGroupLocked(const std::string& name, const std::string& prefix, bool atomic,
+    void   registerGroupLocked(const std::string& prefix, bool atomic,
                                std::optional<LeafType> preferredType);
     LeafId registerLeafLocked(const std::string& path, std::optional<LeafType> type,
                               std::optional<gnmi::TypedValue> initialValue);
 
-    // Deref-comparator for the shared-path key, with transparent lookup from a
-    // freshly canonicalize()d CanonicalPath (no shared_ptr allocation to look up).
+    // Deref-comparator for a shared CanonicalPath key (leaves_ and groups_), transparent so
+    // a lookup can probe with either a freshly canonicalize()d CanonicalPath (no shared_ptr
+    // allocation) or a string_view ancestor slice from ancestorPrefixes (the D3 auto-assign
+    // walk) — both without materialising a key.
     struct DerefLess {
         using is_transparent = void;
         bool operator()(const std::shared_ptr<const CanonicalPath>& a,
@@ -203,15 +205,10 @@ private:
                         const CanonicalPath& b) const noexcept { return *a < b; }
         bool operator()(const CanonicalPath& a,
                         const std::shared_ptr<const CanonicalPath>& b) const noexcept { return a < *b; }
-    };
-
-    // Transparent comparator so the prefix index can be probed by a string_view
-    // ancestor slice (from ancestorPrefixes) without building a CanonicalPath.
-    struct PrefixLess {
-        using is_transparent = void;
-        bool operator()(const CanonicalPath& a, const CanonicalPath& b) const noexcept { return a < b; }
-        bool operator()(const CanonicalPath& a, std::string_view b) const noexcept { return a.str() < b; }
-        bool operator()(std::string_view a, const CanonicalPath& b) const noexcept { return a < b.str(); }
+        bool operator()(const std::shared_ptr<const CanonicalPath>& a,
+                        std::string_view b) const noexcept { return a->str() < b; }
+        bool operator()(std::string_view a,
+                        const std::shared_ptr<const CanonicalPath>& b) const noexcept { return a < b->str(); }
     };
 
     // Returns the single group whose prefix is a path-ancestor of `path`, or
@@ -230,8 +227,11 @@ private:
     // Primary leaf store — node-based std::map for pointer stability (D1), keyed on
     // the shared CanonicalPath handle (L=B): the map key IS the leaf's path handle.
     std::map<std::shared_ptr<const CanonicalPath>, LeafEntry, DerefLess> leaves_;
-    std::map<std::string, NotificationGroup>                          groups_;          // by name
-    std::map<CanonicalPath, NotificationGroup*, PrefixLess>           groupsByPrefix_;  // by prefix
+
+    // Groups keyed by their prefix handle (D4): the prefix IS the group identity, so one
+    // map both owns and indexes — no separate by-name store. The key is shared zero-copy with
+    // NotificationGroup::prefix_ (L=B), mirroring leaves_.
+    std::map<std::shared_ptr<const CanonicalPath>, NotificationGroup, DerefLess> groups_;
 
     uint64_t                  globalSeq_ = 0;  // registry-global monotonic change token (D14)
     mutable std::shared_mutex mutex_;

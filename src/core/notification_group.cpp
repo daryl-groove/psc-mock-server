@@ -7,7 +7,7 @@ namespace gnmid::core {
 bool NotificationGroup::linkLeaf(LeafEntry* e) {
     // Element-aligned under-prefix check (D16); a bare list prefix does not capture
     // a keyed entry. The path is already canonical, so no re-normalization here.
-    if (e == nullptr || !isUnderPrefix(prefix_, e->path())) {
+    if (e == nullptr || !isUnderPrefix(*prefix_, e->path())) {
         return false;
     }
     members_.insert(e);

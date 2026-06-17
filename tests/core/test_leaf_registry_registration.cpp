@@ -10,8 +10,8 @@ using namespace gnmid::core;
 
 namespace {
 
-std::vector<std::string> membersOf(const LeafRegistry& reg, const std::string& group) {
-    auto view = reg.getGroup(group);
+std::vector<std::string> membersOf(const LeafRegistry& reg, const std::string& prefix) {
+    auto view = reg.getGroup(prefix);
     return view ? view->memberPaths : std::vector<std::string>{};
 }
 
@@ -19,18 +19,17 @@ std::vector<std::string> membersOf(const LeafRegistry& reg, const std::string& g
 
 TEST(LeafRegistryRegistration, RegisterGroupThenGetGroup) {
     LeafRegistry reg;
-    reg.registerGroup("g", "/a/b/c", /*atomic=*/true);
+    reg.registerGroup("/a/b/c", /*atomic=*/true);
 
-    auto view = reg.getGroup("g");
+    auto view = reg.getGroup("/a/b/c");
     ASSERT_TRUE(view.has_value());
-    EXPECT_EQ(view->name, "g");
     EXPECT_EQ(view->prefix, "/a/b/c");
     EXPECT_TRUE(view->atomic);
 }
 
 TEST(LeafRegistryRegistration, GetGroupMissingReturnsNullopt) {
     LeafRegistry reg;
-    EXPECT_FALSE(reg.getGroup("nope").has_value());
+    EXPECT_FALSE(reg.getGroup("/no/such/group").has_value());
 }
 
 TEST(LeafRegistryRegistration, GetLeafMissingReturnsNullopt) {
@@ -40,18 +39,18 @@ TEST(LeafRegistryRegistration, GetLeafMissingReturnsNullopt) {
 
 TEST(LeafRegistryRegistration, RegisterLeafAutoAssignsToMatchingGroup) {
     LeafRegistry reg;
-    reg.registerGroup("g", "/a/b/c", /*atomic=*/false);
+    reg.registerGroup("/a/b/c", /*atomic=*/false);
     reg.registerLeaf("/a/b/c/d");
 
-    EXPECT_EQ(membersOf(reg, "g"), (std::vector<std::string>{"/a/b/c/d"}));
+    EXPECT_EQ(membersOf(reg, "/a/b/c"), (std::vector<std::string>{"/a/b/c/d"}));
 }
 
 TEST(LeafRegistryRegistration, RegisterLeafWithNoMatchingGroupIsUngrouped) {
     LeafRegistry reg;
-    reg.registerGroup("g", "/a/b/c", /*atomic=*/false);
+    reg.registerGroup("/a/b/c", /*atomic=*/false);
     reg.registerLeaf("/x/y/z");
 
-    EXPECT_TRUE(membersOf(reg, "g").empty());
+    EXPECT_TRUE(membersOf(reg, "/a/b/c").empty());
     EXPECT_TRUE(reg.getLeaf("/x/y/z").has_value());
 }
 
@@ -60,55 +59,50 @@ TEST(LeafRegistryRegistration, AutoAssignPicksMostSpecificAncestor) {
     // dashed-sibling /a/b-x must not capture it — the case a single upper_bound step
     // gets wrong (/a/b < /a/b-x < /a/b/c).
     LeafRegistry reg;
-    reg.registerGroup("gb", "/a/b", /*atomic=*/false);
-    reg.registerGroup("gdash", "/a/b-x", /*atomic=*/false);
+    reg.registerGroup("/a/b", /*atomic=*/false);
+    reg.registerGroup("/a/b-x", /*atomic=*/false);
     reg.registerLeaf("/a/b/c");
 
-    EXPECT_EQ(membersOf(reg, "gb"), (std::vector<std::string>{"/a/b/c"}));
-    EXPECT_TRUE(membersOf(reg, "gdash").empty());
+    EXPECT_EQ(membersOf(reg, "/a/b"), (std::vector<std::string>{"/a/b/c"}));
+    EXPECT_TRUE(membersOf(reg, "/a/b-x").empty());
 }
 
 TEST(LeafRegistryRegistration, NonOverlappingStringPrefixGroupsCoexist) {
     // /a/b and /a/bc are string-prefixes but not path-ancestors → both legal (J).
     LeafRegistry reg;
-    EXPECT_NO_THROW(reg.registerGroup("g1", "/a/b", /*atomic=*/true));
-    EXPECT_NO_THROW(reg.registerGroup("g2", "/a/bc", /*atomic=*/false));
+    EXPECT_NO_THROW(reg.registerGroup("/a/b", /*atomic=*/true));
+    EXPECT_NO_THROW(reg.registerGroup("/a/bc", /*atomic=*/false));
 
     reg.registerLeaf("/a/b/x");
     reg.registerLeaf("/a/bc/y");
-    EXPECT_EQ(membersOf(reg, "g1"), (std::vector<std::string>{"/a/b/x"}));
-    EXPECT_EQ(membersOf(reg, "g2"), (std::vector<std::string>{"/a/bc/y"}));
+    EXPECT_EQ(membersOf(reg, "/a/b"), (std::vector<std::string>{"/a/b/x"}));
+    EXPECT_EQ(membersOf(reg, "/a/bc"), (std::vector<std::string>{"/a/bc/y"}));
 }
 
 TEST(LeafRegistryRegistration, D5OverlapDescendantThrows) {
     LeafRegistry reg;
-    reg.registerGroup("ancestor", "/a/b", /*atomic=*/true);
-    EXPECT_THROW(reg.registerGroup("descendant", "/a/b/c/d", /*atomic=*/false),
-                 std::invalid_argument);
+    reg.registerGroup("/a/b", /*atomic=*/true);
+    EXPECT_THROW(reg.registerGroup("/a/b/c/d", /*atomic=*/false), std::invalid_argument);
 }
 
 TEST(LeafRegistryRegistration, D5OverlapAncestorThrows) {
     LeafRegistry reg;
-    reg.registerGroup("descendant", "/a/b/c/d", /*atomic=*/false);
-    EXPECT_THROW(reg.registerGroup("ancestor", "/a/b", /*atomic=*/true), std::invalid_argument);
+    reg.registerGroup("/a/b/c/d", /*atomic=*/false);
+    EXPECT_THROW(reg.registerGroup("/a/b", /*atomic=*/true), std::invalid_argument);
 }
 
 TEST(LeafRegistryRegistration, D5OverlapIdenticalPrefixThrows) {
+    // An identical prefix is the equal case of the D5 overlap rule — and, since the prefix
+    // is now the group's sole identity (F1), this is also what "duplicate group" means.
     LeafRegistry reg;
-    reg.registerGroup("g1", "/a/b/c", /*atomic=*/false);
-    EXPECT_THROW(reg.registerGroup("g2", "/a/b/c", /*atomic=*/true), std::invalid_argument);
+    reg.registerGroup("/a/b/c", /*atomic=*/false);
+    EXPECT_THROW(reg.registerGroup("/a/b/c", /*atomic=*/true), std::invalid_argument);
 }
 
 TEST(LeafRegistryRegistration, SiblingPrefixesAreAllowed) {
     LeafRegistry reg;
-    EXPECT_NO_THROW(reg.registerGroup("a", "/a/b/c/d1", /*atomic=*/true));
-    EXPECT_NO_THROW(reg.registerGroup("b", "/a/b/c/d2", /*atomic=*/false));
-}
-
-TEST(LeafRegistryRegistration, DuplicateGroupNameThrows) {
-    LeafRegistry reg;
-    reg.registerGroup("g", "/a/b", /*atomic=*/false);
-    EXPECT_THROW(reg.registerGroup("g", "/x/y", /*atomic=*/false), std::invalid_argument);
+    EXPECT_NO_THROW(reg.registerGroup("/a/b/c/d1", /*atomic=*/true));
+    EXPECT_NO_THROW(reg.registerGroup("/a/b/c/d2", /*atomic=*/false));
 }
 
 TEST(LeafRegistryRegistration, DuplicateLeafPathThrows) {
@@ -138,11 +132,12 @@ TEST(LeafRegistryRegistration, CanonicalEquivalenceKeyOrderAndTrailingSlash) {
 
 TEST(LeafRegistryRegistration, NormalizedLeafAutoAssignsUnderNormalizedGroupPrefix) {
     LeafRegistry reg;
-    reg.registerGroup("g", "/if/i[name=\"eth0\"]", /*atomic=*/true);
-    EXPECT_EQ(reg.getGroup("g")->prefix, "/if/i[name=eth0]");
+    reg.registerGroup("/if/i[name=\"eth0\"]", /*atomic=*/true);  // quoted spelling
+    EXPECT_EQ(reg.getGroup("/if/i[name=eth0]")->prefix, "/if/i[name=eth0]");
 
     reg.registerLeaf("/if/i[name=\"eth0\"]/state/oper");
-    EXPECT_EQ(membersOf(reg, "g"), (std::vector<std::string>{"/if/i[name=eth0]/state/oper"}));
+    EXPECT_EQ(membersOf(reg, "/if/i[name=eth0]"),
+              (std::vector<std::string>{"/if/i[name=eth0]/state/oper"}));
 }
 
 TEST(LeafRegistryRegistration, LeafRegisteredBeforeGroupIsNotRetroactivelyAssigned) {
@@ -150,17 +145,17 @@ TEST(LeafRegistryRegistration, LeafRegisteredBeforeGroupIsNotRetroactivelyAssign
     // no group and stays ungrouped even after the group is later registered.
     LeafRegistry reg;
     reg.registerLeaf("/a/b/c/d");
-    reg.registerGroup("g", "/a/b/c", /*atomic=*/false);
+    reg.registerGroup("/a/b/c", /*atomic=*/false);
 
-    EXPECT_TRUE(membersOf(reg, "g").empty());
+    EXPECT_TRUE(membersOf(reg, "/a/b/c").empty());
 }
 
 // --- Advisory D5 pre-checks (registeredPrefixes / wouldConflict) -----------
 
 TEST(LeafRegistryRegistration, RegisteredPrefixesListsSortedCanonicalPrefixes) {
     LeafRegistry reg;
-    reg.registerGroup("g2", "/a/x", /*atomic=*/false);
-    reg.registerGroup("g1", "/a/b[name=\"eth0\"]", /*atomic=*/true);  // quoted spelling
+    reg.registerGroup("/a/x", /*atomic=*/false);
+    reg.registerGroup("/a/b[name=\"eth0\"]", /*atomic=*/true);  // quoted spelling
 
     EXPECT_EQ(reg.registeredPrefixes(),
               (std::vector<std::string>{"/a/b[name=eth0]", "/a/x"}));  // sorted + canonical
@@ -168,7 +163,7 @@ TEST(LeafRegistryRegistration, RegisteredPrefixesListsSortedCanonicalPrefixes) {
 
 TEST(LeafRegistryRegistration, WouldConflictReportsTheClashingAncestorOrDescendant) {
     LeafRegistry reg;
-    reg.registerGroup("g", "/a/b/c", /*atomic=*/false);
+    reg.registerGroup("/a/b/c", /*atomic=*/false);
 
     EXPECT_EQ(reg.wouldConflict("/a/b"), "/a/b/c");        // new is ancestor of existing
     EXPECT_EQ(reg.wouldConflict("/a/b/c/d"), "/a/b/c");    // new is descendant of existing
@@ -178,7 +173,7 @@ TEST(LeafRegistryRegistration, WouldConflictReportsTheClashingAncestorOrDescenda
 
 TEST(LeafRegistryRegistration, WouldConflictReturnsNulloptForFreeOrSiblingPrefix) {
     LeafRegistry reg;
-    reg.registerGroup("g", "/a/b/c", /*atomic=*/false);
+    reg.registerGroup("/a/b/c", /*atomic=*/false);
 
     EXPECT_FALSE(reg.wouldConflict("/a/b/d").has_value());  // sibling
     EXPECT_FALSE(reg.wouldConflict("/a/bc").has_value());   // string-prefix, not path-ancestor
@@ -187,22 +182,22 @@ TEST(LeafRegistryRegistration, WouldConflictReturnsNulloptForFreeOrSiblingPrefix
 
 TEST(LeafRegistryRegistration, WouldConflictAgreesWithRegisterGroupOutcome) {
     LeafRegistry reg;
-    reg.registerGroup("g", "/a/b/c", /*atomic=*/false);
+    reg.registerGroup("/a/b/c", /*atomic=*/false);
 
     // Advisory check agrees with the authoritative throw: conflicting -> throws,
     // free -> registers.
     ASSERT_TRUE(reg.wouldConflict("/a/b").has_value());
-    EXPECT_THROW(reg.registerGroup("clash", "/a/b", /*atomic=*/false), std::invalid_argument);
+    EXPECT_THROW(reg.registerGroup("/a/b", /*atomic=*/false), std::invalid_argument);
 
     ASSERT_FALSE(reg.wouldConflict("/a/b/d").has_value());
-    EXPECT_NO_THROW(reg.registerGroup("ok", "/a/b/d", /*atomic=*/false));
+    EXPECT_NO_THROW(reg.registerGroup("/a/b/d", /*atomic=*/false));
 }
 
 TEST(LeafRegistryRegistration, OverlapErrorMessageExplainsWhy) {
     LeafRegistry reg;
-    reg.registerGroup("g", "/a/b", /*atomic=*/true);
+    reg.registerGroup("/a/b", /*atomic=*/true);
     try {
-        reg.registerGroup("clash", "/a/b/c", /*atomic=*/false);
+        reg.registerGroup("/a/b/c", /*atomic=*/false);
         FAIL() << "expected overlap to throw";
     } catch (const std::invalid_argument& e) {
         const std::string msg = e.what();

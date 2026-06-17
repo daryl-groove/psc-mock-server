@@ -77,7 +77,7 @@ TEST(Values, CollectLeavesAtRootReturnsEverything) {
 
 TEST(Values, CollectLeavesResolvesEffectiveType) {
     LeafRegistry reg;
-    reg.registerGroup("g", "/a/b", /*atomic=*/false, LeafType::State);
+    reg.registerGroup("/a/b", /*atomic=*/false, LeafType::State);
     reg.registerLeaf("/a/b/inherits");
     reg.registerLeaf("/a/b/own", LeafType::Config);
     reg.registerLeaf("/a/lonely");
@@ -195,7 +195,7 @@ TEST(Values, PollDiffNoChangeIsEmpty) {
 
 TEST(Values, OneWriteScopeAppliesAllAtomicMembers) {
     LeafRegistry reg;
-    reg.registerGroup("ntp", "/system/ntp", /*atomic=*/true);
+    reg.registerGroup("/system/ntp", /*atomic=*/true);
     LeafId server = reg.registerLeaf("/system/ntp/server");
     LeafId port   = reg.registerLeaf("/system/ntp/port");
     LeafId vrf    = reg.registerLeaf("/system/ntp/vrf");
@@ -213,7 +213,7 @@ TEST(Values, OneWriteScopeAppliesAllAtomicMembers) {
 
 TEST(Values, ConcurrentReaderNeverSeesHalfUpdatedAtomicGroup) {
     LeafRegistry reg;
-    reg.registerGroup("ntp", "/system/ntp", /*atomic=*/true);
+    reg.registerGroup("/system/ntp", /*atomic=*/true);
     LeafId a = reg.registerLeaf("/system/ntp/a");
     LeafId b = reg.registerLeaf("/system/ntp/b");
     LeafId c = reg.registerLeaf("/system/ntp/c");

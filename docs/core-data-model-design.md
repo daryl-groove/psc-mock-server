@@ -195,8 +195,10 @@ overloading a sentinel enum value.
 
 `path_` is likewise a `shared_ptr<const CanonicalPath>` (L=B): the canonical path
 is materialised once and that single handle is shared by the registry map key,
-this entry, its `LeafId`, snapshots, and change events — a refcount bump rather
-than a string copy, and refcount-safe so it cannot dangle after a detach (D16/D17).
+this entry, its `LeafId`, and the push change-event (`LeafChange`) payload — a
+refcount bump rather than a string copy, and refcount-safe so it cannot dangle after
+a detach (D16/D17). (The snapshot is **not** in this list — it is a value-copy
+projection keyed by the canonical *string*; see D7.)
 
 Because the type is non-copyable and non-movable, the registry stores it in a
 node-based `std::map` and constructs it in place with `try_emplace` (no copy or
@@ -210,8 +212,7 @@ into the registry's leaf map. Also non-copyable.
 
 | Field            | Type                          | Meaning                                          |
 |------------------|-------------------------------|--------------------------------------------------|
-| `name_`          | `string`                      | Unique key (map key)                             |
-| `prefix_`        | `string` (normalized)         | gNMI notification prefix for this group          |
+| `prefix_`        | `shared_ptr<const CanonicalPath>` | The group's identity **and** map key (D4); SAME handle as the `groups_` key (L=B) |
 | `atomic_`        | `bool`                        | Whether the notification carries `atomic=true`   |
 | `preferredType_` | `optional<LeafType>`          | Lazy-init default type; `nullopt` = no preference|
 | `members_`       | `unordered_set<LeafEntry*>`   | Non-owning pointers to registry-owned entries    |
@@ -222,8 +223,8 @@ into the registry's leaf map. Also non-copyable.
 
 class NotificationGroup {
 public:
-    const std::string&             name() const noexcept { return name_; }
-    const std::string&             prefix() const noexcept { return prefix_; }
+    // A group is identified SOLELY by its prefix (D4) — there is no name.
+    const CanonicalPath&           prefix() const noexcept { return *prefix_; }
     bool                           atomic() const noexcept { return atomic_; }
     std::optional<LeafType>        preferredType() const noexcept { return preferredType_; }
     const std::unordered_set<LeafEntry*>& members() const noexcept { return members_; }
@@ -233,19 +234,19 @@ public:
 
 private:
     friend class LeafRegistry;          // registry creates, links, and tears down
-    NotificationGroup(std::string n, std::string p, bool a, std::optional<LeafType> t)
-        : name_(std::move(n)), prefix_(std::move(p)), atomic_(a), preferredType_(t) {}
+    // (real ctor also takes a RegistryAccess passkey, D11; elided here)
+    NotificationGroup(std::shared_ptr<const CanonicalPath> p, bool a, std::optional<LeafType> t)
+        : prefix_(std::move(p)), atomic_(a), preferredType_(t) {}
 
-    // Link/unlink a leaf. Validates path is under prefix_; maintains the
+    // Link/unlink a leaf. Validates path is under *prefix_; maintains the
     // bidirectional invariant (leaf.group_ <-> members_). Registry-only.
     bool linkLeaf(LeafEntry* e);
     void unlinkLeaf(LeafEntry* e);
 
-    std::string                    name_;
-    std::string                    prefix_;
-    bool                           atomic_ = false;
-    std::optional<LeafType>        preferredType_;
-    std::unordered_set<LeafEntry*> members_;
+    std::shared_ptr<const CanonicalPath> prefix_;  // SAME handle as the groups_ key (L=B / D16)
+    bool                                 atomic_ = false;
+    std::optional<LeafType>              preferredType_;
+    std::unordered_set<LeafEntry*>       members_;
 };
 
 // Defined here because group->preferredType_ requires the complete definition.
@@ -286,14 +287,13 @@ through registry methods; nothing outside can mutate a leaf or the topology.
 // allocating a shared_ptr.
 std::map<std::shared_ptr<const CanonicalPath>, LeafEntry, DerefLess>  leaves_;
 
-// Primary group store — same pointer-stability requirement.
-std::map<std::string, NotificationGroup>  groups_;          // keyed by name
-
-// Secondary prefix index for auto-assign and the D5 overlap check. Non-owning;
-// kept in sync with groups_ at (un)registerGroup / (de)tachSubtree time. Keyed by
-// CanonicalPath (mirrors NotificationGroup::prefix_, D16) with a transparent
-// comparator so an ancestorPrefixes() string_view slice probes it directly.
-std::map<CanonicalPath, NotificationGroup*, PrefixLess>  groupsByPrefix_;  // keyed by prefix
+// Group store — keyed by the group's prefix handle (D4): the prefix IS the group's
+// identity, so a single node-based map both owns and indexes it (no separate by-name store,
+// no secondary index). The key is the SAME shared CanonicalPath handle as
+// NotificationGroup::prefix_ (L=B), mirroring leaves_; DerefLess is transparent so both an
+// ancestorPrefixes() string_view slice (D3 auto-assign) and a freshly canonicalize()d prefix
+// probe it without allocating.
+std::map<std::shared_ptr<const CanonicalPath>, NotificationGroup, DerefLess>  groups_;  // keyed by prefix
 
 uint64_t                  globalSeq_ = 0;  // registry-global monotonic change token (D14)
 mutable std::shared_mutex mutex_;
@@ -321,8 +321,7 @@ using LeafSnapshot = std::map<std::string, LeafValueSnapshot>;   // keyed by pat
 // atomic flag, and the FULL member list (all members, including those outside
 // the current query — needed for atomic monitored-set expansion, Scenario 2).
 struct GroupView {
-    std::string              name;
-    std::string              prefix;
+    std::string              prefix;          // the group's identity (D4)
     bool                     atomic = false;
     std::optional<LeafType>  preferredType;
     std::vector<std::string> memberPaths;     // sorted; value-copy
@@ -342,14 +341,14 @@ struct SubscriptionView {
 
 | Method                                              | Returns             | Phase / notes                                          |
 |-----------------------------------------------------|---------------------|--------------------------------------------------------|
-| `registerGroup(name, prefix, atomic, preferredType?)`| `void`             | Exclusive lock; enforces D5; throws on dup/overlap     |
+| `registerGroup(prefix, atomic, preferredType?)`     | `void`              | Exclusive lock; enforces D5; throws on overlap (incl. identical = duplicate) |
 | `registerLeaf(path, type?, initialValue?)`          | `LeafId`            | Exclusive lock; canonicalizes; auto-assigns to group (D3) |
 | `unregisterLeaf(path)`                              | `void`              | Exclusive lock; detaches from group first (D1 erase order)|
-| `unregisterGroup(name)`                             | `void`              | Exclusive lock; members survive as ungrouped (D9)      |
-| `attachSubtree(SubtreeSpec)`                        | `vector<LeafId>`    | Exclusive lock; atomically adds a whole device branch (D14)|
+| `unregisterGroup(prefix)`                           | `void`              | Exclusive lock; members survive as ungrouped (D9)      |
+| `attachSubtree(SubtreeSpec)`                        | `map<string,LeafId>`| Exclusive lock; atomically adds a whole device branch (D14); returns path→LeafId|
 | `detachSubtree(prefix)`                             | `void`              | Exclusive lock; atomically removes a whole branch (D14)|
 | `getLeaf(LeafId / path)`                            | `optional<LeafValueSnapshot>` | Shared lock; value-copy, no pointer escapes  |
-| `getGroup(name)`                                    | `optional<GroupView>`| Shared lock; value-copy                               |
+| `getGroup(prefix)`                                  | `optional<GroupView>`| Shared lock; value-copy                               |
 | `collectLeaves(prefix)`                             | `LeafSnapshot`      | Shared lock; ON\_CHANGE poll hot path (D7)             |
 | `collectForSubscription(query)`                     | `SubscriptionView`  | Shared lock; one-shot subscription setup (D15)         |
 | `writeValues()`                                     | `ValueWriter`       | Exclusive lock; the ONLY value-write path (D6)         |
@@ -375,21 +374,26 @@ data and value remain valid.
 ```cpp
 enum class LeafType {
     Config,       // writable config leaf (gNMI Set target)
-    State,        // read-only operational state reported by device
-    Operational,  // default — read-only telemetry (sensors, counters, etc.)
+    State,        // read-only state, monitored via ON_CHANGE by default (e.g. oper-status)
+    Operational,  // default — read-only telemetry sampled by default (sensors, counters, etc.)
 };
 ```
 
 `Operational` is the default resolved by `effectiveType()` when neither leaf nor
-group specifies a type. `Config` / `State` mirror the YANG `config true/false`
-annotation and OpenConfig conventions.
+group specifies a type. `Config` is YANG `config true` (writable); **both `State` and
+`Operational` are `config false`** (read-only) — they are *not* a config/state pair. The
+distinction between them is purely the **server's default stream mode for a TARGET_DEFINED
+subscription**: `State`/`Config` resolve to `ON_CHANGE`, `Operational` to `SAMPLE`. This is
+only a default — a client may explicitly subscribe to any leaf in any mode; the type does
+not constrain delivery. (The core merely stores and resolves the type; the TARGET_DEFINED
+mapping itself lives in the protocol/boundary layer.)
 
 ---
 
 ## Header Organisation
 
 ```
-include/
+src/core/
 ├── leaf_type.hpp           — LeafType enum (no other deps)
 ├── leaf_id.hpp             — LeafId opaque handle
 ├── leaf_entry.hpp          — LeafEntry (encapsulated); fwd-declares NotificationGroup
@@ -592,9 +596,17 @@ no group and stays ungrouped even if the group is added later (no retroactive
 assignment). `attachSubtree` (D14) handles a device branch as one unit so this
 ordering is automatic within a branch.
 
-### D4 — Group name as unique key
+### D4 — Group identity is its prefix **[revised]**
 
-Groups are identified by a unique `name`, used as a map key for O(log G) lookup.
+A group is identified **solely by its prefix** — the `CanonicalPath` handle is the
+`groups_` map key, giving O(log G) lookup. There is **no separate `name`**: D5 already
+makes prefixes unique (an identical prefix is the equal case of the overlap rule, so it
+is rejected as a duplicate), and a group name has no gNMI/wire meaning (a `Notification`
+carries only `prefix` + `atomic`) and no invariant role (leaves link via a `group_`
+pointer, not by name). A human label, if ever wanted, is an authoring/observability-layer
+concern (device-modeling §8.1), not a core key. (Originally the group had a redundant
+`name` key + a second by-name map; this revision removed both, collapsing to one
+prefix-keyed map and making `NotificationGroup` mirror `LeafEntry` field-for-field.)
 
 ### D5 — Group prefix non-overlapping constraint *(enforced at registerGroup / attachSubtree)*
 
@@ -606,9 +618,16 @@ declares the *complete state* of P; leaves absent from it are implicitly deleted
 client-side. If two groups nest under the same prefix and either is atomic, the
 atomic notification silently wipes the other group's leaves from the client.
 
-**Why (auto-assign):** even with neither atomic, overlapping prefixes would give
-`registerLeaf()` auto-assign (D3) two equally-valid candidates. Non-overlap keeps
-D3 unambiguous independently of the atomic rule.
+**Only atomic nesting is spec-forced; the blanket rule is a deliberate simplification.**
+§2.1.1 only bites when one of the nested groups is `atomic`. Non-atomic/non-atomic
+nesting is **not** ambiguous for auto-assign: D3 probes ancestor prefixes **longest-first**,
+so a leaf deterministically joins its single longest-ancestor group regardless of nesting
+(there is exactly one longest matching prefix). We nonetheless reject **all** nesting —
+not because D3 forces it, but because a blanket "no nesting" is simpler to state, enforce,
+and reason about, and nested non-atomic *bundling* scopes have no real modelling use here.
+(Relaxing to "forbid nesting only when either group is atomic" is a possible future change
+if a genuine nested-bundle need ever appears; it is intentionally not built — it would be
+speculative generality.)
 
 Sibling prefixes are allowed: `/a/b/c/d1` and `/a/b/c/d2` do not overlap;
 `/a/b` and `/a/bc` do not overlap (string prefix but not a path ancestor).
@@ -646,6 +665,30 @@ the lock, and returns by value. The caller diffs two independent snapshots
 (before/after a poll interval) to detect ON\_CHANGE; no lock is held after return.
 The `value` copied into the snapshot is a `shared_ptr` to an *immutable version*,
 not a deep protobuf copy — see **D17** for why that is both cheap and safe.
+
+**Representation — value handle, path string (deliberate, not L=B).** A `LeafSnapshot`
+is keyed by the canonical-path **string**, and `LeafValueSnapshot` carries the
+`shared_ptr<const TypedValue>` value handle but **not** the path handle. This is a
+role-based split, not an oversight: the value is a potentially-large, COW-versioned
+payload, so it travels as a zero-copy handle; the path is identity/addressing on a
+**consumer-facing** read output, where a `std::string` key keeps `snap.at("/a/b")`
+ergonomic for providers and tests (note `std::map::at`/`operator[]` are *not*
+heterogeneous, so a handle key would force `find(canonicalize(...))` at every call
+site). The L=B single-materialised handle (D16) is therefore the **internal/substrate**
+invariant — map key, `LeafEntry::path_` / `NotificationGroup::prefix_`, `LeafId`, and the
+push `LeafChange` payload — **not** the snapshot.
+
+**Handle-keyed snapshot — evaluated, declined (even on the production trajectory).**
+Keying `LeafSnapshot` by `shared_ptr<const CanonicalPath>` would drop the per-interval
+path-string copies on the poll path. It is **not** adopted: (a) at scale, ON\_CHANGE
+moves to the push change-log (D17 *Future direction* / protocol P1), whose payload is
+*already* handle-based — so the snapshot becomes the **cold** path (initial sync /
+SAMPLE / Get) where the copy is irrelevant; (b) the snapshot is the **consumer-facing**
+read API, where string keys aid user-extensibility; (c) **no gNMI feature needs it** —
+the wire always stringifies the path anyway (wildcards expand to concrete paths, origin
+is handled at the boundary, atomic/`target`/delete-prefix all operate on path strings).
+It is a two-way door (hideable behind the `LeafSnapshot` typedef), revisitable if the
+snapshot path is ever profiled as hot.
 
 Subtree boundary is enforced via an ancestor-or-equal check so `/a/b/c` excludes
 `/a/b/cx` (spec §2.4.2 "node and all its children", not "string prefix").
@@ -703,7 +746,7 @@ struct SubtreeSpec {                     // declarative description of one devic
     std::vector<LeafSpec>  leaves;
 };
 
-std::vector<LeafId> attachSubtree(const SubtreeSpec& spec);  // exclusive lock
+std::map<std::string, LeafId> attachSubtree(const SubtreeSpec& spec);  // exclusive lock; path->LeafId
 void                detachSubtree(const std::string& prefix);// exclusive lock
 ```
 
@@ -861,9 +904,11 @@ CanonicalPath canonicalize(std::string_view raw);
 `shared_ptr<const CanonicalPath>` and shared everywhere: the registry keys
 `std::map<std::shared_ptr<const CanonicalPath>, …>` on it (a deref comparator with
 transparent lookup from a freshly `canonicalize()`d raw string), and that same
-handle is held by `LeafEntry::path_`, `LeafId`, snapshots, and change events. This
-removes the old key/`path_` string duplication and makes path-passing a refcount
-bump, mirroring the D17 value handle. Every boundary method (`registerLeaf`,
+handle is held by `LeafEntry::path_` / `NotificationGroup::prefix_`, `LeafId`, and the
+push change-event (`LeafChange`) payload (D6/P3) — **not** the snapshot, which is a
+value-copy projection keyed by the canonical *string* (D7). This removes the old
+key/`path_` string duplication and makes path-passing a refcount bump, mirroring the
+D17 value handle. Every boundary method (`registerLeaf`,
 `registerGroup`, `getLeaf`, `collectForSubscription`, the subtree ops …) takes a
 raw string, calls `canonicalize()` once, and works with the resulting handle. **It
 is impossible to put an un-normalized key into the registry** — the type system,
@@ -985,8 +1030,8 @@ each write as installing a *new immutable version* (copy-on-write).**
 
 **The same model now covers the path (L=B).** `LeafEntry::path_` is likewise a
 `shared_ptr<const CanonicalPath>` (D16): the canonical path is materialised once
-and that one handle is shared — registry map key, this entry, its `LeafId`,
-snapshots, and change events — as a zero-copy, refcount-safe handle. It mirrors
+and that one handle is shared — registry map key, this entry, its `LeafId`, and the
+push change-event (`LeafChange`) payload — as a zero-copy, refcount-safe handle. It mirrors
 the value handle, removes the old key/`path_` string duplication, and makes the
 change-event payload safe across the post-unlock cross-thread dispatch: it cannot
 dangle on a concurrent detach, restoring the D1 no-dangle guarantee (design-review
@@ -1142,7 +1187,7 @@ faithful match to gNMI's "a path names a node and all its children" semantics.
 |-----------------------------------------|--------------------------------------------|
 | Group prefix non-overlapping            | `registerGroup` / `attachSubtree`          |
 | Leaf auto-assigned to at most one group | `registerLeaf` (prefix scan, D3)           |
-| Group name unique                       | `registerGroup` / `attachSubtree`          |
+| Group identity = prefix (unique)        | `registerGroup` / `attachSubtree` (D4; identical prefix rejected by D5 overlap) |
 | Groups registered before their leaves   | caller convention; automatic within a branch (D14) |
 | Reads under shared lock                 | registry methods (internal)                |
 | All mutation under exclusive lock       | registry methods (internal); value writes via `ValueWriter` |

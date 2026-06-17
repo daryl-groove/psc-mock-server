@@ -12,14 +12,12 @@ namespace gnmid::core {
 
 class NotificationGroup;  // fwd — LeafEntry stores only a back-pointer (breaks the cycle)
 
-// Construction passkey (D11). LeafEntry / NotificationGroup are non-copyable and
-// non-movable, so the registry must build them in place inside its node-based
-// std::map (try_emplace) — which constructs via the allocator, not the registry,
-// so a literally-private constructor would be unreachable. Instead the ctors are
-// public but take a RegistryAccess, whose own constructor is private to
-// LeafRegistry. Net effect: only the registry can originate an entry/group, yet
-// the allocator can still forward the (copyable) passkey. This realizes "registry
-// is the sole owner & constructor" as a mechanism, not a comment.
+// Construction passkey (D11): the ctors are public so std::map::try_emplace can build
+// LeafEntry / NotificationGroup in place (it constructs via the allocator, not the
+// registry, so a literally-private ctor would be unreachable), yet they require a
+// RegistryAccess whose own ctor is private to LeafRegistry. Net effect: only the registry
+// can originate an entry/group — "registry is the sole constructor" as a mechanism (Goal 4),
+// not a comment.
 class RegistryAccess {
     RegistryAccess() = default;
     friend class LeafRegistry;
@@ -29,9 +27,10 @@ public:
 };
 
 // A single gNMI leaf node — encapsulated, registry-owned, non-copyable and
-// non-movable (D11). Outside code reads via const accessors and never holds a
-// mutable reference; the registry (friend) is the sole writer, and
-// NotificationGroup (friend) maintains the back-pointer half of the link.
+// non-movable (D11). No LeafEntry reference ever escapes the registry (D1): outside
+// callers see only value-copied snapshots/views. Its const accessors are read by its
+// two friends — the registry (also the sole writer) and NotificationGroup (which
+// maintains the back-pointer half of the link).
 class LeafEntry {
 public:
     LeafEntry(RegistryAccess, std::shared_ptr<const CanonicalPath> path,
