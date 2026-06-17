@@ -37,6 +37,12 @@ namespace impl {
 
 namespace {
 
+// R1/P5: a TARGET_DEFINED subscription lets the target choose the rate; the mock
+// uses one server-default sample interval for all target-defined SAMPLE leaves,
+// matched to the sensor simulator's ~1s drift tick. (An explicit SAMPLE with
+// sample_interval 0 means "lowest supported" and keeps the loop's 200ms floor.)
+constexpr uint64_t kTargetDefinedSampleIntervalNs = 1'000'000'000;  // 1s
+
 // Write each Notification as its own SubscribeResponse. Atomic containers split a
 // query across several Notifications (spec §2.1.1), so emit sites loop here.
 void writeAll(std::vector<Notification>& notes,
@@ -183,9 +189,16 @@ Status Subscribe::handleStream(
 
     // Resolve TARGET_DEFINED per leaf via the Backend (schema-derived, P5).
     switch (resolveStreamMode(sub, be_)) {
-      case SAMPLE:
-        chronomap.emplace_back(sub, now);
+      case SAMPLE: {
+        // R1/P5: a TARGET_DEFINED leaf carries no client interval (C3 rejects a
+        // pinned one), so without a default it free-runs at the loop's 200ms
+        // floor. Apply the server default; an explicit SAMPLE keeps its own.
+        Subscription s = sub;
+        if (sub.mode() == gnmi::TARGET_DEFINED && s.sample_interval() == 0)
+          s.set_sample_interval(kTargetDefinedSampleIntervalNs);
+        chronomap.emplace_back(std::move(s), now);
         break;
+      }
       case ON_CHANGE: {
         // Baseline snapshot regardless of updates_only — the latter only
         // suppresses the *initial emit* (handled above), never the baseline.

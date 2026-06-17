@@ -69,20 +69,40 @@ def negative(stub):
 
 
 def positive(stub):
-    """TARGET_DEFINED without sample_interval → establishes (sync_response)."""
-    call = stub.Subscribe(req_iter(0), timeout=10)
-    deadline = time.time() + 8
+    """TARGET_DEFINED without sample_interval → establishes AND streams at the
+    server-default cadence, not the ~5 Hz loop floor (R1). An Operational leaf
+    resolves to SAMPLE; with no client interval the server MUST apply its default
+    (~1s) rather than free-run at the 200ms poll floor."""
+    call = stub.Subscribe(req_iter(0), timeout=15)
+    saw_sync = False
+    sample_times = []                       # arrival times of steady-state ticks
+    deadline = time.time() + 12
     try:
         for resp in call:
-            if resp.WhichOneof("response") == "sync_response":
-                return None
-            if time.time() > deadline:
-                return "no sync_response within 8s"
-        return "stream closed before sync_response"
+            which = resp.WhichOneof("response")
+            if which == "sync_response":
+                saw_sync = True
+            elif which == "update" and saw_sync:
+                sample_times.append(time.monotonic())
+            if len(sample_times) >= 3 or time.time() > deadline:
+                break
     except grpc.RpcError as e:
         return f"unexpected error: {e.code()} {e.details()}"
     finally:
         call.cancel()
+
+    if not saw_sync:
+        return "no sync_response (subscription did not establish)"
+    if len(sample_times) < 2:
+        return (f"expected >=2 steady-state SAMPLE updates to measure cadence, "
+                f"got {len(sample_times)}")
+    min_gap = min(b - a for a, b in zip(sample_times, sample_times[1:]))
+    # R1: must stream at the server default (~1s), NOT the ~200ms loop floor (5 Hz).
+    if min_gap < 0.5:
+        return (f"SAMPLE cadence too fast ({min_gap:.3f}s between updates) — the "
+                f"target-defined leaf is flooding at the loop floor instead of the "
+                f"server default")
+    return None
 
 
 def run():
@@ -98,7 +118,7 @@ def run():
 
     e = positive(stub)
     print(f"  TARGET_DEFINED, no interval      → "
-          f"{'established (sync_response)' if e is None else e}")
+          f"{'established + server-paced cadence' if e is None else e}")
     if e:
         errors.append(f"positive case: {e}")
 

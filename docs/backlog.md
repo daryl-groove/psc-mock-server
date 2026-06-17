@@ -47,8 +47,8 @@ Subscribe entry incl. updates_only/POLL/ONCE; `echoTarget` reaches every current
 emit path; the 7 `TryCancel` removals are return-only). Findings R1–R8, triaged by
 when to act. Numbered R* to not clash with the tables above.
 
-**Do now — behavioral:**
-- **R1 — `TARGET_DEFINED`→SAMPLE streams at ~5 Hz (no server-default interval).**
+**Behavioral:**
+- **R1 ✅ DONE — `TARGET_DEFINED`→SAMPLE streamed at ~5 Hz (no server-default interval).**
   `resolveStreamMode`→`preferredMode` ([backend.cpp](../src/backend/backend.cpp) L108) returns only the *mode*, never an
   interval; the sub keeps its own `sample_interval`, which for `TARGET_DEFINED` is
   forced to **0** (C3 rejects non-zero). In the SAMPLE tick the due-test
@@ -61,6 +61,11 @@ when to act. Numbered R* to not clash with the tables above.
   which currently masks it). **Orthogonal to push** — P2 swaps the poll loop for
   `wait_until(nextDeadline)` but interval==0 still spins, so this interval-value fix
   carries over and is not wasted now. (Full per-leaf TARGET_DEFINED is deferred C2.)
+  **Resolved**: `kTargetDefinedSampleIntervalNs` (1s, matched to the sensor drift
+  tick) stamped at the chronomap insert ([subscribe.cpp](../src/gnmi/subscribe.cpp) L186) for
+  `TARGET_DEFINED`→SAMPLE only — an explicit SAMPLE+0 keeps the 200ms floor.
+  `test_target_defined.py` positive case now asserts the steady-state gap > 0.5s
+  (the old flood would fail it).
 
 **Do with the push rework (P1/P2 reshapes these emit/routing paths anyway):**
 - **R2 — `echoTarget` is at 3 build sites, not the single `writeAll` sink.** Every
