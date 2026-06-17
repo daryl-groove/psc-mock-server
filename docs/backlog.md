@@ -39,6 +39,63 @@ Minor (record, low priority):
 - **Atomic whole-record delete** emits `add_delete_()` with an empty path under the container prefix ([src/gnmi/subscribe_emit.cpp](../src/gnmi/subscribe_emit.cpp) L162-167) — relies on `prefix == container` to mean "delete the container"; works but subtle.
 - **e2e tests are not isolated** — they share one server's mutable state (the NTP record gets mutated/deleted by earlier tests), so they pass only against a *fresh* server and fail when run back-to-back. Make each test self-start a server or restore state on teardown.
 
+## Code-review follow-ups (`/code-review high` on `1f3ab3d`, 2026-06-17)
+
+A high-effort multi-angle review of the C1–C6 conformance commit. **No crashes**;
+the diff is otherwise confirmed correct (origin validation covers every Get/Set/
+Subscribe entry incl. updates_only/POLL/ONCE; `echoTarget` reaches every current
+emit path; the 7 `TryCancel` removals are return-only). Findings R1–R8, triaged by
+when to act. Numbered R* to not clash with the tables above.
+
+**Do now — behavioral:**
+- **R1 — `TARGET_DEFINED`→SAMPLE streams at ~5 Hz (no server-default interval).**
+  `resolveStreamMode`→`preferredMode` ([backend.cpp](../src/backend/backend.cpp) L108) returns only the *mode*, never an
+  interval; the sub keeps its own `sample_interval`, which for `TARGET_DEFINED` is
+  forced to **0** (C3 rejects non-zero). In the SAMPLE tick the due-test
+  `elapsed > nanoseconds{sample_interval()}` ([subscribe.cpp](../src/gnmi/subscribe.cpp) L215) is then
+  `elapsed > 0` → due every ~200 ms loop iteration (L251 cap) → 5 Hz flood. Design
+  P5 says target-defined SAMPLE leaves should get a **single server-default
+  interval**. Fix: when a sub resolves to SAMPLE with `sample_interval==0`, stamp a
+  server-default interval (at the chronomap insert, [subscribe.cpp](../src/gnmi/subscribe.cpp) L186-187), and
+  make `tests/e2e/test_target_defined.py` assert cadence (not just `sync_response`,
+  which currently masks it). **Orthogonal to push** — P2 swaps the poll loop for
+  `wait_until(nextDeadline)` but interval==0 still spins, so this interval-value fix
+  carries over and is not wasted now. (Full per-leaf TARGET_DEFINED is deferred C2.)
+
+**Do with the push rework (P1/P2 reshapes these emit/routing paths anyway):**
+- **R2 — `echoTarget` is at 3 build sites, not the single `writeAll` sink.** Every
+  Subscribe write funnels through `writeAll`, but target is stamped upstream in
+  `buildSubscribeNotifications` + the ON_CHANGE loop. The ON_CHANGE site is proof of
+  the risk — it bypasses the builder and had to hand-add its own `echoTarget`. A
+  future emit path that forgets it silently drops `prefix.target` (§2.2.2.1 MUST).
+  Fix: stamp inside `writeAll` (pass the target in). Get has no `writeAll`, so keep
+  its call.
+- **R3 — `validateOrigin` is wired at ~8 sites while the strip is centralized in
+  `gnmi_to_xpath`.** Coverage is complete today, but a future path that calls
+  `gnmi_to_xpath` gets origin stripped *without* validation → an unimplemented origin
+  (`cli`) served as openconfig. Consider a single request-boundary seam. (Caveat:
+  `gnmi_to_xpath` returns a string, can't itself return a Status — needs thought.)
+
+**Batch — ride the next edit that touches these files:**
+- **R4 — leftover `if (!status.ok()) { return status; }` braced single-statement
+  blocks** (5 sites in [subscribe.cpp](../src/gnmi/subscribe.cpp)) after the C6 `TryCancel` removal; collapse to
+  one-liners (the braces only held the deleted call).
+- **R5 — Get re-validates the prefix origin once per request path** (the loop calls
+  `buildGetNotifications` per path) and opens a second `if (prefix != nullptr)` a few
+  lines above the existing one ([get.cpp](../src/gnmi/get.cpp) L69); hoist to `run()` once.
+- **R6 — Set's delete loop hand-inlines `validateOrigin`+`checkWritable`** while
+  replace/update go through `validateWrite` ([set.cpp](../src/gnmi/set.cpp) L80); asymmetric, two
+  validation styles in one RPC.
+- **R7 — ON_CHANGE `echoTarget` reads target via `request.subscribe().prefix().target()`**
+  while the builder path reads `request.prefix().target()` ([subscribe.cpp](../src/gnmi/subscribe.cpp) L245); same
+  value, two expressions → drift risk. Resolve once. (Subsumed if R2 is done.)
+
+**Separate refactor — low priority:**
+- **R8 — the 3 new e2e files duplicate** path-builders, the `yield request; while
+  True: sleep` iterator, server bootstrap, and `/system` path builders from sibling
+  e2e files. Pre-existing suite-wide pattern (no shared module/conftest); extract a
+  shared e2e helper. (Overlaps the Minor "e2e tests are not isolated" item above.)
+
 ## Resolved (recorded so they are not re-raised)
 
 - **Parent-path queries** (old DESIGN.md item D — `/components` returned NOT_FOUND).
