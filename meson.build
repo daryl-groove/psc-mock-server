@@ -137,6 +137,7 @@ sources = [
   'src/gnmi/set.cpp',
   'src/gnmi/subscribe.cpp',
   'src/gnmi/subscribe_emit.cpp',
+  'src/gnmi/subscription.cpp',
   'src/backend/psc_power_sensor_provider.cpp',
   'src/backend/system_config_provider.cpp',
   'src/security/authentication.cpp',
@@ -212,3 +213,12 @@ test_subscribe_emit = executable('test_subscribe_emit',
   include_directories : [include_directories('src')],
 )
 test('subscribe_emit', test_subscribe_emit)
+
+# Push routing (P1/P2, S2): the SubscriptionHub change->stream matching, tested as a
+# pure function against ChangeBatch inputs (no gRPC stream, no threads).
+test_subscription_hub = executable('test_subscription_hub',
+  ['tests/test_subscription_hub.cpp', 'src/gnmi/subscription.cpp'],
+  dependencies        : [gnmid_core_dep, gtest_dep, thread_dep],
+  include_directories : [include_directories('src/gnmi')],
+)
+test('subscription_hub', test_subscription_hub)

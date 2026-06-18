@@ -21,6 +21,7 @@
 
 #include <gnmi.grpc.pb.h>
 #include "backend/backend.hpp"
+#include "subscription.h"
 
 using namespace gnmi;
 using google::protobuf::RepeatedPtrField;
@@ -33,7 +34,7 @@ namespace impl {
 
 class Subscribe {
   public:
-    explicit Subscribe(gnmid::Backend& be) : be_(be) {}
+    Subscribe(gnmid::Backend& be, SubscriptionHub& hub) : be_(be), hub_(hub) {}
     ~Subscribe() = default;
 
     Status run(ServerContext* context,
@@ -54,6 +55,7 @@ class Subscribe {
 
   private:
     gnmid::Backend& be_;
+    SubscriptionHub& hub_;   // push wake (P1/P2); streams register a StreamWaker here
 };
 
 }  // namespace impl

@@ -21,6 +21,7 @@
 
 #include <gnmi.grpc.pb.h>
 #include "backend/backend.hpp"
+#include "subscription.h"
 
 using namespace grpc;
 using namespace gnmi;
@@ -30,10 +31,19 @@ class GNMIService final : public gNMI::Service
 {
   public:
     // The Backend (data + schema layer) is owned by the caller (main) and injected
-    // by reference. GNMIService is unaware of specific provider types.
-    explicit GNMIService(gnmid::Backend& backend) : backend_(backend) {}
+    // by reference. GNMIService is unaware of specific provider types. Wiring the hub
+    // as the registry's push sink here makes a value/structural commit (on a Set or
+    // sensor-driver thread) wake the ON_CHANGE streams it touches (P1/P2).
+    explicit GNMIService(gnmid::Backend& backend) : backend_(backend) {
+      backend_.registry().setSink(&hub_);
+    }
 
-    ~GNMIService() { std::cout << "Quitting GNMI Server" << std::endl; }
+    // Unhook the sink BEFORE hub_ is destroyed, so a provider-driver commit racing
+    // shutdown sees a null sink (a clean no-op) rather than a dangling hub.
+    ~GNMIService() {
+      backend_.registry().setSink(nullptr);
+      std::cout << "Quitting GNMI Server" << std::endl;
+    }
 
     Status Capabilities(ServerContext* context,
         const CapabilityRequest* request, CapabilityResponse* response);
@@ -48,7 +58,8 @@ class GNMIService final : public gNMI::Service
         ServerReaderWriter<SubscribeResponse, SubscribeRequest>* stream);
 
   private:
-    gnmid::Backend& backend_;
+    gnmid::Backend&          backend_;
+    ::impl::SubscriptionHub  hub_;   // push sink; shared by every Subscribe stream
 };
 
 #endif  // _GNMI_SERVER_H

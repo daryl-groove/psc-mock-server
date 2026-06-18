@@ -93,19 +93,54 @@ Implementation forks decided with the user (recorded in core D6 / P3 Fork 1–2)
       no-event, and the L=B lifetime (batch outlives the writer scope **and** a later
       detach). 10 C++ suites green.
 
-## Phase 2 — Subscription object + threading (P2)
+## Phase 2 — Subscription object + threading (P2) — **S2 ✅ DONE**
 
-- [ ] Driver-agnostic `Subscription` (`start` / `onPushEvent` / `onDeadline` /
-      `nextDeadline`).
-- [ ] thread-per-stream loop (`cv.wait_until(nextDeadline())`); per-stream serialized
-      writer.
-- [ ] subscription index (monitored-prefix → subscriptions), one mutex.
+**S2 vs S3 (decided).** thread-per-stream already exists (sync gRPC = one thread per
+Subscribe RPC); the only NEW thing is the **cross-thread wake substrate**. We cut over
+the ON_CHANGE branch to **push-wake but REUSE the existing `buildChange`/`buildFull`
+builder** (the batch is a *wake + routing* signal; the woken thread still
+`snapshot+diff`s) — **S2**. This crosses the one-way door (the concurrency model) at
+the smallest blast radius and gives real-time ON_CHANGE with no watermark race.
+Consuming the batch **payload** (R1, no re-lock) + the single high-water **watermark**
+is the **S3** refinement = **Phase 3**; S2's substrate survives S3 100% (only the
+in-thread "build on wake" step changes), and S3 may not even be needed at this load.
+
+`src/gnmi/subscription.{h,cpp}` + the `subscribe.cpp`/`gnmi.*` wiring. Measured push
+latency **6.5 ms** (vs the old ≤200 ms poll floor); all prior e2e unchanged.
+
+- [x] `SubscriptionHub : ILeafSink` — owns the live-stream registry + one mutex;
+      `onChange` (writer thread) routes a batch to covering streams + signals their cv.
+      Wired via `registry.setSink(&hub_)` in the `GNMIService` ctor (unhooked in the
+      dtor before `hub_` dies). Lock order hub→waker only (documented).
+- [x] Per-stream `StreamWaker` (RAII hub register/deregister + cv/pending + the
+      stream's query paths). The full driver-agnostic `Subscription` (onPushEvent/
+      onDeadline encapsulation) is folded into **S3/Phase 3**, when the build step is
+      reworked anyway — S2 keeps the building in `handleStream` (smallest blast radius).
+- [x] loop swapped from `sleep_for(200ms)` to `waker.waitUntil(min(nextDeadline,
+      now+1s))`; the ~1s cap re-checks `IsCancelled()` (sync-gRPC has no cancel→cv
+      event — backlog "Push layer"). Only the Subscribe thread writes its stream.
+- [x] **routing = linear scan over live streams** (`changeTouchesQueries`) for value
+      *and* structural (Set-delete `removedPrefixes`) events — one mechanism;
+      query-path-trie upgrade deferred (backlog "Push layer").
+- [x] SAMPLE stays timer-driven; `kMinSampleIntervalNs` (200ms) is now the lowest
+      supported rate — `interval==0` floors to it, and an explicit `0<interval<kMin` is
+      **rejected with InvalidArgument** (§3.5.1.5.2). This 防呆 also closes a flood
+      regression S2 introduced (the new `waitUntil` has no implicit cap, unlike the old
+      `sleep_for(200ms)`, so a near-zero interval would busy-emit). Test:
+      `tests/e2e/test_sample_floor.py`. ON_CHANGE reuses `buildChange`/`buildFull` on
+      the per-sub `prev` View (no watermark in S2).
+- [x] tests: `tests/test_subscription_hub.cpp` (11 cases — pins `changeTouchesQueries`
+      incl. element-aligned match, removed-leaf/branch, the key-omitted-falls-to-
+      liveness limitation); `tests/e2e/test_push.py` (Set→update **6.5 ms** < 100 ms).
+      **11 C++ suites + 12 e2e green.**
+
+## Phase 3 — Notification builder on push (P3) — **= the S3 refinement**
+
+- [ ] `ChangeBatch` payload → `Notification`(s) directly (R1, no re-snapshot on wake),
+      replacing S2's `prev`-View `snapshot+diff`.
 - [ ] single high-water `changeSeq` watermark **captured under the snapshot lock**
-      (P3 Fork4 / S8 — not a global value read after an unlocked send).
-
-## Phase 3 — Notification builder on push (P3)
-
-- [ ] `ChangeBatch` → `Notification`(s) (reuse `buildFull`/`buildChange` logic).
+      (P3 Fork4 / S8 — not a global value read after an unlocked send); replaces the
+      per-sub `prev` View.
 - [ ] atomic re-read from core (B1); watermark dedupe; partial-atomic scope (§3.5.2.5,
       payload = subscribed members only).
 - [ ] delete granularity = one branch delete; atomic-delete aligned to container

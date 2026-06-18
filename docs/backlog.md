@@ -16,6 +16,42 @@ from the retired `DESIGN.md` plus integration follow-ups. Roughly priority-order
 | 7 | **`main.cpp` production cleanup** | Remove the `getopt` CLI loop for the resident-service target; replace with build-time constants / a config file. Isolated to `main.cpp`; do at deployment time. |
 | 8 | **Trie-based provider routing** | `Backend` routing is a linear scan over owned prefixes (≤ a handful today). A path-segment trie gives O(depth) instead of O(N) — only worth it past ~10 domains. |
 
+## Push layer — recorded design options (deferred; decided with user during Phase 2)
+
+These are the two deliberate "do the simple thing now, here's the upgrade and its
+trigger" calls made while designing the push driver (P2 / S2). Recorded so the
+upgrade path is explicit and nobody re-derives it.
+
+- **Subscription routing — linear scan now; query-path trie is the high-N upgrade
+  (NOT a monitored-prefix index).** `ILeafSink::onChange` (on the writer thread)
+  must find which live subscriptions a `ChangeBatch` touches. We do a **linear scan
+  over live subscriptions** for *both* value and structural events — one mechanism,
+  zero maintenance, reuses the existing element-aligned matching, and reaches armed
+  not-yet-existent subscriptions (P4) for free. Negligible at single-to-low-double-
+  digit concurrent streams (P2). **Trigger to revisit: concurrent streams → low
+  hundreds.** The elegant high-N form is a **query-path trie** (key = each sub's
+  retained query path): it unifies value routing (leaf P → subs whose query is an
+  ancestor of P, walk P's ancestors) *and* structural routing (prefix E → subs whose
+  query is ancestor-of / descendant-of E, walk ancestors + E's subtree), armed subs
+  included, and is maintained **only at sub create/destroy** (query paths are fixed;
+  P4 re-expansion changes the materialized set, not the query). This is **cleaner
+  than the P2-sketch "monitored-prefix index"**, which would need updating on every
+  hot-plug re-expansion *and* still need a scan for armed subs (= two mechanisms). The
+  swap is localized to the hub's routing method (Subscription/builder untouched).
+
+- **Subscribe cancellation on sync gRPC — ~1s liveness poll now; cancel-as-event is
+  the async/T3 upgrade.** The push loop blocks on `cv.wait_until(min(nextDeadline,
+  now+~1s))` and re-checks `ServerContext::IsCancelled()` on the cap, because gRPC's
+  **synchronous** server API exposes cancellation only as a *pollable flag*
+  (`IsCancelled()`) + a failed `Read/Write`, not as an event that can wake our
+  condition variable. This only bites a **fully-idle ON_CHANGE stream** (no pushes,
+  no heartbeat) whose client silently disconnects — any push/heartbeat would `Write`
+  and catch the cancel immediately. The zero-poll fix is gRPC's **callback/async API**
+  (`ServerBidiReactor::OnCancel()` / a CompletionQueue tag), which delivers cancel as
+  an event — that is the design's **T3** rung (P2), deferred to thousands of streams.
+  Revisit if/when we move to async gRPC, or if the liveness poll ever profiles as a
+  concern. (It is a cleanup-latency knob, not a correctness issue.)
+
 ## Implementation gaps vs current design (cold-read code review, 2026-06-16)
 
 Cases where the **code lags a *decided* design** (distinct from the table above,

@@ -38,6 +38,6 @@ Status GNMIService::Get(ServerContext* context, const GetRequest* request,
 Status GNMIService::Subscribe(ServerContext* context,
                  ServerReaderWriter<SubscribeResponse, SubscribeRequest>* stream)
 {
-  ::impl::Subscribe rpc(backend_);
+  ::impl::Subscribe rpc(backend_, hub_);
   return rpc.run(context, stream);
 }

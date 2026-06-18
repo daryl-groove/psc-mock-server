@@ -666,6 +666,49 @@ leaves — ungrouped Config/State — would be wrongly forced to SAMPLE.)
   `sample_interval` is rejected by the Resolver with `InvalidArgument (3)`
   (§3.5.1.5.2).
 
+#### TARGET\_DEFINED × notification group — resolution refinement (decided with user)
+
+`resolveMode(leaf)` reads the leaf's **`effectiveType`** (D8 priority: leaf's own
+type > group `preferredType` > Operational), so a **group already supplies its
+members a uniform default mode** without new machinery — a grouped leaf with no own
+type inherits the group's `preferredType` and the whole group resolves alike.
+Whether that default is *authoritative* (group overrides the leaf) splits by group
+kind, and the split is **forced by the group semantics (D15), not a free choice**:
+
+- **Atomic group → mode is necessarily group-uniform AND group-authoritative.**
+  §3.5.2.5: any member change re-sends the **whole** subscribed record, members move
+  as a unit — so the mechanism *cannot* stream individual members on different terms
+  (you can't SAMPLE half an atomic record). The group is the delivery unit; its mode
+  is resolved once for the record. (Well-formed atomic groups are config records =
+  all-Config anyway → ON\_CHANGE; the load-bearing point is that the atomic boundary
+  *forbids* per-member mode-splitting regardless.)
+- **Non-atomic group → mode stays per-leaf; `preferredType` is only a default.**
+  D15: a non-atomic group has **no** steady-state ON\_CHANGE effect (a member change
+  reports just that member, as if ungrouped); its bundling shows only on whole-set
+  sends. So members may legitimately resolve to different modes — forcing uniformity
+  here would override the per-leaf schema truth for no spec reason. The group's
+  `preferredType` therefore *defaults* the members (via D8) but does not *force* them.
+- **Ungrouped leaf → its own schema default** (own type, else Operational) — the
+  baseline per-leaf case.
+
+This keeps the spec's per-leaf mandate (§3.5.1.5.2) intact while honouring the user
+intuition "a group should behave as one" exactly where it is real (atomic), and not
+where it would contradict D15 (non-atomic).
+
+**Per-group default sample interval — speculative seam, deliberately NOT built.** A
+group could carry a `preferredSampleInterval` parallel to `preferredType`, letting
+each group's TARGET\_DEFINED→SAMPLE leaves tick at a different default. There is **no
+identified need** (real targets rarely set per-group/per-leaf interval defaults; a
+rate-sensitive client uses explicit SAMPLE and picks the interval itself), so this is
+**tier-3 deferral — recorded only so the seam is not re-derived, not a planned
+future** (distinct from the triggered query-path-trie in backlog "Push layer"). The
+mock keeps the single server-default (`kTargetDefinedSampleIntervalNs`).
+
+> ⚠ **Current impl is per-*subscription* (backlog C2), not per-leaf.**
+> `Backend::preferredMode(xpath)` returns one mode for the whole path. True per-leaf
+> resolution + this group refinement is **Phase 5**, riding the S2 push substrate now
+> in place.
+
 ---
 
 ## Status
@@ -678,7 +721,15 @@ is bringing the implementation up to the core (D1–D17) and protocol (P1–P5) 
 Not a fork, but recorded so the Resolver enforces them: **SAMPLE** (§3.5.1.5.2
 L1762-1766) — an unsupported `sample_interval` MUST be rejected by closing the RPC
 with `InvalidArgument (3)`; `sample_interval == 0` MUST create the subscription at
-the lowest interval the target can support. **Origin** (D16) — empty→`openconfig`;
+the lowest interval the target can support. **Concretely (decided with user): the
+target's lowest supported interval is `kMinSampleIntervalNs` (200 ms)**, so the
+Resolver rejects an explicit SAMPLE `0 < sample_interval < kMinSampleIntervalNs` with
+`InvalidArgument`, and treats `sample_interval == 0` as `kMinSampleIntervalNs`. This
+is also the **防呆 against a flood**: without it, the S2 push loop (which waits on
+`min(nextDeadline, now+1s)` with no implicit cap, unlike the old `sleep_for(200ms)`)
+would busy-emit on a near-zero interval. (Clamping up instead of rejecting was
+rejected — it would silently send slower than the client asked, violating "sample at
+the specified interval".) **Origin** (D16) — empty→`openconfig`;
 any other (syntactically valid) origin names an unimplemented schema and is
 rejected with **`UNIMPLEMENTED`** (§3.3.4 L1152 / §3.5.2.4 L1900, finding **N**),
 `InvalidArgument` being reserved for a malformed path. These live in pipeline

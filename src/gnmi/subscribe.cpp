@@ -26,6 +26,7 @@
 
 #include "subscribe.h"
 #include "subscribe_emit.h"
+#include "canonical_path.hpp"
 #include <utils/utils.h>
 #include <utils/log.h>
 
@@ -42,6 +43,12 @@ namespace {
 // matched to the sensor simulator's ~1s drift tick. (An explicit SAMPLE with
 // sample_interval 0 means "lowest supported" and keeps the loop's 200ms floor.)
 constexpr uint64_t kTargetDefinedSampleIntervalNs = 1'000'000'000;  // 1s
+
+// The target's lowest supported SAMPLE interval (§3.5.1.5.2). An explicit
+// sample_interval below this is rejected (防呆 / anti-flood); sample_interval == 0
+// ("lowest supported") is created at this rate. Matches the historical 200ms loop
+// floor — and is load-bearing now that the S2 push loop has no implicit cap.
+constexpr uint64_t kMinSampleIntervalNs = 200'000'000;  // 200ms
 
 // Stamp the request target onto every notification (C5/R2: the single emit sink
 // owns the echo, so no current or future emit path can forget it), then write each
@@ -154,6 +161,16 @@ Status Subscribe::handleStream(
     if (sub.mode() == gnmi::TARGET_DEFINED && sub.sample_interval() != 0)
       return Status(StatusCode::INVALID_ARGUMENT,
                     "sample_interval must not be set with TARGET_DEFINED");
+
+    // A non-zero explicit SAMPLE interval below the lowest the target supports is
+    // unsupportable → InvalidArgument (§3.5.1.5.2). 0 ("lowest supported") is allowed
+    // and floored to kMinSampleIntervalNs in the loop. Without this a client pinning a
+    // near-zero interval would flood the push loop (no implicit cap since S2).
+    if (sub.mode() == gnmi::SAMPLE && sub.sample_interval() != 0 &&
+        sub.sample_interval() < kMinSampleIntervalNs)
+      return Status(StatusCode::INVALID_ARGUMENT,
+                    "sample_interval below the minimum supported "
+                    + to_string(kMinSampleIntervalNs) + " ns");
   }
 
   // Send initial snapshot unless client requested updates_only. sync_response is
@@ -211,26 +228,55 @@ Status Subscribe::handleStream(
     }
   }
 
-  /* Single loop, capped at ~5 iterations/second, serving both buckets: SAMPLE by
-   * timer, ON_CHANGE by snapshot diff. The core has no change-notify yet, so
-   * ON_CHANGE detection polls each iteration (push is a later optim — P1). */
+  // Register with the push hub so a core commit on another thread (a Set, or a sensor
+  // driver) wakes us the instant a change touches one of our ON_CHANGE query subtrees
+  // — real-time delivery instead of the old poll tick (P1/P2, S2). SAMPLE is
+  // timer-driven and needs no push, so only ON_CHANGE queries are registered; a
+  // pure-SAMPLE stream registers none and is simply never push-woken. queries are
+  // finalised here, before the waker is constructed (and so published to the hub).
+  std::vector<gnmid::core::CanonicalPath> ocQueries;
+  ocQueries.reserve(onChange.size());
+  for (const auto& oc : onChange) ocQueries.push_back(gnmid::core::canonicalize(oc.query));
+  StreamWaker waker(hub_, std::move(ocQueries));
+
+  // Effective SAMPLE interval: an explicit 0 means "lowest supported", floored to
+  // 200ms (the historical loop floor); a TARGET_DEFINED->SAMPLE leaf already had a
+  // server default stamped at setup. Used for BOTH the wait deadline and the due-test,
+  // so a 0-interval sub neither spins nor over-emits when push-woken.
+  auto effInterval = [](const Subscription& s) -> nanoseconds {
+    nanoseconds iv{s.sample_interval()};
+    return iv.count() == 0 ? nanoseconds{kMinSampleIntervalNs} : iv;  // 0 -> lowest supported
+  };
+
+  /* One loop serving both buckets: SAMPLE by timer, ON_CHANGE by push (woken by the
+   * hub) with snapshot+diff as the source of truth. The wait blocks until the next
+   * SAMPLE/heartbeat deadline, a push wake, or a ~1s liveness cap (so an idle stream
+   * still re-checks IsCancelled() — sync gRPC has no cancel->cv event; backlog "Push
+   * layer"). S3 replaces the snapshot+diff with the batch payload + a watermark. */
   while (!context->IsCancelled()) {
-    auto start = high_resolution_clock::now();
+    auto now = high_resolution_clock::now();
+    auto deadline = now + seconds(1);  // liveness cap
+    for (auto& [s, last] : chronomap)
+      deadline = std::min(deadline, last + effInterval(s));
+    for (auto& oc : onChange)
+      if (oc.sub.heartbeat_interval() > 0)
+        deadline = std::min(deadline,
+                            oc.lastHeartbeat + nanoseconds{oc.sub.heartbeat_interval()});
+
+    waker.waitUntil(deadline);
+    if (context->IsCancelled()) break;
+    now = high_resolution_clock::now();
 
     // ---- SAMPLE: batch all due subscriptions into one Notification ----
     SubscribeRequest updateRequest(request);
     SubscriptionList* updateList(updateRequest.mutable_subscribe());
     updateList->clear_subscription();
-
-    for (auto& pair : chronomap) {
-      duration<long long, std::nano> elapsed = high_resolution_clock::now() - pair.second;
-      if (elapsed > nanoseconds{pair.first.sample_interval()}) {
-        pair.second = high_resolution_clock::now();
-        Subscription* sub = updateList->add_subscription();
-        sub->CopyFrom(pair.first);
+    for (auto& [s, last] : chronomap) {
+      if (now - last >= effInterval(s)) {
+        last = now;
+        updateList->add_subscription()->CopyFrom(s);
       }
     }
-
     if (updateList->subscription_size() > 0) {
       std::vector<Notification> notes;
       status = buildSubscribeNotifications(notes, updateRequest.subscribe());
@@ -238,11 +284,11 @@ Status Subscribe::handleStream(
       writeAll(notes, target, stream);
     }
 
-    // ---- ON_CHANGE: poll each subscriber's snapshot and diff vs its previous ----
+    // ---- ON_CHANGE: snapshot each subscriber and diff vs its previous. S2 keeps the
+    // existing builder; the only change vs the old loop is that the push wake (not a
+    // 200ms timer) is what drove us here. ----
     for (auto& oc : onChange) {
       gnmid::Backend::View cur = be_.snapshot(oc.query);
-      const auto now = high_resolution_clock::now();
-
       std::vector<Notification> notes;
       if (heartbeatDue(oc.sub.heartbeat_interval(), oc.lastHeartbeat, now)) {
         // Heartbeat re-emits the full state regardless of change (spec §3.5.1.5.2).
@@ -252,13 +298,8 @@ Status Subscribe::handleStream(
         notes = buildChangeNotifications(oc.prev, cur);
       }
       writeAll(notes, target, stream);
-
       oc.prev = std::move(cur);
     }
-
-    // Caps the loop at 5 iterations per second.
-    auto loopTime = high_resolution_clock::now() - start;
-    this_thread::sleep_for(milliseconds(200) - loopTime);
   }
 
   return Status::OK;
