@@ -198,7 +198,7 @@ foreach t : [
 endforeach
 
 test_backend = executable('test_backend',
-  ['tests/test_backend.cpp'],
+  ['tests/test_backend.cpp', 'src/backend/psc_power_sensor_provider.cpp'],
   dependencies        : [gnmid_backend_dep, gtest_dep, thread_dep],
   include_directories : [include_directories('src')],
 )

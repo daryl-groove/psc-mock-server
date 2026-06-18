@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <map>
 #include <mutex>
 #include <random>
 #include <stop_token>
@@ -11,6 +12,7 @@
 
 #include "backend/backend.hpp"      // brings gnmi.pb.h before utils.h (which needs gnmi::)
 #include "backend/gnmi_value.hpp"
+#include "canonical_path.hpp"
 #include <utils/utils.h>            // get_time_nanosec
 
 namespace gnmid {
@@ -43,25 +45,68 @@ const SensorDef SENSORS[] = {
 constexpr double STEP_PROBABILITY = 0.3;   // chance a leaf moves per tick
 constexpr auto   UPDATE_INTERVAL  = std::chrono::seconds(1);
 
+std::string unitBase(const std::string& unit) {
+    return "/components/component[name=" + unit + "]";
+}
+
 std::string leafPath(const std::string& unit, const char* suffix) {
-    return "/components/component[name=" + unit + "]" + suffix;
+    return unitBase(unit) + suffix;
 }
 
 }  // namespace
 
 PscPowerSensorProvider::PscPowerSensorProvider(Backend& be) : Provider(be) {
-    // Declare + seed every sensor leaf synchronously, so a Get/Subscribe arriving
-    // before the first simulator tick finds data. declareLeaf returns the id the
-    // simulator pushes through.
-    for (const auto& unit : PSC_UNITS)
+    // Each PSU lives in a PERMANENT slot: the name + empty markers are registered
+    // once and never removed (M2). The sensor subtree is DYNAMIC — attached when the
+    // PSU is present. Units boot present (empty=false + sensors) so a Get/Subscribe
+    // before any hot-plug sees the same data a fixed inventory would.
+    std::lock_guard lk(mu_);
+    for (const auto& unit : PSC_UNITS) {
+        const std::string base = unitBase(unit);
+        be_.declareLeaf(base + "/state/name", core::LeafType::Operational, typedValue(unit));
+        core::LeafId emptyId =
+            be_.declareLeaf(base + "/state/empty", core::LeafType::Operational, typedValue(true));
+        slots_[unit] = Slot{ emptyId, false, {} };
+        setPresentLocked(unit, true);   // boot present
+    }
+}
+
+void PscPowerSensorProvider::setPresent(const std::string& unit, bool present) {
+    std::lock_guard lk(mu_);
+    setPresentLocked(unit, present);
+}
+
+void PscPowerSensorProvider::setPresentLocked(const std::string& unit, bool present) {
+    auto it = slots_.find(unit);
+    if (it == slots_.end()) return;        // unknown slot — no-op
+    Slot& slot = it->second;
+    if (slot.present == present) return;    // idempotent
+
+    const std::string base = unitBase(unit);
+    if (present) {
+        core::SubtreeSpec spec;
+        for (const auto& s : SENSORS)
+            spec.leaves.push_back({ leafPath(unit, s.suffix), core::LeafType::Operational,
+                                    typedValue(s.nominal) });
+        std::map<std::string, core::LeafId> ids = be_.attachSubtree(spec);
+        slot.walks.clear();
         for (const auto& s : SENSORS) {
-            core::LeafId id = be_.declareLeaf(leafPath(unit, s.suffix),
-                                              core::LeafType::Operational,
-                                              typedValue(s.nominal));
-            walks_.push_back(Walk{ id, s.nominal, s.step,
-                                   s.nominal * (1.0 - s.maxDev),
-                                   s.nominal * (1.0 + s.maxDev) });
+            const std::string p = core::canonicalize(leafPath(unit, s.suffix)).str();
+            slot.walks.push_back(Walk{ ids.at(p), s.nominal, s.step,
+                                       s.nominal * (1.0 - s.maxDev),
+                                       s.nominal * (1.0 + s.maxDev) });
         }
+    } else {
+        // Detach the device subtree only — the two branches the sensors live under,
+        // never the permanent name/empty markers that share /state with temperature.
+        be_.detachSubtree(base + "/power-supply");
+        be_.detachSubtree(base + "/state/temperature");
+        slot.walks.clear();
+    }
+
+    core::ValueWriter w = be_.registry().writeValues();   // flip the presence marker
+    w.set(slot.emptyId, typedValue(!present), get_time_nanosec());
+    slot.present = present;
 }
 
 void PscPowerSensorProvider::start() {
@@ -70,22 +115,27 @@ void PscPowerSensorProvider::start() {
         std::bernoulli_distribution stepNow(STEP_PROBABILITY);
         std::bernoulli_distribution stepUp(0.5);
 
-        std::mutex mu;
+        std::mutex waitMu;
         std::condition_variable_any cv;
-        std::unique_lock lock(mu);
+        std::unique_lock waitLock(waitMu);
         do {
             const int64_t now = get_time_nanosec();
-            // One ValueWriter scope per tick: all leaves share a collection time
-            // and become visible together, so a reader never straddles two ticks.
+            // One ValueWriter scope per tick: all present slots' leaves share a
+            // collection time and become visible together, so a reader never
+            // straddles two ticks. slots_ is read under mu_ (vs setPresent).
+            std::lock_guard lk(mu_);
             core::ValueWriter w = be_.registry().writeValues();
-            for (auto& wk : walks_) {
-                if (wk.step > 0.0 && stepNow(rng)) {
-                    wk.value += stepUp(rng) ? wk.step : -wk.step;
-                    wk.value = std::clamp(wk.value, wk.lo, wk.hi);
+            for (auto& [unit, slot] : slots_) {
+                if (!slot.present) continue;
+                for (auto& wk : slot.walks) {
+                    if (wk.step > 0.0 && stepNow(rng)) {
+                        wk.value += stepUp(rng) ? wk.step : -wk.step;
+                        wk.value = std::clamp(wk.value, wk.lo, wk.hi);
+                    }
+                    w.set(wk.id, typedValue(wk.value), now);
                 }
-                w.set(wk.id, typedValue(wk.value), now);
             }
-        } while (!cv.wait_for(lock, stop, UPDATE_INTERVAL,
+        } while (!cv.wait_for(waitLock, stop, UPDATE_INTERVAL,
                               [&] { return stop.stop_requested(); }));
     });
 }

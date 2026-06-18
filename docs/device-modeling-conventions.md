@@ -93,9 +93,9 @@ would see a value for a device that is not inserted.
 
 > Note: strictly, only `{name, empty}` are permanent; `oper-status`, `serial`,
 > `part-no` etc. belong to the dynamic device subtree (they do not exist when the slot
-> is empty). A worked example of this fixed-slot lifecycle is *not* kept as a test
-> today (the integration tests are deliberately a small canonical set, §7); this
-> document is the reference for it.
+> is empty). This fixed-slot lifecycle is the worked example in `PscPowerSensorProvider`
+> (§9), exercised by `PscHotPlugTest` (`tests/test_backend.cpp`): insert/remove via its
+> `setPresent()` backdoor — the markers persist, the sensor subtree appears/vanishes.
 
 ### Two valid granularities — choose by what is physically permanent
 
@@ -311,20 +311,32 @@ The worked instance these conventions describe, as the two providers register it
 (`src/backend/`). Based on **openconfig-platform-psu** (augmenting
 openconfig-platform) and **openconfig-system**.
 
-### Sensors — `PscPowerSensorProvider`, all `Operational`
+### Sensors — `PscPowerSensorProvider`, hot-pluggable PSU slots (M2)
 
-Two units, `PSC-0` and `PSC-1`; a background `jthread` drifts the values on a
-quantized random walk and pushes them through one `ValueWriter` scope per tick.
+Two PSU slots, `PSC-0` and `PSC-1`. Each slot carries two **permanent** markers
+(registered once, never removed) plus a **dynamic** sensor subtree that exists only
+while the PSU is present (§3):
 
 ```
-/components/component[name=PSC-{0,1}]/state/temperature/instant          celsius
-/components/component[name=PSC-{0,1}]/power-supply/state/input-voltage    volts   (54V bus)
-/components/component[name=PSC-{0,1}]/power-supply/state/input-current    amps
-/components/component[name=PSC-{0,1}]/power-supply/state/output-voltage   volts   (12V rail)
-/components/component[name=PSC-{0,1}]/power-supply/state/output-current   amps
-/components/component[name=PSC-{0,1}]/power-supply/state/output-power     watts
-/components/component[name=PSC-{0,1}]/power-supply/state/capacity         watts   (static)
+/components/component[name=PSC-{0,1}]/state/name                         permanent marker (= unit name)
+/components/component[name=PSC-{0,1}]/state/empty                        permanent marker (false = populated)
+
+/components/component[name=PSC-{0,1}]/state/temperature/instant          celsius  ┐ dynamic device subtree:
+/components/component[name=PSC-{0,1}]/power-supply/state/input-voltage    volts    │ attached on insert,
+/components/component[name=PSC-{0,1}]/power-supply/state/input-current    amps     │ detached on remove
+/components/component[name=PSC-{0,1}]/power-supply/state/output-voltage   volts    │ (54V bus / 12V rail)
+/components/component[name=PSC-{0,1}]/power-supply/state/output-current   amps     │
+/components/component[name=PSC-{0,1}]/power-supply/state/output-power     watts    │
+/components/component[name=PSC-{0,1}]/power-supply/state/capacity         watts    ┘ (capacity static)
 ```
+
+Slots **boot present** (empty=false + sensors), so a Get/Subscribe before any
+hot-plug sees the same data a fixed inventory would. `setPresent(unit, bool)` is the
+insert/remove backdoor (Fork B): insert attaches the sensor subtree + flips
+`empty=false`; remove detaches the two device branches (`/power-supply`,
+`/state/temperature`) — leaving the markers — + flips `empty=true`. A background
+`jthread` drifts the present slots' values on a quantized random walk, one
+`ValueWriter` scope per tick. Sensors and markers are all `Operational`.
 
 > Units are **volts / amps / watts**, not mV/mA/mW. YANG `ieeefloat32` maps to
 > `double_val` in `gnmi::TypedValue`.

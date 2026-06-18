@@ -14,6 +14,7 @@
 #include "backend/backend.hpp"
 #include "backend/gnmi_value.hpp"
 #include "backend/provider.hpp"
+#include "backend/psc_power_sensor_provider.hpp"
 #include "leaf_sink.hpp"
 
 using namespace gnmid;
@@ -195,6 +196,56 @@ TEST_F(BackendTest, SetReachesHotPluggedConfigLeaf) {
                       typedValue(std::string("SN-123")), 100} });
     EXPECT_EQ(be.snapshot(PSU9).leaves.at(PSU9 + "/config/serial-no").value->string_val(),
               "SN-123");
+}
+
+// ---- M2 hot-plug worked example: the real PscPowerSensorProvider (Fork B) ----
+// Drives the live provider's setPresent() backdoor and asserts the M2 lifecycle via
+// snapshot: permanent name/empty markers persist, the sensor subtree appears/vanishes.
+// Robust against the simulator jthread (it drifts sensor *values*, not existence).
+
+class PscHotPlugTest : public ::testing::Test {
+protected:
+    Backend                 be;
+    PscPowerSensorProvider* psc = nullptr;
+    const std::string       base = "/components/component[name=PSC-0]";
+
+    void SetUp() override {
+        auto p = std::make_unique<PscPowerSensorProvider>(be);
+        psc = p.get();
+        be.addProvider(std::move(p));   // starts the simulator
+    }
+};
+
+TEST_F(PscHotPlugTest, BootsPresentWithPermanentMarkers) {
+    auto v = be.snapshot(base);
+    ASSERT_TRUE(v.routed);
+    EXPECT_EQ(v.leaves.at(base + "/state/name").value->string_val(), "PSC-0");
+    EXPECT_FALSE(v.leaves.at(base + "/state/empty").value->bool_val());        // present
+    EXPECT_TRUE(v.leaves.count(base + "/power-supply/state/output-power"));
+    EXPECT_TRUE(v.leaves.count(base + "/state/temperature/instant"));
+}
+
+TEST_F(PscHotPlugTest, RemoveKeepsMarkersDropsSensors) {
+    psc->setPresent("PSC-0", false);
+    auto v = be.snapshot(base);
+    EXPECT_EQ(v.leaves.at(base + "/state/name").value->string_val(), "PSC-0");  // marker persists
+    EXPECT_TRUE(v.leaves.at(base + "/state/empty").value->bool_val());          // empty=true
+    EXPECT_FALSE(v.leaves.count(base + "/power-supply/state/output-power"));     // sensors gone
+    EXPECT_FALSE(v.leaves.count(base + "/state/temperature/instant"));
+}
+
+TEST_F(PscHotPlugTest, ReinsertRestoresSensors) {
+    psc->setPresent("PSC-0", false);
+    psc->setPresent("PSC-0", true);
+    auto v = be.snapshot(base);
+    EXPECT_FALSE(v.leaves.at(base + "/state/empty").value->bool_val());      // present again
+    EXPECT_TRUE(v.leaves.count(base + "/power-supply/state/output-power"));  // sensors back
+}
+
+TEST_F(PscHotPlugTest, IdempotentAndUnknownUnitNoop) {
+    psc->setPresent("PSC-0", true);   // already present -> no-op
+    EXPECT_TRUE(be.snapshot(base).leaves.count(base + "/state/temperature/instant"));
+    psc->setPresent("PSC-9", true);   // unknown slot -> no-op, no crash
 }
 
 }  // namespace
