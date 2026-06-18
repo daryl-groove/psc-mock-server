@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -59,16 +60,29 @@ public:
     // The provider has already registered its leaves/groups in its constructor.
     void addProvider(std::unique_ptr<Provider> p);
 
-    // --- provider-facing registration (called from a Provider constructor) ---
+    // --- provider-facing registration (at construction OR at runtime) ---
     // A group is identified by its prefix (D4); declare it before its leaves so they
-    // auto-assign (D3).
+    // auto-assign (D3). declare* are the single-entity forms; attach/detachSubtree
+    // add or remove a whole hot-pluggable device branch (D12). The path->LeafId /
+    // writable bindings are kept in sync, guarded by bindingsMu_ so a provider's
+    // driver may grow/shrink the tree after serving has begun, not only in its ctor.
     void         declareGroup(const std::string& prefix, bool atomic);
     core::LeafId declareLeaf(const std::string& xpath, core::LeafType type,
                              std::optional<gnmi::TypedValue> value = std::nullopt);
 
-    // Mutable registry access for a provider's driver (value writes only — never
-    // structural; structure goes through declare*/commit so the bindings stay in
-    // sync).
+    // Hot-plug insert: register the spec's groups+leaves in one core operation (one
+    // structural event to any sink) and sync the bindings. Returns the branch's
+    // canonical-path -> LeafId map; the provider pushes values through these ids.
+    std::map<std::string, core::LeafId> attachSubtree(const core::SubtreeSpec& spec);
+
+    // Hot-plug remove: drop every leaf/group under prefix from the core (one
+    // structural event) and erase their bindings. Held LeafIds for the branch go
+    // stale (a later ValueWriter::set on them returns false — a clean miss).
+    void detachSubtree(const std::string& prefix);
+
+    // Mutable registry access for a provider's driver (VALUE writes only — never
+    // structural; structure goes through declare*/attach*/detach*/commit so the
+    // bindings stay in sync).
     core::LeafRegistry& registry() noexcept { return registry_; }
 
     // --- reads (gNMI Get / Subscribe) ---
@@ -98,9 +112,10 @@ private:
 
     core::LeafRegistry                     registry_;
     std::vector<std::unique_ptr<Provider>> providers_;
-    std::vector<core::CanonicalPath>       ownedPrefixes_;   // for routing
+    std::vector<core::CanonicalPath>       ownedPrefixes_;   // for routing; fixed after startup (addProvider)
     std::map<std::string, core::LeafId>    ids_;             // canonical path -> id binding
     std::set<std::string>                  writableConfig_;  // canonical declared config paths
+    mutable std::mutex                     bindingsMu_;      // guards ids_/writableConfig_ across runtime hot-plug
 };
 
 }  // namespace gnmid

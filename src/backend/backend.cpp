@@ -63,11 +63,35 @@ void Backend::declareGroup(const std::string& prefix, bool atomic) {
 
 core::LeafId Backend::declareLeaf(const std::string& xpath, core::LeafType type,
                                   std::optional<gnmi::TypedValue> value) {
+    std::lock_guard lk(bindingsMu_);
     core::LeafId id = registry_.registerLeaf(xpath, type, std::move(value));
     const std::string c = canon(xpath);
     ids_[c] = id;
     if (type == core::LeafType::Config) writableConfig_.insert(c);
     return id;
+}
+
+std::map<std::string, core::LeafId>
+Backend::attachSubtree(const core::SubtreeSpec& spec) {
+    std::lock_guard lk(bindingsMu_);
+    std::map<std::string, core::LeafId> ids = registry_.attachSubtree(spec);
+    for (const auto& [path, id] : ids) {        // core returns canonical-path keys
+        ids_[path] = id;
+        if (auto snap = registry_.getLeaf(id);
+            snap && snap->effectiveType == core::LeafType::Config)
+            writableConfig_.insert(path);
+    }
+    return ids;
+}
+
+void Backend::detachSubtree(const std::string& prefix) {
+    const std::string p = canon(prefix);
+    std::lock_guard lk(bindingsMu_);
+    registry_.detachSubtree(prefix);            // registry canonicalizes the prefix itself
+    for (auto it = ids_.begin(); it != ids_.end(); )
+        if (ownsPath(p, it->first)) it = ids_.erase(it); else ++it;
+    for (auto it = writableConfig_.begin(); it != writableConfig_.end(); )
+        if (ownsPath(p, *it)) it = writableConfig_.erase(it); else ++it;
 }
 
 bool Backend::routed(const std::string& xpath) const {
@@ -78,6 +102,7 @@ bool Backend::routed(const std::string& xpath) const {
 }
 
 bool Backend::writable(const std::string& xpath) const {
+    std::lock_guard lk(bindingsMu_);
     return writableConfig_.count(canon(xpath)) > 0;
 }
 
@@ -114,6 +139,7 @@ gnmi::SubscriptionMode Backend::preferredMode(const std::string& xpath) const {
 }
 
 void Backend::commit(const std::vector<SetOp>& ops) {
+    std::lock_guard lk(bindingsMu_);  // ids_/writableConfig_ may race a runtime hot-plug
     // Structural pass first: deletes remove the leaf (data-plane absence); an
     // update to an absent-but-declared config path re-creates it (D3 re-assigns it
     // to its group). The writable schema persists across delete, so a re-Set is
