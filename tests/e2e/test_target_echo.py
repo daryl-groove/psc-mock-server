@@ -11,55 +11,34 @@ it.
 /system is the ideal probe: one query yields both a non-atomic notification (the
 /system/config scalars) and an atomic one (the NTP server record), so a single
 Get exercises both notification shapes.
-
-Usage:
-  python3 tests/e2e/test_target_echo.py
-  (server must be running: ./build/psc-mock-server --force-insecure --log-level 1)
 """
 
-import sys
-import os
-import time
+from github.com.openconfig.gnmi.proto.gnmi import gnmi_pb2
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)
+from gnmi_helpers import gpath, hold_open
 
-from github.com.openconfig.gnmi.proto.gnmi import gnmi_pb2, gnmi_pb2_grpc
-import grpc
-
-SERVER = "localhost:50051"
 TARGET = "psc-router-7"
 
 
-def system_path():
-    p = gnmi_pb2.Path()
-    p.elem.add(name="system")
-    return p
-
-
-def get_notifications(stub, target):
+def _get_notifications(stub, target):
     req = gnmi_pb2.GetRequest(encoding=gnmi_pb2.JSON_IETF)
-    req.path.append(system_path())
+    req.path.append(gpath("/system"))
     if target:
         req.prefix.target = target
     return list(stub.Get(req, timeout=5).notification)
 
 
-def once_notifications(stub, target):
+def _once_notifications(stub, target):
     sl = gnmi_pb2.SubscriptionList(mode=gnmi_pb2.SubscriptionList.ONCE,
                                    encoding=gnmi_pb2.JSON_IETF)
     if target:
         sl.prefix.target = target
     sub = sl.subscription.add()
-    sub.path.CopyFrom(system_path())
+    sub.path.CopyFrom(gpath("/system"))
     notes = []
 
-    def it():
-        yield gnmi_pb2.SubscribeRequest(subscribe=sl)
-        while True:
-            time.sleep(0.2)
-
-    call = stub.Subscribe(it(), timeout=8)
+    call = stub.Subscribe(hold_open(gnmi_pb2.SubscribeRequest(subscribe=sl)),
+                          timeout=8)
     try:
         for resp in call:
             if resp.WhichOneof("response") == "update":
@@ -71,7 +50,7 @@ def once_notifications(stub, target):
     return notes
 
 
-def check(label, notes, target, errors):
+def _check(label, notes, target, errors):
     atomic = sum(1 for n in notes if n.atomic)
     nonatomic = sum(1 for n in notes if not n.atomic)
     bad = [n for n in notes if n.prefix.target != target]
@@ -87,31 +66,19 @@ def check(label, notes, target, errors):
     return atomic, nonatomic
 
 
-def run():
-    stub = gnmi_pb2_grpc.gNMIStub(grpc.insecure_channel(SERVER))
+def test_target_echo(stub):
     errors = []
-    print(f"\n=== prefix.target echo test against {SERVER} ===\n")
 
     # Get with a target → echoed on every notification, atomic + non-atomic.
-    a, na = check("Get /system", get_notifications(stub, TARGET), TARGET, errors)
+    a, na = _check("Get /system", _get_notifications(stub, TARGET), TARGET, errors)
     if a == 0 or na == 0:
         errors.append("Get /system did not exercise BOTH atomic and non-atomic "
                       f"notifications (atomic={a}, non-atomic={na})")
 
     # Get without a target → MUST NOT be set (expected target == "").
-    check("Get /system", get_notifications(stub, ""), "", errors)
+    _check("Get /system", _get_notifications(stub, ""), "", errors)
 
     # Subscribe ONCE with a target → same echo (the buildSubscribeNotifications path).
-    check("ONCE /system", once_notifications(stub, TARGET), TARGET, errors)
+    _check("ONCE /system", _once_notifications(stub, TARGET), TARGET, errors)
 
-    print("\n=== Results ===")
-    if errors:
-        print("  FAIL")
-        for e in errors:
-            print(f"    - {e}")
-        sys.exit(1)
-    print("  PASS")
-
-
-if __name__ == "__main__":
-    run()
+    assert not errors, "\n".join(errors)

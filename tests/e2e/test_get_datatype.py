@@ -18,33 +18,17 @@ A filtered-to-empty result is NOT_FOUND: the path exists but holds nothing of th
 requested type. Atomic containers are homogeneous (a `.../config` container is
 wholly config-true), so the NTP record survives a CONFIG filter intact, never
 torn.
-
-Usage:
-  python3 tests/e2e/test_get_datatype.py
-  (server must be running: ./build/psc-mock-server --force-insecure --log-level 1)
 """
 
-import sys
-import os
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)
-
-from github.com.openconfig.gnmi.proto.gnmi import gnmi_pb2, gnmi_pb2_grpc
 import grpc
+from github.com.openconfig.gnmi.proto.gnmi import gnmi_pb2
 
-SERVER = "localhost:50051"
+from gnmi_helpers import gpath
+
 SENSORS = "/components/component"
 
 
-def xpath_to_path(xpath):
-    path = gnmi_pb2.Path()
-    for seg in xpath.strip("/").split("/"):
-        path.elem.add(name=seg)
-    return path
-
-
-def leaf_paths(response):
+def _leaf_paths(response):
     """Set of relative leaf path strings across every notification."""
     paths = set()
     for n in response.notification:
@@ -55,29 +39,25 @@ def leaf_paths(response):
     return paths
 
 
-def do_get(stub, xpath, dtype):
+def _do_get(stub, xpath, dtype):
     """Returns (response, None) on OK or (None, grpc.StatusCode) on error."""
     req = gnmi_pb2.GetRequest(encoding=gnmi_pb2.JSON_IETF, type=dtype)
-    req.path.append(xpath_to_path(xpath))
+    req.path.append(gpath(xpath))
     try:
         return stub.Get(req, timeout=5), None
     except grpc.RpcError as e:
         return None, e.code()
 
 
-def run():
-    channel = grpc.insecure_channel(SERVER)
-    stub = gnmi_pb2_grpc.gNMIStub(channel)
+def test_get_datatype_filtering(stub):
     errors = []
 
-    print(f"\n=== Get DataType filtering test against {SERVER} ===\n")
-
     # /system CONFIG → config data present, including the atomic NTP record whole.
-    resp, code = do_get(stub, "/system", gnmi_pb2.GetRequest.CONFIG)
+    resp, code = _do_get(stub, "/system", gnmi_pb2.GetRequest.CONFIG)
     if code is not None:
         errors.append(f"/system CONFIG: expected data, got {code}")
     else:
-        paths = leaf_paths(resp)
+        paths = _leaf_paths(resp)
         print(f"  /system CONFIG  → {len(paths)} leaves")
         if not any("config/hostname" in p for p in paths):
             errors.append("/system CONFIG missing config/hostname")
@@ -86,41 +66,31 @@ def run():
             errors.append(f"/system CONFIG NTP record not whole: {sorted(ntp)}")
 
     # /system STATE → nothing of that class lives here (it is all config).
-    resp, code = do_get(stub, "/system", gnmi_pb2.GetRequest.STATE)
+    resp, code = _do_get(stub, "/system", gnmi_pb2.GetRequest.STATE)
     print(f"  /system STATE        → {code}")
     if code != grpc.StatusCode.NOT_FOUND:
         errors.append(f"/system STATE: expected NOT_FOUND, got {code}")
 
     # Sensors are operational (runtime measurements), not plain state.
-    resp, code = do_get(stub, SENSORS, gnmi_pb2.GetRequest.OPERATIONAL)
+    resp, code = _do_get(stub, SENSORS, gnmi_pb2.GetRequest.OPERATIONAL)
     if code is not None:
         errors.append(f"sensors OPERATIONAL: expected data, got {code}")
     else:
-        paths = leaf_paths(resp)
+        paths = _leaf_paths(resp)
         print(f"  sensors OPERATIONAL  → {len(paths)} leaves")
         if not paths:
             errors.append("sensors OPERATIONAL returned no leaves")
 
     # ...so STATE must NOT return them (disjoint: operational is not state).
-    resp, code = do_get(stub, SENSORS, gnmi_pb2.GetRequest.STATE)
+    resp, code = _do_get(stub, SENSORS, gnmi_pb2.GetRequest.STATE)
     print(f"  sensors STATE        → {code}")
     if code != grpc.StatusCode.NOT_FOUND:
         errors.append(f"sensors STATE: expected NOT_FOUND (operational≠state), got {code}")
 
     # ...and carry no config.
-    resp, code = do_get(stub, SENSORS, gnmi_pb2.GetRequest.CONFIG)
+    resp, code = _do_get(stub, SENSORS, gnmi_pb2.GetRequest.CONFIG)
     print(f"  sensors CONFIG       → {code}")
     if code != grpc.StatusCode.NOT_FOUND:
         errors.append(f"sensors CONFIG: expected NOT_FOUND, got {code}")
 
-    print("\n=== Results ===")
-    if errors:
-        print("  FAIL")
-        for e in errors:
-            print(f"    - {e}")
-        sys.exit(1)
-    print("  PASS")
-
-
-if __name__ == "__main__":
-    run()
+    assert not errors, "\n".join(errors)

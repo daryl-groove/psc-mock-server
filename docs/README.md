@@ -55,10 +55,15 @@ untouched.
 meson setup build && cd build && ninja      # build (produces build/psc-mock-server)
 meson test                                  # C++ unit tests (core + backend + utils)
 
-# end-to-end (python, against a running server):
-./build/psc-mock-server --force-insecure --log-level 1   # then, in tests/e2e/:
-python3 tests/e2e/test_onchange.py          # (and the other test_*.py)
+# end-to-end (pytest; each test self-starts a fresh server on a private port):
+pytest tests/e2e                            # whole suite, order-independent
+pytest tests/e2e/test_onchange.py -v        # one file
 ```
+
+The e2e suite spawns `build/psc-mock-server` itself (the `gnmi_server` fixture in
+`tests/e2e/conftest.py`) — no manually-started server needed. Override the binary
+with `PSC_SERVER_BIN=…`. Needs `pytest` + `grpcio`; the `test_gnmic.py` case skips
+when the `gnmic` CLI is absent.
 
 - **Meson + C++20** (`std::jthread`/`std::shared_mutex`); deps grpc++ / protobuf /
   boost(log). Proto is generated at build time (`protoc` custom targets) and shared

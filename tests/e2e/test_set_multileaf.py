@@ -7,83 +7,38 @@ surface as ONE coherent atomic ON_CHANGE notification carrying every new value
 together — never split across notifications, never a half-applied record.
 
 Server-side this is guaranteed structurally: Set collects all ops into a single
-WriteBatch and commits it under one store lock (see set.cpp / leaf_store.cpp), so
-a concurrent Subscribe poll observes the batch all-or-nothing. This test drives
-the observable behavior over the real RPCs:
+WriteBatch and commits it under one store lock, so a concurrent Subscribe poll
+observes the batch all-or-nothing. This test drives the observable behavior over
+the real RPCs:
 
     Subscribe ON_CHANGE <ntp record>                 →  initial atomic (5 leaves)
     Set update version=6 AND association-type=PEER   →  one atomic re-send with
                                                         BOTH new values together
-
-Usage:
-  python3 tests/e2e/test_set_multileaf.py
-  (server must be running: ./build/psc-mock-server --force-insecure --log-level 4)
 """
 
-import sys
-import os
-import time
 import threading
+import time
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)
-
-from github.com.openconfig.gnmi.proto.gnmi import gnmi_pb2, gnmi_pb2_grpc
 import grpc
+from github.com.openconfig.gnmi.proto.gnmi import gnmi_pb2
 
-SERVER = "localhost:50051"
+from gnmi_helpers import hold_open, leaf_map, ntp_config_path
+
 TIMEOUT_S = 20
 
-ADDRESS = "10.0.0.1"
 NEW_VERSION = 6
 NEW_ASSOC = "PEER"
 
 
-def ntp_config_path(*suffixes):
-    path = gnmi_pb2.Path()
-    path.elem.add(name="system")
-    path.elem.add(name="ntp")
-    path.elem.add(name="servers")
-    e = path.elem.add(name="server")
-    e.key["address"] = ADDRESS
-    path.elem.add(name="config")
-    for name in suffixes:
-        path.elem.add(name=name)
-    return path
-
-
-def path_to_str(path):
-    parts = []
-    for e in path.elem:
-        seg = e.name
-        for k, v in e.key.items():
-            seg += f"[{k}={v}]"
-        parts.append(seg)
-    return "/" + "/".join(parts)
-
-
-def leaf_map(notification):
-    """Relative leaf name -> TypedValue for an atomic notification."""
-    return {path_to_str(u.path).lstrip("/"): u.val for u in notification.update}
-
-
-def build_subscribe_request():
-    sub = gnmi_pb2.Subscription()
+def _subscribe_request():
+    sl = gnmi_pb2.SubscriptionList(mode=gnmi_pb2.SubscriptionList.STREAM)
+    sub = sl.subscription.add()
     sub.path.CopyFrom(ntp_config_path())     # whole record
     sub.mode = gnmi_pb2.ON_CHANGE
-    sl = gnmi_pb2.SubscriptionList()
-    sl.mode = gnmi_pb2.SubscriptionList.STREAM
-    sl.subscription.append(sub)
     return gnmi_pb2.SubscribeRequest(subscribe=sl)
 
 
-def request_iter():
-    yield build_subscribe_request()
-    while True:
-        time.sleep(0.2)
-
-
-def drive_set(stub, synced, errors):
+def _drive_set(stub, synced, errors):
     if not synced.wait(timeout=TIMEOUT_S):
         errors.append("sync_response never arrived; Set driver did not run")
         return
@@ -105,21 +60,16 @@ def drive_set(stub, synced, errors):
         errors.append(f"Set failed: {e.code()}: {e.details()}")
 
 
-def run():
-    channel = grpc.insecure_channel(SERVER)
-    stub = gnmi_pb2_grpc.gNMIStub(channel)
-
-    print(f"\n=== Multi-leaf Set coherence test against {SERVER} ===\n")
-
+def test_set_multileaf_coherent(stub):
     synced = threading.Event()
     errors = []
     coherent = False
 
     driver = threading.Thread(
-        target=drive_set, args=(stub, synced, errors), daemon=True)
+        target=_drive_set, args=(stub, synced, errors), daemon=True)
     driver.start()
 
-    call = stub.Subscribe(request_iter(), timeout=TIMEOUT_S)
+    call = stub.Subscribe(hold_open(_subscribe_request()), timeout=TIMEOUT_S)
     deadline = time.time() + TIMEOUT_S
 
     try:
@@ -137,8 +87,7 @@ def run():
                 continue  # initial snapshot, before the Set
 
             leaves = leaf_map(n)
-            print(f"  [server] ON_CHANGE atomic={n.atomic} "
-                  f"leaves={sorted(leaves)}")
+            print(f"  [server] ON_CHANGE atomic={n.atomic} leaves={sorted(leaves)}")
             if not n.atomic:
                 errors.append("ON_CHANGE on atomic container was NOT atomic")
 
@@ -153,23 +102,10 @@ def run():
                 break
     except grpc.RpcError as e:
         if e.code() != grpc.StatusCode.CANCELLED:
-            print(f"\n[error] gRPC error: {e.code()}: {e.details()}")
-            sys.exit(1)
+            raise
     finally:
         call.cancel()
 
     if not coherent:
         errors.append("never saw both leaves in one coherent atomic re-send")
-
-    print("\n=== Results ===")
-    print(f"  both edits in one atomic notification: {coherent}")
-    if errors:
-        print("  FAIL")
-        for e in errors:
-            print(f"    - {e}")
-        sys.exit(1)
-    print("  PASS")
-
-
-if __name__ == "__main__":
-    run()
+    assert not errors, "\n".join(errors)

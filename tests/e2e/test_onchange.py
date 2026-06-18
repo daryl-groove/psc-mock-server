@@ -17,70 +17,33 @@ Verifies:
      a 1s tick with 30% step chance per leaf, so a multi-leaf subtree changes)
   4. Notification.timestamp looks like a collection time: a positive int64 in
      nanoseconds, close to wall-clock now (not zero, not emission-far-future)
-
-Usage:
-  python3 tests/e2e/test_onchange.py
-  (server must be running: ./build/psc-mock-server --force-insecure --log-level 4)
 """
 
-import sys
-import os
 import time
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)
-
-from github.com.openconfig.gnmi.proto.gnmi import gnmi_pb2, gnmi_pb2_grpc
 import grpc
+from github.com.openconfig.gnmi.proto.gnmi import gnmi_pb2
 
-SERVER = "localhost:50051"
+from gnmi_helpers import hold_open, psc_path
+
 TIMEOUT_S = 20          # hard cap so the test never hangs on the open stream
 
 
-def make_psc_path(component, *suffixes):
-    path = gnmi_pb2.Path()
-    path.elem.add(name="components")
-    e = path.elem.add(name="component")
-    e.key["name"] = component
-    for name in suffixes:
-        path.elem.add(name=name)
-    return path
-
-
-def make_subscription(path):
-    sub = gnmi_pb2.Subscription()
-    sub.path.CopyFrom(path)
-    sub.mode = gnmi_pb2.ON_CHANGE
-    return sub
-
-
-def build_subscribe_request(paths):
-    sl = gnmi_pb2.SubscriptionList()
-    sl.mode = gnmi_pb2.SubscriptionList.STREAM
+def _subscribe_request(paths):
+    sl = gnmi_pb2.SubscriptionList(mode=gnmi_pb2.SubscriptionList.STREAM)
     for p in paths:
-        sl.subscription.append(make_subscription(p))
+        sub = sl.subscription.add()
+        sub.path.CopyFrom(p)
+        sub.mode = gnmi_pb2.ON_CHANGE
     return gnmi_pb2.SubscribeRequest(subscribe=sl)
 
 
-def request_iter(paths):
-    # Send the SubscriptionList, then hold the client->server stream open so the
-    # server keeps streaming; the reader cancels the call when satisfied.
-    yield build_subscribe_request(paths)
-    while True:
-        time.sleep(0.2)
-
-
-def run():
+def test_onchange_streams(stub):
     # Broad subtrees → several leaves → a change is near-certain within seconds.
     paths = [
-        make_psc_path("PSC-0", "power-supply", "state"),
-        make_psc_path("PSC-0", "state", "temperature"),
+        psc_path("PSC-0", "power-supply", "state"),
+        psc_path("PSC-0", "state", "temperature"),
     ]
-
-    channel = grpc.insecure_channel(SERVER)
-    stub = gnmi_pb2_grpc.gNMIStub(channel)
-
-    print(f"\n=== ON_CHANGE smoke test against {SERVER} ===\n")
 
     saw_sync = False
     initial_updates = 0
@@ -91,7 +54,7 @@ def run():
     ts_lo = now_ns - 120_000_000_000     # 2 min in the past
     ts_hi = now_ns + 5_000_000_000       # 5 s in the future
 
-    call = stub.Subscribe(request_iter(paths), timeout=TIMEOUT_S)
+    call = stub.Subscribe(hold_open(_subscribe_request(paths)), timeout=TIMEOUT_S)
     deadline = time.time() + TIMEOUT_S
 
     try:
@@ -130,12 +93,10 @@ def run():
 
     except grpc.RpcError as e:
         if e.code() != grpc.StatusCode.CANCELLED:
-            print(f"\n[error] gRPC error: {e.code()}: {e.details()}")
-            sys.exit(1)
+            raise
     finally:
         call.cancel()
 
-    # ---- assertions ----
     if initial_updates == 0:
         errors.append("no initial snapshot updates before sync_response")
     if not saw_sync:
@@ -145,18 +106,4 @@ def run():
             f"no ON_CHANGE update streamed within {TIMEOUT_S}s "
             "(expected the simulator to drift a value)")
 
-    print("=== Results ===")
-    print(f"  initial leaves : {initial_updates}")
-    print(f"  sync_response  : {saw_sync}")
-    print(f"  on-change msgs : {onchange_updates}")
-
-    if errors:
-        print("  FAIL")
-        for e in errors:
-            print(f"    - {e}")
-        sys.exit(1)
-    print("  PASS")
-
-
-if __name__ == "__main__":
-    run()
+    assert not errors, "\n".join(errors)

@@ -14,76 +14,33 @@ This drives, over the real gNMI RPCs:
     Set update .../version = 5           →  atomic re-send, full record, version=5
     Set delete .../iburst                →  atomic re-send, 4 leaves, iburst gone
     Get <ntp record>                     →  atomic Notification too (§3.5.2.5)
-
-Usage:
-  python3 tests/e2e/test_atomic.py
-  (server must be running: ./build/psc-mock-server --force-insecure --log-level 4)
 """
 
-import sys
-import os
-import time
 import threading
+import time
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)
-
-from github.com.openconfig.gnmi.proto.gnmi import gnmi_pb2, gnmi_pb2_grpc
 import grpc
+from github.com.openconfig.gnmi.proto.gnmi import gnmi_pb2
 
-SERVER = "localhost:50051"
+from gnmi_helpers import hold_open, leaf_names, ntp_config_path, path_to_str
+
 TIMEOUT_S = 20
 
-ADDRESS = "10.0.0.1"
 NEW_VERSION = 5
 DELETE_LEAF = "iburst"
 
-
-def ntp_config_path(*suffixes):
-    path = gnmi_pb2.Path()
-    path.elem.add(name="system")
-    path.elem.add(name="ntp")
-    path.elem.add(name="servers")
-    e = path.elem.add(name="server")
-    e.key["address"] = ADDRESS
-    path.elem.add(name="config")
-    for name in suffixes:
-        path.elem.add(name=name)
-    return path
+FULL_RECORD = {"address", "port", "version", "iburst", "association-type"}
 
 
-def path_to_str(path):
-    parts = []
-    for e in path.elem:
-        seg = e.name
-        for k, v in e.key.items():
-            seg += f"[{k}={v}]"
-        parts.append(seg)
-    return "/" + "/".join(parts)
-
-
-def leaf_names(notification):
-    """Effective leaf names of an atomic notification (paths are relative)."""
-    return {path_to_str(u.path).lstrip("/") for u in notification.update}
-
-
-def build_subscribe_request():
-    sub = gnmi_pb2.Subscription()
+def _subscribe_request():
+    sl = gnmi_pb2.SubscriptionList(mode=gnmi_pb2.SubscriptionList.STREAM)
+    sub = sl.subscription.add()
     sub.path.CopyFrom(ntp_config_path())     # whole record
     sub.mode = gnmi_pb2.ON_CHANGE
-    sl = gnmi_pb2.SubscriptionList()
-    sl.mode = gnmi_pb2.SubscriptionList.STREAM
-    sl.subscription.append(sub)
     return gnmi_pb2.SubscribeRequest(subscribe=sl)
 
 
-def request_iter():
-    yield build_subscribe_request()
-    while True:
-        time.sleep(0.2)
-
-
-def drive_sets(stub, synced, errors):
+def _drive_sets(stub, synced, errors):
     if not synced.wait(timeout=TIMEOUT_S):
         errors.append("sync_response never arrived; Set driver did not run")
         return
@@ -109,7 +66,7 @@ def drive_sets(stub, synced, errors):
         errors.append(f"Set delete failed: {e.code()}: {e.details()}")
 
 
-def check_get(stub, errors):
+def _check_get(stub, errors):
     """§3.5.2.5: Get on the atomic container must also come back atomic."""
     req = gnmi_pb2.GetRequest(encoding=gnmi_pb2.JSON_IETF)
     req.path.append(ntp_config_path())
@@ -130,12 +87,7 @@ def check_get(stub, errors):
         errors.append(f"Get atomic prefix wrong: {path_to_str(n.prefix)}")
 
 
-def run():
-    channel = grpc.insecure_channel(SERVER)
-    stub = gnmi_pb2_grpc.gNMIStub(channel)
-
-    print(f"\n=== Atomic-container test against {SERVER} ===\n")
-
+def test_atomic_container(stub):
     synced = threading.Event()
     errors = []
 
@@ -144,10 +96,10 @@ def run():
     got_iburst_delete = False
 
     driver = threading.Thread(
-        target=drive_sets, args=(stub, synced, errors), daemon=True)
+        target=_drive_sets, args=(stub, synced, errors), daemon=True)
     driver.start()
 
-    call = stub.Subscribe(request_iter(), timeout=TIMEOUT_S)
+    call = stub.Subscribe(hold_open(_subscribe_request()), timeout=TIMEOUT_S)
     deadline = time.time() + TIMEOUT_S
 
     try:
@@ -170,8 +122,7 @@ def run():
                 print(f"  [server] initial atomic={n.atomic} "
                       f"prefix={path_to_str(n.prefix)} leaves={sorted(names)}")
                 if (n.atomic and path_to_str(n.prefix).endswith("/config")
-                        and names == {"address", "port", "version",
-                                      "iburst", "association-type"}):
+                        and names == FULL_RECORD):
                     initial_ok = True
                 else:
                     errors.append("initial atomic notification malformed")
@@ -187,8 +138,7 @@ def run():
             # Version change → full record re-sent (5 leaves), version == NEW.
             # (Only the version-change notification carries the full 5-leaf set;
             # the later iburst-delete one legitimately has 4, so don't flag it.)
-            full = {"address", "port", "version", "iburst", "association-type"}
-            if not got_version_update and names == full:
+            if not got_version_update and names == FULL_RECORD:
                 for u in n.update:
                     if path_to_str(u.path).lstrip("/") == "version" \
                             and u.val.uint_val == NEW_VERSION:
@@ -206,12 +156,11 @@ def run():
 
     except grpc.RpcError as e:
         if e.code() != grpc.StatusCode.CANCELLED:
-            print(f"\n[error] gRPC error: {e.code()}: {e.details()}")
-            sys.exit(1)
+            raise
     finally:
         call.cancel()
 
-    check_get(stub, errors)
+    _check_get(stub, errors)
 
     if not initial_ok:
         errors.append("never saw a well-formed initial atomic notification")
@@ -220,18 +169,4 @@ def run():
     if not got_iburst_delete:
         errors.append("never saw the atomic re-send with iburst implicitly deleted")
 
-    print("\n=== Results ===")
-    print(f"  initial atomic record : {initial_ok}")
-    print(f"  version full re-send  : {got_version_update}")
-    print(f"  iburst implicit delete: {got_iburst_delete}")
-
-    if errors:
-        print("  FAIL")
-        for e in errors:
-            print(f"    - {e}")
-        sys.exit(1)
-    print("  PASS")
-
-
-if __name__ == "__main__":
-    run()
+    assert not errors, "\n".join(errors)

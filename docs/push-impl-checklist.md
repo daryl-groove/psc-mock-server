@@ -53,9 +53,16 @@ client is wrongly rejected). See `backlog.md` C1–C5.
       atomic partition + `changeSeq` diff (incl. suppress-on-equal-seq) + atomic
       whole-record re-send + delete-container + timestamp-collapse + `echoTarget`
       behaviour deterministically — the regression net for the push rework.
-- [ ] **e2e isolation** — each test self-starts a fresh server or restores state on
-      teardown (today they share mutable NTP state and fail when run back-to-back).
-- **Gate:** 8 C++ suites + all e2e green; emit behaviour pinned by the new C++ test.
+- [x] **e2e isolation** — migrated the 10 standalone scripts to a pytest suite
+      (`pytest tests/e2e`). A `tests/e2e/conftest.py` `gnmi_server` fixture spawns a
+      **fresh server per test** on a private port (`-b 127.0.0.1:<free>`, readiness
+      via `channel_ready_future`, torn down after) — so the Set/delete tests no
+      longer poison each other; verified by running the suite back-to-back and the
+      formerly-destructive tests 3× (all green). Shared helpers extracted to
+      `tests/e2e/gnmi_helpers.py` (path-builders, `hold_open` subscribe iterator,
+      leaf extractors) — backlog **R8** done with it. `gnmic` test skips when the CLI
+      is absent. (pytest is a user-site dev dep; grpcio stays system-wide.)
+- **Gate:** ✅ 9 C++ suites + 11 e2e green; emit behaviour pinned by the new C++ test.
 
 ## Phase 1 — Core event seam (P1)
 

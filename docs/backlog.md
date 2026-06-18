@@ -37,7 +37,10 @@ missing/partial behaviour.
 Minor (record, low priority):
 - **Set rejects an extension-only request** with `UNIMPLEMENTED`; spec §3.4 L1179-1180 says a `SetRequest` carrying only extensions is valid (supporting unknown extension *semantics* is not required — so an OK no-op is the conformant response).
 - **Atomic whole-record delete** emits `add_delete_()` with an empty path under the container prefix ([src/gnmi/subscribe_emit.cpp](../src/gnmi/subscribe_emit.cpp) L162-167) — relies on `prefix == container` to mean "delete the container"; works but subtle.
-- **e2e tests are not isolated** — they share one server's mutable state (the NTP record gets mutated/deleted by earlier tests), so they pass only against a *fresh* server and fail when run back-to-back. Make each test self-start a server or restore state on teardown.
+- **e2e tests are not isolated** — ✅ **RESOLVED.** Each test now self-starts a fresh
+  server via the pytest `gnmi_server` fixture (`tests/e2e/conftest.py`), so the
+  Set/delete tests no longer share mutable state; the suite is order-independent and
+  back-to-back-safe (verified). (See R8 above.)
 
 ## Code-review follow-ups (`/code-review high` on `1f3ab3d`, 2026-06-17)
 
@@ -92,10 +95,12 @@ when to act. Numbered R* to not clash with the tables above.
   real seam with the Resolver.
 
 **Separate refactor — low priority:**
-- **R8 — the 3 new e2e files duplicate** path-builders, the `yield request; while
-  True: sleep` iterator, server bootstrap, and `/system` path builders from sibling
-  e2e files. Pre-existing suite-wide pattern (no shared module/conftest); extract a
-  shared e2e helper. (Overlaps the Minor "e2e tests are not isolated" item above.)
+- **R8 ✅ DONE — shared e2e harness extracted.** The whole `tests/e2e/` suite is now
+  pytest: `tests/e2e/gnmi_helpers.py` holds the path-builders (`gpath`/`psc_path`/
+  `ntp_config_path`/`sys_config_path`), `path_to_str`, the `hold_open` subscribe
+  iterator, and the atomic leaf extractors (`leaf_names`/`leaf_map`); `tests/e2e/
+  conftest.py` holds the server bootstrap (`gnmi_server` fixture) + `stub`. The
+  per-file duplication is gone. (Done together with the isolation fix below.)
 
 ## Resolved (recorded so they are not re-raised)
 
