@@ -14,6 +14,7 @@
 #include "gnmi.pb.h"
 #include "leaf_entry.hpp"
 #include "leaf_id.hpp"
+#include "leaf_sink.hpp"
 #include "leaf_type.hpp"
 #include "notification_group.hpp"
 
@@ -82,19 +83,31 @@ public:
     // a clean miss, never UB.
     bool set(const LeafId& id, gnmi::TypedValue value, int64_t collectedNs);
 
-    ~ValueWriter()                             = default;  // releases the lock
-    ValueWriter(ValueWriter&&)                 = default;  // movable: returned by value
-    ValueWriter& operator=(ValueWriter&&)      = default;
-    ValueWriter(const ValueWriter&)            = delete;   // two owners would double-release
+    // On destruction: releases the exclusive lock FIRST, then (if a sink is attached
+    // and this writer recorded real changes) dispatches the change-set — so the sink
+    // never runs under the write lock. Defined out-of-line where LeafRegistry is complete.
+    ~ValueWriter();
+
+    // Non-movable AND non-copyable. writeValues() returns by value via guaranteed copy
+    // elision (C++17), so a move is never actually invoked; forbidding it removes the
+    // moved-from-husk hazard — a defaulted move copies the raw reg_ without nulling the
+    // source, so the husk's destructor would re-dispatch and unlock a lock it no longer
+    // owns. A future need for a real move must add a correct one (null the source); the
+    // compiler flags it then, rather than failing silently at runtime.
+    ValueWriter(ValueWriter&&)                 = delete;
+    ValueWriter& operator=(ValueWriter&&)      = delete;
+    ValueWriter(const ValueWriter&)            = delete;
     ValueWriter& operator=(const ValueWriter&) = delete;
 
 private:
     friend class LeafRegistry;
-    explicit ValueWriter(LeafRegistry& reg, std::unique_lock<std::shared_mutex> lk)
-        : reg_(&reg), lock_(std::move(lk)) {}
+    ValueWriter(LeafRegistry& reg, std::unique_lock<std::shared_mutex> lk,
+                std::shared_ptr<ChangeBatch> batch)
+        : reg_(&reg), lock_(std::move(lk)), batch_(std::move(batch)) {}
 
     LeafRegistry*                       reg_;
     std::unique_lock<std::shared_mutex> lock_;
+    std::shared_ptr<ChangeBatch>        batch_;  // nullptr when no sink is attached (zero-overhead poll path)
 };
 
 // Central, sole owner of every LeafEntry and NotificationGroup in the process
@@ -177,19 +190,34 @@ public:
     // Acquires the exclusive lock and returns the sole value-write handle (D6).
     ValueWriter writeValues();
 
+    // Attaches the optional push sink (P1). Set ONCE before serving; nullptr (the
+    // default) makes every dispatch a no-op, so the poll/test path keeps working with
+    // zero overhead (no batch is even built). Takes the exclusive lock so a setup-time
+    // attach is race-free against the locked sink_ reads.
+    void setSink(ILeafSink* sink);
+
 private:
     friend class ValueWriter;
 
     // The actual value write, performed while the caller's ValueWriter holds the
     // exclusive lock (so it does NOT re-lock). Value-gated changeSeq bump (D14/D17).
-    bool setValueLocked(const LeafId& id, gnmi::TypedValue value, int64_t collectedNs);
+    // On a real change, appends an enriched LeafChange to *batch when batch != nullptr.
+    bool setValueLocked(const LeafId& id, gnmi::TypedValue value, int64_t collectedNs,
+                        ChangeBatch* batch);
+
+    // Releases-then-dispatched seam helper: calls sink_->onChange if a sink is attached
+    // and the batch is non-empty. The caller MUST have released the exclusive lock
+    // first (the sink never runs under the write lock). noexcept — a misbehaving sink
+    // can never std::terminate a destructor / structural op.
+    void dispatch(std::shared_ptr<const ChangeBatch> batch) noexcept;
 
     // Register one group/leaf assuming the exclusive lock is already held — the
     // shared core of register*/attachSubtree, so a whole branch is one lock (D12).
+    // registerLeafLocked appends an `added` LeafChange to *batch when batch != nullptr.
     void   registerGroupLocked(const std::string& prefix, bool atomic,
                                std::optional<LeafType> preferredType);
     LeafId registerLeafLocked(const std::string& path, std::optional<LeafType> type,
-                              std::optional<gnmi::TypedValue> initialValue);
+                              std::optional<gnmi::TypedValue> initialValue, ChangeBatch* batch);
 
     // Deref-comparator for a shared CanonicalPath key (leaves_ and groups_), transparent so
     // a lookup can probe with either a freshly canonicalize()d CanonicalPath (no shared_ptr
@@ -234,6 +262,7 @@ private:
     std::map<std::shared_ptr<const CanonicalPath>, NotificationGroup, DerefLess> groups_;
 
     uint64_t                  globalSeq_ = 0;  // registry-global monotonic change token (D14)
+    ILeafSink*                sink_      = nullptr;  // optional push seam (P1); unset = no-op
     mutable std::shared_mutex mutex_;
 };
 

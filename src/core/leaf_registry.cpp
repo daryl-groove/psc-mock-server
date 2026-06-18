@@ -46,8 +46,17 @@ void LeafRegistry::registerGroup(const std::string& prefix, bool atomic,
 
 LeafId LeafRegistry::registerLeaf(const std::string& path, std::optional<LeafType> type,
                                   std::optional<gnmi::TypedValue> initialValue) {
-    std::unique_lock lock(mutex_);
-    return registerLeafLocked(path, type, std::move(initialValue));
+    std::shared_ptr<ChangeBatch> batch;
+    LeafId id;
+    {
+        std::unique_lock lock(mutex_);
+        if (sink_) {
+            batch = std::make_shared<ChangeBatch>();
+        }
+        id = registerLeafLocked(path, type, std::move(initialValue), batch.get());
+    }  // lock released here
+    dispatch(std::move(batch));
+    return id;
 }
 
 void LeafRegistry::registerGroupLocked(const std::string& prefix, bool atomic,
@@ -79,7 +88,8 @@ void LeafRegistry::registerGroupLocked(const std::string& prefix, bool atomic,
 }
 
 LeafId LeafRegistry::registerLeafLocked(const std::string& path, std::optional<LeafType> type,
-                                        std::optional<gnmi::TypedValue> initialValue) {
+                                        std::optional<gnmi::TypedValue> initialValue,
+                                        ChangeBatch* batch) {
     CanonicalPath canonPath = canonicalize(path);
 
     if (leaves_.find(canonPath) != leaves_.end()) {
@@ -101,6 +111,17 @@ LeafId LeafRegistry::registerLeafLocked(const std::string& path, std::optional<L
     // this leaf. D5 guarantees at most one such group exists.
     if (NotificationGroup* owner = findOwningGroup(leaf.path())) {
         owner->linkLeaf(&leaf);
+    }
+
+    // A newly-materialised leaf is a wire-visible `add` (§3.5.2.3). Reported faithfully
+    // even when unset (value == nullptr, Fork 3b) — the builder/P4 re-expansion decides
+    // what reaches the wire (D14: unset never sent), the seam just states "it appeared".
+    if (batch) {
+        batch->added.push_back(LeafChange{.id          = LeafId(pathHandle),
+                                          .path        = pathHandle,
+                                          .changeSeq   = leaf.changeSeq(),
+                                          .collectedNs = leaf.collectedNs(),
+                                          .value       = leaf.value()});
     }
 
     return LeafId(std::move(pathHandle));
@@ -240,53 +261,80 @@ SubscriptionView LeafRegistry::collectForSubscription(const std::string& query) 
 }
 
 std::map<std::string, LeafId> LeafRegistry::attachSubtree(const SubtreeSpec& spec) {
-    std::unique_lock lock(mutex_);
-
-    // Groups before leaves, so the leaves auto-assign within the same branch (D3).
-    for (const auto& g : spec.groups) {
-        registerGroupLocked(g.prefix, g.atomic, g.preferredType);
-    }
+    std::shared_ptr<ChangeBatch> batch;
     std::map<std::string, LeafId> ids;
-    for (const auto& l : spec.leaves) {
-        LeafId id = registerLeafLocked(l.path, l.type, l.initialValue);
-        ids.emplace(canonicalize(l.path).str(), id);  // addressable by canonical path, not spec order
-    }
+    {
+        std::unique_lock lock(mutex_);
+        if (sink_) {
+            batch = std::make_shared<ChangeBatch>();
+        }
+        // Groups before leaves, so the leaves auto-assign within the same branch (D3).
+        for (const auto& g : spec.groups) {
+            registerGroupLocked(g.prefix, g.atomic, g.preferredType);
+        }
+        for (const auto& l : spec.leaves) {
+            LeafId id = registerLeafLocked(l.path, l.type, l.initialValue, batch.get());
+            ids.emplace(canonicalize(l.path).str(), id);  // addressable by canonical path, not spec order
+        }
+    }  // lock released here — the whole branch's `added` records dispatch as ONE batch
+    dispatch(std::move(batch));
     return ids;
 }
 
 void LeafRegistry::detachSubtree(const std::string& prefix) {
     const CanonicalPath canonPrefix = canonicalize(prefix);
 
-    std::unique_lock lock(mutex_);
+    std::shared_ptr<ChangeBatch> batch;
+    {
+        std::unique_lock lock(mutex_);
 
-    // Remove every leaf under the branch, unlinking from its group first (D1).
-    forEachUnderPrefix(leaves_, canonPrefix, [&](auto it) {
-        LeafEntry& leaf = it->second;
-        if (leaf.group_ != nullptr) {
-            leaf.group_->unlinkLeaf(&leaf);
+        // Remove every leaf under the branch, unlinking from its group first (D1).
+        forEachUnderPrefix(leaves_, canonPrefix, [&](auto it) {
+            LeafEntry& leaf = it->second;
+            if (leaf.group_ != nullptr) {
+                leaf.group_->unlinkLeaf(&leaf);
+            }
+            return leaves_.erase(it);
+        });
+
+        // Remove every group whose prefix is under the branch (its members are already gone).
+        // A group with a broader prefix outside the branch survives, minus the unlinked leaves.
+        forEachUnderPrefix(groups_, canonPrefix, [&](auto it) { return groups_.erase(it); });
+
+        // ONE branch-level delete, not per-leaf (§3.5.2.3 / D14 delete-granularity).
+        if (sink_) {
+            batch = std::make_shared<ChangeBatch>();
+            batch->removedPrefixes.push_back(canonPrefix);
         }
-        return leaves_.erase(it);
-    });
-
-    // Remove every group whose prefix is under the branch (its members are already gone).
-    // A group with a broader prefix outside the branch survives, minus the leaves just unlinked.
-    forEachUnderPrefix(groups_, canonPrefix, [&](auto it) { return groups_.erase(it); });
+    }  // lock released here
+    dispatch(std::move(batch));
 }
 
 void LeafRegistry::unregisterLeaf(const std::string& path) {
     const CanonicalPath canonPath = canonicalize(path);
 
-    std::unique_lock lock(mutex_);
+    std::shared_ptr<ChangeBatch> batch;
+    {
+        std::unique_lock lock(mutex_);
 
-    auto it = leaves_.find(canonPath);
-    if (it == leaves_.end()) {
-        return;
-    }
-    LeafEntry& leaf = it->second;
-    if (leaf.group_ != nullptr) {
-        leaf.group_->unlinkLeaf(&leaf);  // unlink BEFORE erase (D1 erase order)
-    }
-    leaves_.erase(it);
+        auto it = leaves_.find(canonPath);
+        if (it == leaves_.end()) {
+            return;  // no-op: nothing changed, nothing to dispatch
+        }
+        LeafEntry& leaf = it->second;
+        if (leaf.group_ != nullptr) {
+            leaf.group_->unlinkLeaf(&leaf);  // unlink BEFORE erase (D1 erase order)
+        }
+        leaves_.erase(it);
+
+        // A single unregister is a one-entry removedPrefixes — the same channel as
+        // detachSubtree (R2 coverage by construction).
+        if (sink_) {
+            batch = std::make_shared<ChangeBatch>();
+            batch->removedPrefixes.push_back(canonPath);
+        }
+    }  // lock released here
+    dispatch(std::move(batch));
 }
 
 void LeafRegistry::unregisterGroup(const std::string& prefix) {
@@ -305,13 +353,39 @@ void LeafRegistry::unregisterGroup(const std::string& prefix) {
         member->group_ = nullptr;
     }
     groups_.erase(it);
+
+    // No ILeafSink event (Fork 4 / D6 carve-out): unregisterGroup removes NO data —
+    // its members survive as ungrouped leaves (D9), so routing it to removedPrefixes
+    // would wrongly tell the client to delete live leaves (ungroup != delete). The
+    // correct wire effect is "re-characterised as per-leaf", a re-send not a delete;
+    // deferred until a real consumer needs it (no provider calls this today).
 }
 
 ValueWriter LeafRegistry::writeValues() {
-    return ValueWriter(*this, std::unique_lock<std::shared_mutex>(mutex_));
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    // Build a batch ONLY when a sink is attached — the poll/test path pays nothing.
+    auto batch = sink_ ? std::make_shared<ChangeBatch>() : std::shared_ptr<ChangeBatch>{};
+    return ValueWriter(*this, std::move(lock), std::move(batch));
 }
 
-bool LeafRegistry::setValueLocked(const LeafId& id, gnmi::TypedValue value, int64_t collectedNs) {
+void LeafRegistry::setSink(ILeafSink* sink) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    sink_ = sink;
+}
+
+void LeafRegistry::dispatch(std::shared_ptr<const ChangeBatch> batch) noexcept {
+    if (sink_ && batch && !batch->empty()) {
+        try {
+            sink_->onChange(std::move(batch));
+        } catch (...) {
+            // onChange is contractually noexcept; swallow defensively so a misbehaving
+            // sink can never std::terminate via a destructor / structural dispatch.
+        }
+    }
+}
+
+bool LeafRegistry::setValueLocked(const LeafId& id, gnmi::TypedValue value, int64_t collectedNs,
+                                  ChangeBatch* batch) {
     if (!id.valid()) {
         return false;
     }
@@ -323,7 +397,7 @@ bool LeafRegistry::setValueLocked(const LeafId& id, gnmi::TypedValue value, int6
 
     // Value-gated (D14): a re-pushed identical value is a no-op, so static sensors
     // never spuriously fire ON_CHANGE. The registry, not the provider, decides what
-    // counts as a change.
+    // counts as a change — so an unchanged write records NO LeafChange either.
     if (leaf.value_ &&
         google::protobuf::util::MessageDifferencer::Equals(*leaf.value_, value)) {
         return true;
@@ -334,11 +408,32 @@ bool LeafRegistry::setValueLocked(const LeafId& id, gnmi::TypedValue value, int6
     leaf.value_       = std::make_shared<const gnmi::TypedValue>(std::move(value));
     leaf.collectedNs_ = collectedNs;
     leaf.changeSeq_   = ++globalSeq_;
+
+    // Enriched change captured AT COMMIT (R1): the consumer never re-reads the core.
+    if (batch) {
+        batch->changed.push_back(LeafChange{.id          = LeafId(leaf.path_),
+                                            .path        = leaf.path_,
+                                            .changeSeq   = leaf.changeSeq_,
+                                            .collectedNs = leaf.collectedNs_,
+                                            .value       = leaf.value_});
+    }
     return true;
 }
 
+ValueWriter::~ValueWriter() {
+    // Release the exclusive lock FIRST, then dispatch — the sink must never run under
+    // the write lock (no re-lock / lock-ordering hazard). batch_ is null on the
+    // no-sink path, so this is a bare unlock there.
+    if (lock_.owns_lock()) {
+        lock_.unlock();
+    }
+    if (batch_) {
+        reg_->dispatch(std::move(batch_));
+    }
+}
+
 bool ValueWriter::set(const LeafId& id, gnmi::TypedValue value, int64_t collectedNs) {
-    return reg_->setValueLocked(id, std::move(value), collectedNs);
+    return reg_->setValueLocked(id, std::move(value), collectedNs, batch_.get());
 }
 
 }  // namespace gnmid::core

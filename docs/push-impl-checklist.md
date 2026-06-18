@@ -64,16 +64,34 @@ client is wrongly rejected). See `backlog.md` C1–C5.
       is absent. (pytest is a user-site dev dep; grpcio stays system-wide.)
 - **Gate:** ✅ 9 C++ suites + 11 e2e green; emit behaviour pinned by the new C++ test.
 
-## Phase 1 — Core event seam (P1)
+## Phase 1 — Core event seam (P1) ✅ DONE
 
-- [ ] `ILeafSink` + `ChangeBatch{changed, added, removedPrefixes}` / `LeafChange`
-      (enriched payload R1, single unified `onChange` R2).
-- [ ] `ValueWriter` assembles `LeafChange` at commit; registry dispatches on
-      commit / `attachSubtree`·`registerLeaf` / `detachSubtree`·`unregisterLeaf|Group`.
-- [ ] `LeafRegistry` holds an optional `ILeafSink*`; dispatch is a no-op when unset
-      (poll/test paths keep working).
-- [ ] tests: payload correctness, unset = no-op, `shared_ptr<const ChangeBatch>`
-      lifetime across post-unlock dispatch (L=B).
+`src/core/leaf_sink.hpp` + the registry wiring; **additive, no consumer yet** (the
+server attaches no sink, so the poll path is byte-for-byte unchanged — 11 e2e green).
+Implementation forks decided with the user (recorded in core D6 / P3 Fork 1–2):
+
+- [x] **`ILeafSink` + `ChangeBatch{changed, added, removedPrefixes}` / `LeafChange`**
+      (`leaf_sink.hpp`). Enriched payload R1 (path D16/L=B + value D17 handles, changeSeq,
+      collectedNs captured at commit); single `onChange(shared_ptr<const ChangeBatch>)`
+      **(Fork 2)**, `noexcept` **(尖角 2)**.
+- [x] **`ValueWriter` assembles the batch at commit; registry dispatches AFTER unlock.**
+      `setValueLocked` appends an enriched `LeafChange` on a real (value-gated) change;
+      the writer's destructor releases the exclusive lock **then** calls
+      `dispatch()` — the sink never runs under the write lock **(Fork 1: destructor,
+      not explicit commit())**. `ValueWriter` is now **non-movable** (guaranteed copy
+      elision means no move is needed; removes the moved-from-husk hazard, 尖角 1).
+- [x] **Structural sources**: `registerLeaf`/`attachSubtree` → `added` (unset leaves
+      included faithfully, Fork 3b); `detachSubtree`/`unregisterLeaf` → branch-level
+      `removedPrefixes`. **`unregisterGroup` emits nothing (Fork 4 carve-out:
+      ungroup ≠ delete)** — reconciled in core D6 / P3 Fork 2.
+- [x] **`LeafRegistry` holds an optional `ILeafSink*` (`setSink`); no-op when unset** —
+      and the batch is **not even built** without a sink, so the poll/test path pays
+      nothing (Fork 5).
+- [x] **tests** — `tests/core/test_leaf_sink.cpp` (9 cases): enriched changed payload,
+      value-gated no-op records nothing, no-sink = no dispatch, `added` incl. unset,
+      attachSubtree one-batch, detach/unregisterLeaf removedPrefixes, unregisterGroup
+      no-event, and the L=B lifetime (batch outlives the writer scope **and** a later
+      detach). 10 C++ suites green.
 
 ## Phase 2 — Subscription object + threading (P2)
 

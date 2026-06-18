@@ -186,6 +186,7 @@ foreach t : [
     'leaf_registry_registration',
     'leaf_registry_values',
     'leaf_registry_structural',
+    'leaf_sink',
     'integration_scenario',
   ]
   exe = executable('test_core_' + t,

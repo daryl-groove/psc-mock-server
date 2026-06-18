@@ -513,13 +513,19 @@ Rationale:
 > commits *and* from every structural op. (Poll-diff catches both for free via the
 > key-set diff (D14) — this distinction only matters once push is built.)
 >
-> **Seam shape (finalized in protocol-layer-design.md P3 — `ILeafSink`).** The
-> registry holds an optional `ILeafSink*` and dispatches **one unified
-> `onChange(const ChangeBatch&)`** (no-op when unset). `ChangeBatch =
-> {changed, added, removedPrefixes}` maps the four sources cleanly: a `ValueWriter`
-> commit fills `changed`; `attachSubtree`/`registerLeaf` fill `added`;
-> `detachSubtree`/`unregisterLeaf`/`unregisterGroup` fill `removedPrefixes` (a
-> single unregister is a one-entry prefix — R2 coverage by construction). The
+> **Seam shape (finalized in protocol-layer-design.md P3 — `ILeafSink`; IMPLEMENTED
+> Phase 1, `src/core/leaf_sink.hpp`).** The registry holds an optional `ILeafSink*`
+> and dispatches **one unified `onChange(shared_ptr<const ChangeBatch>)`** (no-op
+> when unset; the batch is built only when a sink is attached, so the poll path pays
+> nothing). `ChangeBatch = {changed, added, removedPrefixes}` maps the sources: a
+> `ValueWriter` commit fills `changed`; `attachSubtree`/`registerLeaf` fill `added`;
+> `detachSubtree`/`unregisterLeaf` fill `removedPrefixes` (a single `unregisterLeaf`
+> is a one-entry prefix — the same channel as `detachSubtree`).
+> **`unregisterGroup` is the carve-out (Fork 4): it emits NOTHING.** It removes no
+> data — its members survive as ungrouped leaves (D9) — so routing it to
+> `removedPrefixes` would wrongly tell the client to delete live leaves (ungroup ≠
+> delete; the correct effect is a "re-characterised as per-leaf" re-send, not a
+> delete). Deferred until a real consumer needs it (no provider calls it today). The
 > `changed`/`added` records are **enriched** (R1): each `LeafChange` carries
 > `{LeafId, shared_ptr<const CanonicalPath>, changeSeq, collectedNs,
 > shared_ptr<const TypedValue>}` captured at commit, so the consumer never re-locks

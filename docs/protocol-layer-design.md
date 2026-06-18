@@ -107,27 +107,31 @@ state on each tick and uses `changeSeq` for `suppress_redundant`.
 // ONE unified event carries value changes AND structural adds/removals.
 // Payload is enriched (captured at commit) so the sink never re-locks the core.
 // [Shape finalized in P3: R1 enriched payload, R2 unified entry point.]
+// [IMPLEMENTED Phase 1 — src/core/leaf_sink.hpp; matches this sketch.]
 struct LeafChange {                          // one changed/added leaf, captured at commit
     LeafId                                  id;
     std::shared_ptr<const CanonicalPath>    path;        // shared handle (D16/L=B) — zero-copy, refcount-safe
     uint64_t                                changeSeq;   // D14 change token
     int64_t                                 collectedNs; // wire-timestamp source (D14)
-    std::shared_ptr<const gnmi::TypedValue> value;       // D17 COW handle — zero-copy
+    std::shared_ptr<const gnmi::TypedValue> value;       // D17 COW handle — zero-copy; nullptr = unset
 };
 struct ChangeBatch {                         // OWNS its records (must outlive the writer scope)
     std::vector<LeafChange>    changed;          // ValueWriter commit (value writes)
     std::vector<LeafChange>    added;            // attachSubtree / registerLeaf
-    std::vector<CanonicalPath> removedPrefixes;  // detachSubtree / unregisterLeaf|Group
+    std::vector<CanonicalPath> removedPrefixes;  // detachSubtree / unregisterLeaf (NOT unregisterGroup — Fork 4 carve-out)
 };
 class ILeafSink {
 public:
     virtual ~ILeafSink() = default;
-    virtual void onChange(const ChangeBatch&) = 0;   // single entry point
+    virtual void onChange(std::shared_ptr<const ChangeBatch>) noexcept = 0;  // single entry point
 };
-// LeafRegistry holds an optional ILeafSink*; dispatch is a no-op when unset
-// (poll/test paths keep working without a listener). The batch is dispatched as a
-// shared_ptr<const ChangeBatch> so fan-out to many Subscriptions is a refcount bump
-// and nothing dangles after the ValueWriter scope exits (L=B; see core D6).
+// LeafRegistry holds an optional ILeafSink*; dispatch is a no-op when unset (poll/test
+// paths keep working without a listener, and the batch is not even built). It is
+// dispatched as a shared_ptr<const ChangeBatch> AFTER the exclusive lock is released,
+// so the sink never re-locks the core, fan-out to many Subscriptions is a refcount
+// bump, and nothing dangles after the ValueWriter scope exits (L=B; see core D6).
+// onChange is noexcept — it is called from the ValueWriter destructor / a post-unlock
+// structural dispatch, where an escaping exception would std::terminate.
 ```
 
 **Why push-native (vs poll-first).** The end-state is push (core D6 confirmed,
@@ -309,7 +313,8 @@ The change event carries an owned `vector<LeafChange>` (dispatched as
 
 #### Fork 2 — One unified `onChange(ChangeBatch)` entry point, R2 (decided)
 
-The sink has a single method `onChange(const ChangeBatch&)` where
+The sink has a single method `onChange(shared_ptr<const ChangeBatch>)` (Fork 1
+above gives it the shared-handle payload) where
 `ChangeBatch = {changed, added, removedPrefixes}` (sketch under P1), instead of
 separate `onLeavesChanged`/`onSubtreeAttached`/`onSubtreeDetached` methods.
 
@@ -317,12 +322,19 @@ separate `onLeavesChanged`/`onSubtreeAttached`/`onSubtreeDetached` methods.
   consumes** — the core emits exactly what the protocol routes, one type across
   the seam, one routing path. A value-only commit simply leaves `added`/
   `removedPrefixes` empty.
-- **R2 coverage falls out structurally.** A single `unregisterLeaf`/
-  `unregisterGroup` is just a one-entry `removedPrefixes` — the same channel as
-  `detachSubtree` — so the former gap (D6 named only subtree ops) is closed *by
-  construction*, not by bolting on extra methods. The dispatch sources are
-  therefore: `ValueWriter` commit → `changed`; `attachSubtree`/`registerLeaf` →
-  `added`; `detachSubtree`/`unregisterLeaf`/`unregisterGroup` → `removedPrefixes`.
+- **R2 coverage falls out structurally.** A single `unregisterLeaf` is just a
+  one-entry `removedPrefixes` — the same channel as `detachSubtree` — so the former
+  gap (D6 named only subtree ops) is closed *by construction*, not by bolting on
+  extra methods. The dispatch sources are therefore: `ValueWriter` commit →
+  `changed`; `attachSubtree`/`registerLeaf` → `added`; `detachSubtree`/
+  `unregisterLeaf` → `removedPrefixes`.
+- **⚠ `unregisterGroup` is the carve-out (impl Fork 4, decided when Phase 1 landed).**
+  It emits **nothing**: it removes no data — members survive as ungrouped leaves
+  (D9) — so a `removedPrefixes` entry would wrongly delete live leaves client-side
+  (ungroup ≠ delete; the correct effect is a "re-characterised as per-leaf" re-send,
+  not a delete). Deferred until a real consumer needs that re-send (no provider calls
+  it today). So R2's "by construction" holds for `unregisterLeaf`, **not** for
+  `unregisterGroup`. (Reconciled in core D6.)
 - **Trade-off accepted.** A "fatter" event with sometimes-empty spans, versus more
   self-documenting but multiplied method surface that *still* needs new methods for
   the single-unregister case. Chosen for lower coupling and less redundant surface.
