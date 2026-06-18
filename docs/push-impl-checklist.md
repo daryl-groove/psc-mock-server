@@ -5,6 +5,17 @@ design (`protocol-layer-design.md` P1–P5). Subscribe is poll+diff today; this 
 it push-native. Ordered so the cheap conformance fixes and the test safety net land
 **before** the one-way-door event substrate.
 
+> **STATUS (2026-06-18) — re-ranked; this is no longer the active roadmap.**
+> Phase 0–2 delivered push's core value (real-time ON_CHANGE, 6.5 ms, green). The
+> phase numbering here is a *single-feature dependency order*, **not** a global
+> priority ranking — it was written before 0–2 landed, on the assumption we'd push
+> straight through to P5 + cutover. Now that the core is delivered, **Phase 3–6 are
+> demoted into the global backlog** (`backlog.md` → "Global priority") and re-ranked
+> there against all other work from the **real-application angle** (a gNMI server on
+> a real PSC card + a compliant client's boundary expectations — *not* "it's a
+> mock"). Phases 3–6 below are retained **verbatim** as the build-out record; do not
+> read them as "what's next."
+
 **Door note.** Tier 0/1 are two-way doors (additive, localized). **Push (Phase 1–2)
 is the one remaining one-way door** — the cross-thread event substrate + concurrency
 model — so do it deliberately, on top of the Phase 0 test net. P3/P4/P5, C2 and

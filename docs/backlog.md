@@ -5,6 +5,55 @@ findings** tracked in [design-review.md](design-review.md) (A–T) and the **pro
 design** in [protocol-layer-design.md](protocol-layer-design.md) (P1–P5). Salvaged
 from the retired `DESIGN.md` plus integration follow-ups. Roughly priority-ordered.
 
+## Global priority (real-application lens, 2026-06-18)
+
+Ranked by what a gNMI server **on a real PSC card** owes a compliant client —
+including boundary behaviour (hot-plug, delete, default-value transitions) — **not**
+by "it's a mock" (that framing is the wrong yardstick; the mock is one instance of
+the real device, so a "low priority for a mock" / "no e2e uses it" note below should
+be re-read through this lens). This **supersedes the implicit "follow
+push-impl-checklist Phase 3→6" order**: push's core value landed at Phase 2, so its
+tail re-enters this ranking rather than auto-executing. Nothing below is deleted —
+this only re-orders.
+
+1. **Runtime hot-plug surface on `Backend`** — *the* minimal-viable-complete gap.
+   Pluggability is the PSC device's defining trait, and the modelling is already
+   designed (`device-modeling-conventions.md` §3/§6) and the **core** seam exists
+   (`attach/detachSubtree`). But `Backend` only exposes **constructor-time**
+   `declareLeaf`/`declareGroup`; there is **no runtime attach/detach**, and
+   `registry()` is contractually **value-writes-only** (using it for structure desyncs
+   `ids_`/`ownedPrefixes_`/`writableConfig_`, backend.hpp:69-71). So **hot-plug is not
+   reachable through the supported provider API today.** Scope: surface a
+   binding-synced runtime attach/detach on `Backend`; exercise it from a *thin* demo
+   (one pluggable unit toggling — not a full shelf model, per README scope); add a
+   hot-plug e2e (Get reflects appear/disappear, ON_CHANGE client sees add/delete).
+   Additive — no core rework.
+2. **P4 push-routing for list-level ON_CHANGE** (push-impl-checklist Phase 4) — once
+   hot-plug is reachable, a client with ON_CHANGE on `/components/component` should be
+   woken **instantly** on insert/remove. Correctness is already safe (the ~1s liveness
+   snapshot+diff **catches** structural changes — it does not miss them), so this is a
+   latency + routing-mechanism refinement on top of #1, not a data-loss bug.
+3. **#5 `[name=*]` wildcards** — real clients issue wildcard subscriptions; key-omitted
+   lists already work, literal `[name=*]` + mid-path multi-key do not.
+4. **#6 YANG schema validation** — a real device validates paths/keys/types; re-weigh
+   on real-application merit (boundary correctness), not the "low priority for a mock"
+   note in the table. Still gated by the libyang-weight trade-off (a hardcoded
+   path-schema table is the lighter option).
+5. **#3 JSON_IETF encoding** — "更完整", not required: we are read-mostly telemetry, and
+   a collector consumes scalar typed values fine. It's an **emit-boundary serializer**
+   (View → `json_ietf_val`), additive, **no architectural rework** to add later — so
+   optional/deferred. *Separate small honesty fix worth doing regardless:*
+   `buildSubscribeNotifications` rejects PROTO as `UNIMPLEMENTED` yet accepts
+   JSON/JSON_IETF and then emits scalar (= PROTO-shaped) values — align Capabilities +
+   encoding acceptance with what we actually emit.
+6. **Deferred — perf / internal / approximation, no client-facing obligation or
+   boundary at stake:** S3/P3 (no-relock builder + high-water watermark; pure perf, no
+   driver), the driver-agnostic `Subscription` object refactor (readability/
+   extensibility, no driver — do it only when you next touch `handleStream` and it
+   actually blocks you), P5 per-leaf TARGET_DEFINED (the per-subscription approximation
+   works today, C2), #8 trie routing (trigger: concurrent streams → low hundreds),
+   #4 `suppress_redundant` (niche), #7 main.cpp (deploy-time).
+
 | # | Item | Notes |
 |---|---|---|
 | 1 | **Push-native ON_CHANGE** (event seam + threading) | The big next step. Designed as **P1/P2** in [protocol-layer-design.md](protocol-layer-design.md); subscribe is poll+diff today. Phased build plan: **[push-impl-checklist.md](push-impl-checklist.md)** (Phase 0 punch list → P1 seam → P2 threading → P3/P4/P5). Now well-positioned: a localized swap of the Change Source against a real consumer (the integrated server). |

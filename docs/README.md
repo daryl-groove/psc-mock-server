@@ -9,6 +9,32 @@ before connecting to real hardware.
 
 ---
 
+## Design yardstick & scope
+
+Two standing principles behind every design / priority call in these docs:
+
+- **Weigh from the real application, not "it's a mock."** The yardstick is what a
+  gNMI server **on a real PSC card** owes a compliant client — including boundary
+  behaviour (hot-plug, delete, default-value transitions) — *not* "does the mock need
+  it" / "no e2e uses it." The mock is one instance of the real device, not the
+  measure. ("low priority for a mock" reasoning is a smell; re-read it through this
+  lens.)
+- **The deliverable is the gNMI/core layer's expressiveness + authoring ergonomics.**
+  However complex a future device model becomes — a chassis that itself plugs into a
+  shelf, shelves of differing type (BBU vs PSU), slots carrying a `presence` marker,
+  PSU/BBU device subtrees underneath — it must stay **expressible and intuitive to
+  build** on this layer. The two providers (`src/backend/`) are **deliberately-minimal
+  examples** of *applying* the layer, **not** realistic device models; do not grow
+  them to chase hypothetical hardware. (How a device maps onto the core lives in
+  [device-modeling-conventions.md](device-modeling-conventions.md).)
+
+**Build order:** reach a **minimal viable, complete** system first, with the
+architecture chosen so later extension needs **no rework** — *then* extend. Extensions
+that are confirmed additive (JSON_IETF serializer, richer wildcards, push-routing
+latency) are parked in [backlog.md](backlog.md), not front-loaded.
+
+---
+
 ## Architecture (current)
 
 ```
