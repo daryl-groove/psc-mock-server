@@ -115,6 +115,38 @@ bool isUnderPrefix(const CanonicalPath& prefix, const CanonicalPath& path) noexc
     return q[p.size()] == '/';                        // element boundary
 }
 
+namespace {
+
+// Drop every [key=value] predicate from a canonical path, leaving the bare element
+// names. The result has no predicates (so it is itself canonical-shaped).
+std::string stripKeys(std::string_view path) {
+    std::string out;
+    out.reserve(path.size());
+    bool inKey = false;
+    for (char c : path) {
+        if (c == '[')      inKey = true;
+        else if (c == ']') inKey = false;
+        else if (!inKey)   out.push_back(c);
+    }
+    return out;
+}
+
+}  // namespace
+
+bool ownsPath(std::string_view prefix, std::string_view path) noexcept {
+    if (!path.starts_with(prefix))    return false;
+    if (path.size() == prefix.size()) return true;
+    const char next = path[prefix.size()];
+    return next == '/' || next == '[';
+}
+
+bool selects(std::string_view query, std::string_view path) noexcept {
+    if (ownsPath(query, path)) return true;
+    if (query.find('[') == std::string_view::npos)
+        return ownsPath(query, stripKeys(path));
+    return false;
+}
+
 std::vector<std::string_view> ancestorPrefixes(const CanonicalPath& path) {
     const std::string_view p = path.str();
 

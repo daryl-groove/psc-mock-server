@@ -23,11 +23,12 @@ reappearing — and the permanent `empty` marker flips both ways.
 
 import queue
 import threading
+import time
 
 import pytest
 from github.com.openconfig.gnmi.proto.gnmi import gnmi_pb2
 
-from gnmi_helpers import hold_open, path_to_str, psc_path
+from gnmi_helpers import gpath, hold_open, path_to_str, psc_path
 
 # Start this test's server with the sim-control channel enabled.
 pytestmark = pytest.mark.parametrize("gnmi_server", [["-s"]], indirect=True)
@@ -40,10 +41,10 @@ SENSOR_MARKERS = ("power-supply/state/input-voltage", "state/temperature/instant
 DEADLINE_S = 5.0
 
 
-def _slot_subscribe_request():
+def _subscribe_request(path):
     sl = gnmi_pb2.SubscriptionList(mode=gnmi_pb2.SubscriptionList.STREAM)
     sub = sl.subscription.add()
-    sub.path.CopyFrom(psc_path(UNIT))        # /components/component[name=PSC-0]
+    sub.path.CopyFrom(path)
     sub.mode = gnmi_pb2.ON_CHANGE
     return gnmi_pb2.SubscribeRequest(subscribe=sl)
 
@@ -84,7 +85,7 @@ def test_hotplug_remove_then_insert_visible_on_wire(stub, sim_stub):
     events = queue.Queue()
     synced = threading.Event()
 
-    call = stub.Subscribe(hold_open(_slot_subscribe_request()), timeout=30)
+    call = stub.Subscribe(hold_open(_subscribe_request(psc_path(UNIT))), timeout=30)
 
     def reader():
         try:
@@ -132,3 +133,62 @@ def test_hotplug_remove_then_insert_visible_on_wire(stub, sim_stub):
         if path_to_str(u.path).endswith("/state/empty")
     ]
     assert empty_vals == [False], f"slot should be present after re-insert, got {empty_vals}"
+
+
+# The old liveness fallback re-diffed every ~1s; push is milliseconds. A 0.6s ceiling
+# cleanly separates "instant P4 push" from that ~1s floor with ample CI slack.
+LIST_PUSH_MAX_S = 0.6
+
+
+def test_hotplug_on_barelist_query_is_instant_p4(stub, sim_stub):
+    """A list-level ON_CHANGE on the bare key-omitted /components/component must be woken
+    *immediately* on a per-slot hot-plug (P4) — not at the ~1s liveness re-diff. This is
+    the query a real collector uses to watch the whole inventory."""
+    events = queue.Queue()
+    synced = threading.Event()
+
+    bare_list = gpath("/components/component")  # no [name=...]
+    call = stub.Subscribe(hold_open(_subscribe_request(bare_list)), timeout=30)
+
+    def reader():
+        try:
+            for resp in call:
+                which = resp.WhichOneof("response")
+                if which == "sync_response":
+                    synced.set()
+                elif which == "update":
+                    events.put(("notif", resp.update, time.monotonic()))
+        except Exception as e:  # noqa: BLE001
+            events.put(("error", e, time.monotonic()))
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    assert synced.wait(timeout=10), "never received sync_response"
+    time.sleep(0.3)  # settle past the post-sync ON_CHANGE baseline
+
+    t_send = time.monotonic()
+    _set_present(sim_stub, present=False)
+
+    # Drain until the keyed sensor subtree's delete surfaces on the bare-list stream.
+    t_arrive = None
+    deadline = time.monotonic() + DEADLINE_S
+    while time.monotonic() < deadline:
+        try:
+            item = events.get(timeout=DEADLINE_S)
+        except queue.Empty:
+            break
+        kind, notif, ts = item
+        if kind == "error":
+            pytest.fail(f"stream error: {notif}")
+        dels = _deletes(notif)
+        if any(any(m in d for d in dels) for m in SENSOR_MARKERS):
+            t_arrive = ts
+            break
+
+    call.cancel()
+    assert t_arrive is not None, "bare-list ON_CHANGE never saw the hot-plug delete"
+    latency = t_arrive - t_send
+    print(f"  bare-list hot-plug push latency: {latency * 1000:.0f} ms")
+    assert latency < LIST_PUSH_MAX_S, (
+        f"bare-list hot-plug took {latency * 1000:.0f} ms — P4 should push instantly, "
+        f"not fall back to the ~1s liveness re-diff")

@@ -103,12 +103,46 @@ TEST(ChangeTouchesQueries, EmptyQueriesNeverMatch) {
   EXPECT_FALSE(changeTouchesQueries(q, b));
 }
 
-TEST(ChangeTouchesQueries, KeyOmittedListNotMatchedFallsToLiveness) {
-  // Documented limitation (subscription.h): a bare key-omitted list query is not an
-  // element-aligned ancestor of its keyed entries, so it does NOT match here and
-  // relies on the ~1s liveness re-diff. Pinned so this stays a conscious choice.
+// --- P4: bare key-omitted list query matches its keyed entries (the list fan-out,
+// shared with Backend::selects) so a per-slot hot-plug wakes a list-level ON_CHANGE
+// stream immediately instead of falling back to the ~1s liveness re-diff. ----------
+
+TEST(ChangeTouchesQueries, KeyOmittedListMatchesChangedKeyedLeaf) {
   std::vector<CanonicalPath> q{cp("/components/component")};
   ChangeBatch b;
   b.changed.push_back(changedLeaf("/components/component[name=PSC-0]/state/temperature"));
+  EXPECT_TRUE(changeTouchesQueries(q, b));
+}
+
+TEST(ChangeTouchesQueries, KeyOmittedListMatchesAddedKeyedLeaf) {
+  // Hot-plug insert: the sensor subtree appears under a keyed entry.
+  std::vector<CanonicalPath> q{cp("/components/component")};
+  ChangeBatch b;
+  b.added.push_back(changedLeaf("/components/component[name=PSC-0]/power-supply/state/input-voltage"));
+  EXPECT_TRUE(changeTouchesQueries(q, b));
+}
+
+TEST(ChangeTouchesQueries, KeyOmittedListMatchesRemovedKeyedBranch) {
+  // Hot-plug remove: detachSubtree -> removedPrefixes[keyed branch].
+  std::vector<CanonicalPath> q{cp("/components/component")};
+  ChangeBatch b;
+  b.removedPrefixes.push_back(cp("/components/component[name=PSC-0]/power-supply"));
+  EXPECT_TRUE(changeTouchesQueries(q, b));
+}
+
+TEST(ChangeTouchesQueries, KeyOmittedQueryDescendingPastListElementMatches) {
+  // The query omits the key AND descends past the list element.
+  std::vector<CanonicalPath> q{cp("/components/component/state")};
+  ChangeBatch b;
+  b.changed.push_back(changedLeaf("/components/component[name=PSC-0]/state/name"));
+  EXPECT_TRUE(changeTouchesQueries(q, b));
+}
+
+TEST(ChangeTouchesQueries, KeyedQueryDoesNotMatchOtherSlot) {
+  // A per-slot query carries a key, so the fan-out does NOT apply: a change on a
+  // DIFFERENT slot must not wake it.
+  std::vector<CanonicalPath> q{cp("/components/component[name=PSC-0]")};
+  ChangeBatch b;
+  b.changed.push_back(changedLeaf("/components/component[name=PSC-1]/state/temperature"));
   EXPECT_FALSE(changeTouchesQueries(q, b));
 }

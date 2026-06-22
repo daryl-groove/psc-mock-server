@@ -51,6 +51,26 @@ bool isUnderPrefix(const CanonicalPath& prefix, const CanonicalPath& path) noexc
 // auto-assign. Root "/" is not yielded. Views are valid for path's lifetime.
 std::vector<std::string_view> ancestorPrefixes(const CanonicalPath& path);
 
+// --- Routing / list-fan-out matching (operate on already-CANONICAL strings) -----
+// These are looser than isUnderPrefix on purpose: a key-LESS namespace root must
+// own/select its keyed entries (the list fan-out). Shared by the Backend's
+// setup-time routing AND the push hub's change routing so the two cannot drift
+// ("Get matched but Subscribe didn't"). Inputs MUST already be canonical (pass
+// CanonicalPath::str()); taking string_view keeps callers' hot loops allocation-free.
+
+// Namespace ownership: does `prefix` own `path`? Like isUnderPrefix, but a '[' right
+// after the match also counts as a boundary, so "/components/component" owns
+// "/components/component[name=PSC-0]/...". (Does NOT descend past the list element
+// with the key omitted — that's `selects`.)
+bool ownsPath(std::string_view prefix, std::string_view path) noexcept;
+
+// Does `query` select `path`? `ownsPath`, PLUS a query with NO key predicate also
+// selects keyed entries of the same shape even when the query descends past the list
+// element (e.g. "/components/component/state" selects
+// "/components/component[name=PSC-0]/state/name"). This is the boundary-layer list
+// fan-out (D16 note); the core store itself stays element-aligned.
+bool selects(std::string_view query, std::string_view path) noexcept;
+
 }  // namespace gnmid::core
 
 template <>

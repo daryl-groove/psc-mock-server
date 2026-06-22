@@ -8,42 +8,11 @@ namespace gnmid {
 
 namespace {
 
-// Namespace ownership: does `prefix` own `path`'s namespace? Looser than the
-// core's element-aligned isUnderPrefix on purpose — a key-LESS namespace root
-// (e.g. "/components/component") must own its keyed entries
-// ("/components/component[name=PSC-0]/..."), so a '[' right after the match counts
-// as a boundary too (matching the old isPathPrefix routing semantics). Both
-// arguments are canonical strings.
-bool ownsPath(const std::string& prefix, const std::string& path) {
-    if (!path.starts_with(prefix)) return false;
-    if (path.size() == prefix.size()) return true;
-    const char next = path[prefix.size()];
-    return next == '/' || next == '[';
-}
-
-// Drop every [key=value] predicate from a path, leaving the bare element names.
-std::string stripKeys(const std::string& path) {
-    std::string out;
-    out.reserve(path.size());
-    bool inKey = false;
-    for (char c : path) {
-        if (c == '[')      inKey = true;
-        else if (c == ']') inKey = false;
-        else if (!inKey)   out.push_back(c);
-    }
-    return out;
-}
-
-// Does a query select a leaf? Exact element-aligned prefix; AND a query with NO
-// key predicate also selects keyed leaves of the same shape (a key-omitted list
-// query fans out to all entries — the old LeafStore::selects semantics, the list
-// expansion the conventions place in the boundary layer, not the core).
-bool selects(const std::string& query, const std::string& leaf) {
-    if (ownsPath(query, leaf)) return true;
-    if (query.find('[') == std::string::npos)
-        return ownsPath(query, stripKeys(leaf));
-    return false;
-}
+// Routing / list-fan-out matching now lives in core (canonical_path.hpp), shared
+// with the push hub so setup-time and change-time routing cannot drift. Bring the
+// names into this scope so the call sites below read unchanged.
+using core::ownsPath;
+using core::selects;
 
 }  // namespace
 

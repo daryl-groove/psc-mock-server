@@ -6,13 +6,17 @@ namespace impl {
 
 using gnmid::core::CanonicalPath;
 using gnmid::core::ChangeBatch;
-using gnmid::core::isUnderPrefix;
+using gnmid::core::selects;
 
 bool changeTouchesQueries(const std::vector<CanonicalPath>& queries,
                           const ChangeBatch& batch) {
+  // `selects` (not isUnderPrefix) so a bare key-omitted list query
+  // (/components/component) matches its keyed entries — a per-slot insert/remove then
+  // wakes a list-level ON_CHANGE stream immediately (P4), the same fan-out the Backend
+  // already applies at setup. Conservative: a false positive only costs a re-diff.
   auto underAnyQuery = [&](const CanonicalPath& p) {
     for (const auto& q : queries)
-      if (isUnderPrefix(q, p)) return true;  // changed leaf p is in query q's subtree
+      if (selects(q.str(), p.str())) return true;  // changed leaf p selected by query q
     return false;
   };
   for (const auto& c : batch.changed)
@@ -21,8 +25,9 @@ bool changeTouchesQueries(const std::vector<CanonicalPath>& queries,
     if (c.path && underAnyQuery(*c.path)) return true;
   for (const auto& r : batch.removedPrefixes)
     for (const auto& q : queries)
-      // leaf deleted under q, or a branch deleted at/above q (bidirectional).
-      if (isUnderPrefix(q, r) || isUnderPrefix(r, q)) return true;
+      // leaf deleted under q, or a branch deleted at/above q (bidirectional); the
+      // key-omitted fan-out applies both ways.
+      if (selects(q.str(), r.str()) || selects(r.str(), q.str())) return true;
   return false;
 }
 

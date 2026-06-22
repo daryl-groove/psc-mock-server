@@ -35,16 +35,19 @@ this only re-orders.
    → `setPresent`. `tests/e2e/test_hotplug.py` subscribes ON_CHANGE to one slot and sees
    the sensor subtree `delete` on remove and re-add on insert, instantly (element-aligned
    per-slot push). 11 C++ + 15 e2e green.
-2. **P4 push-routing for list-level ON_CHANGE** (push-impl-checklist Phase 4) — **← NOW
-   NEXT** (#1 done). With hot-plug reachable, a client with ON_CHANGE on
-   `/components/component` (bare key-omitted) should be woken **instantly** on
-   insert/remove; today only the element-aligned per-slot form
-   (`/components/component[name=PSC-0]`) is instant (proven by `test_hotplug.py`), the
-   bare list falls back to the ~1s liveness re-diff. Correctness is already safe (the
-   ~1s snapshot+diff **catches** structural changes — it does not miss them), so this is
-   a latency + routing-mechanism refinement on top of #1, not a data-loss bug. The
-   `test_hotplug.py` harness is the ready-made driver: add a bare-list subscription case
-   and tighten its assertion from "~1s" to "instant".
+2. **P4 push-routing for list-level ON_CHANGE** (push-impl-checklist Phase 4) — **✅ DONE
+   2026-06-22.** A client with ON_CHANGE on the bare key-omitted `/components/component`
+   is now woken **instantly** on insert/remove, not at the ~1s liveness re-diff. Fix
+   (Fork1+A): the key-omitted list fan-out predicate (`ownsPath`/`selects`) was lifted
+   from `Backend`'s anonymous namespace into `core/canonical_path.{hpp,cpp}` as shared
+   `string_view` primitives, and the push hub's `changeTouchesQueries`
+   ([src/gnmi/subscription.cpp](../src/gnmi/subscription.cpp)) now matches with
+   `core::selects` instead of the strict `isUnderPrefix` — so setup-time and change-time
+   routing share one matching rule and cannot drift. `test_hotplug.py` gained a bare-list
+   case asserting <0.6s (measured ~5ms); `test_subscription_hub` + `test_canonical_path`
+   pin the fan-out (incl. the keyed-query-no-fan-out negative). The query-path **trie**
+   stays the deferred high-N upgrade (scale-gated; see "Push layer" below) — this fix is
+   a prerequisite it reuses, not throwaway. 11 C++ + 16 e2e green.
 3. **#5 `[name=*]` wildcards** — real clients issue wildcard subscriptions; key-omitted
    lists already work, literal `[name=*]` + mid-path multi-key do not.
 4. **#6 YANG schema validation** — a real device validates paths/keys/types; re-weigh
@@ -99,6 +102,17 @@ upgrade path is explicit and nobody re-derives it.
   than the P2-sketch "monitored-prefix index"**, which would need updating on every
   hot-plug re-expansion *and* still need a scan for armed subs (= two mechanisms). The
   swap is localized to the hub's routing method (Subscription/builder untouched).
+  **Why the trigger is *scale*, not "adopt the more elegant form now": at low N the
+  linear scan can actually beat the trie on wall-clock** — a contiguous
+  `vector<StreamWaker*>` is cache-friendly and branch-predictable, whereas the trie
+  pays allocation + pointer-chasing + cache misses. Both are microseconds at low-
+  double-digit streams, so the choice there is driven by clarity/maintenance (linear
+  wins), not speed; the trie's advantage only emerges as the live-subscription count
+  grows. **The trie also reuses the key-omitted (bare-list) match semantics, so the
+  P4 Fork1 fix — lifting that predicate into `canonical_path` — is a prerequisite the
+  trie consumes, not throwaway**; the one part that is genuinely fiddlier in a trie is
+  encoding the bare-list fan-out as a wildcard-ish node (linear scan just calls
+  `selects()`).
 
 - **Subscribe cancellation on sync gRPC — ~1s liveness poll now; cancel-as-event is
   the async/T3 upgrade.** The push loop blocks on `cv.wait_until(min(nextDeadline,

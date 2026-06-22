@@ -123,6 +123,33 @@ TEST(CanonicalPath, MalformedPredicatesThrow) {
     EXPECT_THROW(canonicalize("/a/b[k=1][k=2]"), std::invalid_argument);  // repeated key
 }
 
+// --- Routing / list fan-out (ownsPath / selects) --------------------------
+
+TEST(Selects, OwnsPathTreatsKeyBracketAsBoundary) {
+    EXPECT_TRUE(ownsPath("/components/component",
+                         "/components/component[name=PSC-0]"));            // '[' boundary
+    EXPECT_TRUE(ownsPath("/components/component",
+                         "/components/component[name=PSC-0]/state/name")); // and deeper
+    EXPECT_FALSE(ownsPath("/components/component", "/components/componentX"));
+}
+
+TEST(Selects, KeyOmittedQueryFansOutToKeyedEntries) {
+    // No key in the query -> selects keyed entries of the same shape, even when the
+    // query descends past the list element (where ownsPath alone would miss).
+    EXPECT_TRUE(selects("/components/component",
+                        "/components/component[name=PSC-0]/state/name"));
+    EXPECT_TRUE(selects("/components/component/state",
+                        "/components/component[name=PSC-0]/state/name"));
+}
+
+TEST(Selects, KeyedQueryDoesNotFanOut) {
+    // A query carrying a key matches only its own element-aligned subtree.
+    EXPECT_TRUE(selects("/components/component[name=PSC-0]",
+                        "/components/component[name=PSC-0]/state/name"));
+    EXPECT_FALSE(selects("/components/component[name=PSC-0]",
+                         "/components/component[name=PSC-1]/state/name"));
+}
+
 // --- LeafId smoke (Phase 1.3) ---------------------------------------------
 
 TEST(LeafId, DefaultIsInvalidAndEqual) {

@@ -28,13 +28,14 @@ namespace impl {
 class StreamWaker;
 
 // True if `batch` touches any of `queries` (a stream's ON_CHANGE query subtrees): a
-// changed/added leaf under a query, or a removed prefix overlapping a query (a leaf
-// deleted under it, or a branch deleted at/above it). Conservative by design — a
-// false positive only costs a harmless re-diff (the snapshot+diff on wake is the
-// source of truth), so an imprecise match never loses a change, only its
-// instantaneity. A bare key-omitted list query (e.g. /components/component) is not an
-// element-aligned ancestor of its keyed entries, so it is not matched here and falls
-// back to the ~1s liveness re-diff (acceptable; unused by any ON_CHANGE path today).
+// changed/added leaf selected by a query, or a removed prefix overlapping a query (a
+// leaf deleted under it, or a branch deleted at/above it). Matching uses
+// `core::selects`, so a bare key-omitted list query (e.g. /components/component) DOES
+// match its keyed entries — a per-slot hot-plug wakes a list-level ON_CHANGE stream
+// immediately (P4), the same fan-out the Backend applies at setup. Conservative by
+// design — a false positive only costs a harmless re-diff (the snapshot+diff on wake
+// is the source of truth), so an imprecise match never loses a change, only its
+// instantaneity.
 bool changeTouchesQueries(const std::vector<gnmid::core::CanonicalPath>& queries,
                           const gnmid::core::ChangeBatch& batch);
 
