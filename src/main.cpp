@@ -26,13 +26,15 @@
 #include "backend/backend.hpp"
 #include "backend/psc_power_sensor_provider.hpp"
 #include "backend/system_config_provider.hpp"
+#include "sim/sim_control_service.h"
 #include <security/authentication.h>
 #include <utils/log.h>
 
 using namespace std;
 
 void RunServer(const std::string& bind_addr,
-               std::shared_ptr<grpc::ServerCredentials> cred)
+               std::shared_ptr<grpc::ServerCredentials> cred,
+               bool sim)
 {
   // Build the Backend (data + schema layer over the core registry) and register
   // providers. To add a new data domain: addProvider() another Provider here.
@@ -45,6 +47,14 @@ void RunServer(const std::string& bind_addr,
 
   builder.AddListeningPort(bind_addr, cred);
   builder.RegisterService(&gnmi);
+
+  // Sim/test-only hardware-event channel: registered only under --sim so it is
+  // absent from a production binary. Lets an e2e harness reproduce a hot-plug.
+  SimControlService sim_control(backend);
+  if (sim) {
+    builder.RegisterService(&sim_control);
+    cout << "SimControl enabled (hardware-event injection)" << endl;
+  }
   unique_ptr<Server> server(builder.BuildAndStart());
   cout << "Using grpc " << grpc::Version() << endl;
 
@@ -70,6 +80,7 @@ static void show_usage(string name)
     << "\t-u,--username USERNAME\t\tDefine connection username\n"
     << "\t-p,--password PASSWORD\t\tDefine connection password\n"
     << "\t-f,--force-insecure\t\tNo TLS connection, no password authentication\n"
+    << "\t-s,--sim\t\t\tEnable the sim-only hardware-event channel (SimControl)\n"
     << "\t-k,--private-key PRIVATE_KEY\tpath to server TLS private key\n"
     << "\t-c,--cert CERTIFICATE\tpath to server TLS certificate\n"
     << "\t-r,--ca CERTIFICATE\tpath to root certificate/CA certificate\n"
@@ -92,6 +103,7 @@ int main (int argc, char* argv[]) {
   int option_index = 0;
   string bind_addr = "localhost:50051";
   string username, password;
+  bool sim = false;
   Log();
   AuthBuilder auth;
 
@@ -106,6 +118,7 @@ int main (int argc, char* argv[]) {
     {"ca", required_argument, 0, 'r'}, //certificate chain
     {"force-insecure", no_argument, 0, 'f'}, //insecure mode
     {"bind", required_argument, 0, 'b'}, //insecure mode
+    {"sim", no_argument, 0, 's'}, //sim-only hardware-event channel
     {0, 0, 0, 0}
   };
 
@@ -115,7 +128,7 @@ int main (int argc, char* argv[]) {
    * An option character is followed by (‘::’) indicates an optional argument.
    * Here: no argument after (h,f) ; mandatory argument after (p,u,l,b,c,k,r)
    */
-  while ((c = getopt_long(argc, argv, "hfl:p:u:c:k:r:b:", long_options, &option_index))
+  while ((c = getopt_long(argc, argv, "hfsl:p:u:c:k:r:b:", long_options, &option_index))
          != -1) {
     switch (c)
     {
@@ -148,12 +161,15 @@ int main (int argc, char* argv[]) {
       case 'f': //force insecure connection
         auth.setInsecure(true);
         break;
+      case 's': //sim-only hardware-event channel
+        sim = true;
+        break;
       default: /* You won't get there */
         exit(1);
     }
   }
 
-  RunServer(bind_addr, auth.build());
+  RunServer(bind_addr, auth.build(), sim);
 
   return 0;
 }

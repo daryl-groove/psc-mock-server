@@ -97,6 +97,17 @@ would see a value for a device that is not inserted.
 > (§9), exercised by `PscHotPlugTest` (`tests/test_backend.cpp`): insert/remove via its
 > `setPresent()` backdoor — the markers persist, the sensor subtree appears/vanishes.
 
+> **Triggering a hot-plug from the wire (sim/test only).** A real insert/remove is an
+> out-of-band hardware event, *not* a gNMI client action — modelling presence as a
+> writable config leaf was rejected for exactly that reason (it would pollute the
+> model and let a client "insert" a PSU). So the wire trigger lives on a **separate
+> service**, `SimControl.SetPresent(unit, present)` (`proto/sim_control.proto` →
+> `Backend::injectHardwareEvent` → `Provider::onHardwareEvent` → `setPresent`),
+> registered only under the server's `--sim` flag and therefore **absent from a
+> production binary**. `tests/e2e/test_hotplug.py` uses it to reproduce a hot-plug and
+> observe the ON_CHANGE add/delete end-to-end on the wire. The gNMI surface is never
+> involved in the trigger.
+
 ### Two valid granularities — choose by what is physically permanent
 
 - **Fixed slot, swappable device** (a chassis PSU/BBU bay): the *slot* is permanent
@@ -337,6 +348,11 @@ insert/remove backdoor (Fork B): insert attaches the sensor subtree + flips
 `/state/temperature`) — leaving the markers — + flips `empty=true`. A background
 `jthread` drifts the present slots' values on a quantized random walk, one
 `ValueWriter` scope per tick. Sensors and markers are all `Operational`.
+
+`setPresent` is C++-only; the wire-reachable trigger is `SimControl.SetPresent`
+(`--sim`-gated sim service → `Backend::injectHardwareEvent` → `onHardwareEvent`), used
+by `tests/e2e/test_hotplug.py` to prove insert/remove surface as ON_CHANGE add/delete
+on the wire (see §3).
 
 > Units are **volts / amps / watts**, not mV/mA/mW. YANG `ieeefloat32` maps to
 > `double_val` in `gnmi::TypedValue`.

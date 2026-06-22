@@ -57,6 +57,14 @@ void Backend::addProvider(std::unique_ptr<Provider> p) {
     providers_.push_back(std::move(p));
 }
 
+void Backend::injectHardwareEvent(const std::string& unit, bool present) {
+    // Fan out to every provider; the one that owns the unit acts, the rest no-op.
+    // Out-of-band hardware events have no path, so there is nothing to route on —
+    // a fan-out is both correct and trivially decoupled at this scale.
+    for (auto& p : providers_)
+        p->onHardwareEvent(unit, present);
+}
+
 void Backend::declareGroup(const std::string& prefix, bool atomic) {
     registry_.registerGroup(prefix, atomic);
 }

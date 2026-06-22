@@ -1,0 +1,24 @@
+// SimControl — a sim/test-only hardware-event injection channel, deliberately
+// SEPARATE from the gNMI service. Real PSU insert/remove is out-of-band from gNMI
+// (a hardware interrupt, not a client RPC), so a client must never be able to drive
+// it through Get/Set/Subscribe; modelling presence as a writable config leaf was
+// rejected for exactly that reason. This service is registered only under the
+// server's --sim flag, so it is absent from a production binary. It exists to let an
+// e2e harness reproduce a hot-plug at a chosen instant and observe the ON_CHANGE
+// add/delete on the wire.
+syntax = "proto3";
+
+package psc.sim;
+
+service SimControl {
+  // Insert (present=true) or remove (present=false) a unit (e.g. "PSC-0").
+  // Idempotent; an unknown unit is a no-op. Maps onto Backend::injectHardwareEvent.
+  rpc SetPresent(SetPresentRequest) returns (SetPresentResponse);
+}
+
+message SetPresentRequest {
+  string unit    = 1;  // unit name, matching gNMI component[name=<unit>]
+  bool   present = 2;
+}
+
+message SetPresentResponse {}

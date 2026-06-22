@@ -40,6 +40,12 @@ public:
     // Idempotent; safe to call while the simulator runs; unknown unit is a no-op.
     void setPresent(const std::string& unit, bool present);
 
+    // The generic provider seam (Backend::injectHardwareEvent → sim-control wire):
+    // a hardware insert/remove maps straight onto setPresent.
+    void onHardwareEvent(const std::string& unit, bool present) override {
+        setPresent(unit, present);
+    }
+
 private:
     // Per-leaf walk state: the leaf's id (for ValueWriter), current value, grid
     // STEP (0 = static), and the lo/hi bounds (nominal ± maxDev).

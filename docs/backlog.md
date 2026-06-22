@@ -27,12 +27,24 @@ this only re-orders.
    binding-synced runtime attach/detach on `Backend`; exercise it from a *thin* demo
    (one pluggable unit toggling — not a full shelf model, per README scope); add a
    hot-plug e2e (Get reflects appear/disappear, ON_CHANGE client sees add/delete).
-   Additive — no core rework.
-2. **P4 push-routing for list-level ON_CHANGE** (push-impl-checklist Phase 4) — once
-   hot-plug is reachable, a client with ON_CHANGE on `/components/component` should be
-   woken **instantly** on insert/remove. Correctness is already safe (the ~1s liveness
-   snapshot+diff **catches** structural changes — it does not miss them), so this is a
-   latency + routing-mechanism refinement on top of #1, not a data-loss bug.
+   Additive — no core rework. **✅ DONE 2026-06-22.** Runtime attach/detach + binding
+   sync landed earlier; the **wire-observable e2e** now closes it: a sim-only
+   `SimControl.SetPresent` service (`proto/sim_control.proto`, `--sim`-gated, separate
+   from gNMI so presence never enters the served model — out-of-band hardware events
+   are not client actions) → `Backend::injectHardwareEvent` → `Provider::onHardwareEvent`
+   → `setPresent`. `tests/e2e/test_hotplug.py` subscribes ON_CHANGE to one slot and sees
+   the sensor subtree `delete` on remove and re-add on insert, instantly (element-aligned
+   per-slot push). 11 C++ + 15 e2e green.
+2. **P4 push-routing for list-level ON_CHANGE** (push-impl-checklist Phase 4) — **← NOW
+   NEXT** (#1 done). With hot-plug reachable, a client with ON_CHANGE on
+   `/components/component` (bare key-omitted) should be woken **instantly** on
+   insert/remove; today only the element-aligned per-slot form
+   (`/components/component[name=PSC-0]`) is instant (proven by `test_hotplug.py`), the
+   bare list falls back to the ~1s liveness re-diff. Correctness is already safe (the
+   ~1s snapshot+diff **catches** structural changes — it does not miss them), so this is
+   a latency + routing-mechanism refinement on top of #1, not a data-loss bug. The
+   `test_hotplug.py` harness is the ready-made driver: add a bare-list subscription case
+   and tighten its assertion from "~1s" to "instant".
 3. **#5 `[name=*]` wildcards** — real clients issue wildcard subscriptions; key-omitted
    lists already work, literal `[name=*]` + mid-path multi-key do not.
 4. **#6 YANG schema validation** — a real device validates paths/keys/types; re-weigh

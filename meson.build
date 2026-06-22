@@ -67,6 +67,23 @@ gnmi_proto = custom_target('gnmi_proto',
   ]
 )
 
+# sim_control.proto — the sim/test-only hardware-event channel (separate service,
+# registered only under --sim). No imports, so a plain single-shot generation. Its
+# generated sources + the service are compiled straight into the executable below.
+sim_control_proto = custom_target('sim_control_proto',
+  input  : 'proto/sim_control.proto',
+  output : ['sim_control.pb.cc', 'sim_control.pb.h',
+             'sim_control.grpc.pb.cc', 'sim_control.grpc.pb.h'],
+  command: [
+    protoc,
+    '--proto_path=@CURRENT_SOURCE_DIR@/proto',
+    '--cpp_out=@OUTDIR@',
+    '--grpc_out=@OUTDIR@',
+    '--plugin=protoc-gen-grpc=' + grpc_cpp_plugin.full_path(),
+    '@CURRENT_SOURCE_DIR@/proto/sim_control.proto',
+  ]
+)
+
 # ---------------------------------------------------------------------------
 # Compiled proto, shared by the core lib and its tests so the generated .cc are
 # built once rather than per-target. The `sources` headers give every consumer a
@@ -140,8 +157,10 @@ sources = [
   'src/gnmi/subscription.cpp',
   'src/backend/psc_power_sensor_provider.cpp',
   'src/backend/system_config_provider.cpp',
+  'src/sim/sim_control_service.cpp',
   'src/security/authentication.cpp',
   'src/utils/log.cpp',
+  sim_control_proto,   # generated .pb/.grpc sources + their outdir on the include path
 ]
 # proto, core and Backend (incl. backend.cpp) come through gnmid_backend_dep.
 

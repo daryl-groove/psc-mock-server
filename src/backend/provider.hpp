@@ -34,6 +34,13 @@ public:
     // Default: no driver (config domains change only via Set).
     virtual void start() {}
 
+    // Out-of-band hardware event: a unit was inserted (present=true) or removed.
+    // Routed here by Backend::injectHardwareEvent for every provider; a provider
+    // that doesn't own the unit no-ops. This is the generic seam the sim-control
+    // backdoor drives — real insert/remove is out-of-band from gNMI, so it never
+    // touches the served data model. Default: no hardware (config domains).
+    virtual void onHardwareEvent(const std::string& /*unit*/, bool /*present*/) {}
+
 protected:
     Backend& be_;
 };

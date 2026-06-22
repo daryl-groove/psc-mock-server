@@ -63,21 +63,26 @@ class GnmiServer:
 
 
 @pytest.fixture
-def gnmi_server():
+def gnmi_server(request):
     """Spawn a fresh psc-mock-server on a private port; wait until it serves; tear
-    it down afterwards. Function-scoped so every test starts from pristine state."""
+    it down afterwards. Function-scoped so every test starts from pristine state.
+
+    Extra server args can be passed via indirect parametrization, e.g.
+    `@pytest.mark.parametrize("gnmi_server", [["-s"]], indirect=True)` to enable the
+    sim-control channel (see the `sim_stub` fixture)."""
     if not _SERVER_BIN.exists():
         pytest.skip(
             f"server binary not built: {_SERVER_BIN}\n"
             "build it first, e.g.  meson compile -C build"
         )
 
+    extra_args = list(getattr(request, "param", []))
     addr = f"127.0.0.1:{_free_port()}"
     # Log to a temp file (not a PIPE) so a chatty subscribe loop can never fill a
     # pipe buffer and stall the server; surfaced only if startup fails.
     log = tempfile.TemporaryFile(mode="w+")
     proc = subprocess.Popen(
-        [str(_SERVER_BIN), "-f", "-b", addr, "-l", "1"],
+        [str(_SERVER_BIN), "-f", "-b", addr, "-l", "1", *extra_args],
         stdout=log,
         stderr=subprocess.STDOUT,
     )
@@ -132,3 +137,13 @@ def channel(gnmi_server):
 def stub(channel):
     """A gNMI stub on this test's server."""
     return gnmi_pb2_grpc.gNMIStub(channel)
+
+
+@pytest.fixture
+def sim_stub(channel):
+    """A SimControl stub (sim-only hardware-event channel) on this test's server.
+    Requires the server to be started with `-s`; pair it with
+    `@pytest.mark.parametrize("gnmi_server", [["-s"]], indirect=True)`."""
+    import sim_control_pb2_grpc  # noqa: E402  (flat module on tests/e2e sys.path)
+
+    return sim_control_pb2_grpc.SimControlStub(channel)

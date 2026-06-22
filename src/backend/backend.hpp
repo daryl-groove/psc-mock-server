@@ -60,6 +60,11 @@ public:
     // The provider has already registered its leaves/groups in its constructor.
     void addProvider(std::unique_ptr<Provider> p);
 
+    // Inject an out-of-band hardware insert/remove for a unit (the sim-control
+    // backdoor / a real driver's insert-remove signal). Fanned out to every
+    // provider's onHardwareEvent; never part of the served gNMI model.
+    void injectHardwareEvent(const std::string& unit, bool present);
+
     // --- provider-facing registration (at construction OR at runtime) ---
     // A group is identified by its prefix (D4); declare it before its leaves so they
     // auto-assign (D3). declare* are the single-entity forms; attach/detachSubtree
